@@ -6,8 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# ethers = { version = "2.0.4", features = ["ws", "rustls"] }
-tokio = { version = "1.28.0", features = ["full"] }
 dotenv = "0.15.0"
 serde_json = "1.0.96"
-# ethers-flashbots = "0.13.0"
+ethers-flashbots = "0.13.0"
+tokio = { version = "1.28.0", features = ["full"] }
+ethers = { version = "2.0.4", features = ["ws", "rustls"] }
