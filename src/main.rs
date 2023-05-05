@@ -1,12 +1,15 @@
 // not for production!
 #![allow(dead_code)]
 #![allow(unused_variables)]
-use std::env;
 use ethers::prelude::*;
+use std::{env, str::FromStr};
+
+mod arbitrage;
+use crate::arbitrage::Arbitrage;
 
 // const FLASHBOTS_BUNLDE_RELAY_URL: &str = "https://relay-goerli.flashbots.net";
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
     let goerli_rpc: String = env::var("GOERLI_RPC_URL").expect("GOERLI_RPC_URL not set");
@@ -14,21 +17,17 @@ async fn main() {
     let provider: Provider<Http> =
         Provider::<Http>::try_from(goerli_rpc).expect("could not instantiate HTTP Provider");
 
-    let block: Block<Transaction> = provider
-        .get_block_with_txs(BlockNumber::Latest)
-        .await
-        .unwrap()
-        .unwrap();
+    let private_key: String = env::var("PRIVATE_KEY").expect("PRIVATE_KEY not set");
+    let flashbots_key: String = env::var("FLASHBOTS_KEY").expect("FLASHBOTS_KEY not set");
 
-    println!("Block {}", serde_json::to_string_pretty(&block).unwrap());
+    let wallet = LocalWallet::from_str(&private_key)?;
+    let flashbots_wallet = LocalWallet::from_str(&flashbots_key)?;
 
-    // let private_key: String = env::var("PRIVATE_KEY").expect("PRIVATE_KEY not set");
-    // let flashbots_key: String = env::var("FLASHBOTS_KEY").expect("FLASHBOTS_KEY not set");
+    // Print the wallet address to the console
+    println!("Wallet address: {:?}", wallet.address());
+    println!("Flashbots signer address: {:?}", flashbots_wallet.address());
 
-    // let wallet = Wallet::new(&mut &private_key);
+    let arb: Arbitrage = Arbitrage::new(provider, wallet, flashbots_wallet);
 
-    // Print the wallet address
-    // println!("Wallet address: {}", wallet.address());
-
-    // Ok(())
+    Ok(())
 }
