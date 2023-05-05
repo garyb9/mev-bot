@@ -1,21 +1,12 @@
+#![allow(dead_code)]
 use ethers::prelude::*;
 
-pub struct Arbitrage {
-    provider: Provider<Http>,
-    wallet: LocalWallet,
-    flashbots_wallet: LocalWallet,
+pub struct Arbitrage<M, S> {
+    client: SignerMiddleware<M, S>,
 }
 
-impl Arbitrage {
-    pub fn new(
-        provider: Provider<Http>,
-        wallet: LocalWallet,
-        flashbots_wallet: LocalWallet,
-    ) -> Self {
-        Self {
-            provider,
-            wallet,
-            flashbots_wallet,
-        }
+impl<M, S> Arbitrage<M, S> {
+    pub fn new(client: SignerMiddleware<M, S>) -> Self {
+        Arbitrage { client }
     }
 }
