@@ -3,12 +3,15 @@
 use ethers::prelude::*;
 use ethers_flashbots::*;
 use reqwest::Url;
-use std::{env, str::FromStr};
+use std::{env, str::FromStr, sync::Arc};
 
 mod arbitrage;
-use crate::arbitrage::Arbitrage;
+mod listener;
 
-const FLASHBOTS_BUNLDE_RELAY_URL: &str = "https://relay-goerli.flashbots.net";
+use crate::arbitrage::Arbitrage;
+use crate::listener::BlockListener;
+
+const FLASHBOTS_RELAY_URL_GOERLI: &str = "https://relay-goerli.flashbots.net";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
 
     let provider: Provider<Http> =
         Provider::<Http>::try_from(goerli_rpc).expect("could not instantiate HTTP Provider");
+    let provider_arc: Arc<Provider<Http>> = Arc::new(provider); // using Arc since provider will be shared across multiple classes
 
     let private_key: String = env::var("PRIVATE_KEY").expect("PRIVATE_KEY not set");
     let flashbots_key: String = env::var("FLASHBOTS_KEY").expect("FLASHBOTS_KEY not set");
@@ -30,8 +34,8 @@ async fn main() -> anyhow::Result<()> {
     println!("Flashbots signer address: {:?}", flashbots_wallet.address());
 
     let flashbots_middleware = FlashbotsMiddleware::new(
-        provider,
-        Url::parse(FLASHBOTS_BUNLDE_RELAY_URL)?,
+        provider_arc.clone(),
+        Url::parse(FLASHBOTS_RELAY_URL_GOERLI)?,
         flashbots_wallet,
     );
 
@@ -39,6 +43,9 @@ async fn main() -> anyhow::Result<()> {
     let client = SignerMiddleware::new(flashbots_middleware, wallet);
 
     let arb = Arbitrage::new(client);
+
+    let listener: BlockListener = BlockListener::new(provider_arc);
+    listener.listen().await?;
 
     Ok(())
 }
