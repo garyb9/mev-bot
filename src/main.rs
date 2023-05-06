@@ -8,6 +8,7 @@ use std::{env, str::FromStr, sync::Arc};
 mod arbitrage;
 mod listener;
 mod market;
+mod uniswap_v2;
 
 use crate::arbitrage::Arbitrage;
 use crate::listener::BlockListener;

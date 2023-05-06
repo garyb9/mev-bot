@@ -17,11 +17,6 @@ impl BlockListener {
         stream
             .for_each(|block_hash| async move {
                 let block = self.provider.get_block(block_hash).await.unwrap().unwrap();
-                // println!(
-                //     "Transactions in Block {}: {}",
-                //     block.number.unwrap(),
-                //     serde_json::to_string_pretty(&(block.transactions)).unwrap()
-                // );
                 println!(
                     "Block {} -> baseFeePerGas: {} Gwei",
                     block.number.unwrap(),
@@ -29,7 +24,7 @@ impl BlockListener {
                 );
             })
             .await;
-        // Set up the block listener
+
         Ok(())
     }
 }

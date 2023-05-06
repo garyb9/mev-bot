@@ -1,5 +1,8 @@
 use async_trait::async_trait;
 use ethers::types::U256;
+use std::collections::HashMap;
+
+pub struct TokenBalances(HashMap<String, U256>);
 
 pub struct MultipleCallData {
     targets: Vec<String>,
@@ -18,12 +21,12 @@ pub trait EthMarket {
 
     async fn get_tokens_in(&self, token_in: String, token_out: String, amount_out: U256) -> U256;
 
-    async fn sell_tokens_to_next_market(
-        &self,
-        token_in: String,
-        amount_in: U256,
-        eth_market: dyn EthMarket,
-    ) -> MultipleCallData; // Future
+    // async fn sell_tokens_to_next_market(
+    //     &self,
+    //     token_in: String,
+    //     amount_in: U256,
+    //     eth_market: dyn EthMarket,
+    // ) -> MultipleCallData; // Future
 
     async fn sell_tokens(&self, token_in: String, amount_in: U256, recipient: String) -> String; // Future
 
