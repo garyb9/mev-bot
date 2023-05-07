@@ -1,3 +1,5 @@
+use std::{future::Future};
+
 use crate::market;
 
 struct UniswapV2EthPair {
@@ -24,7 +26,7 @@ impl market::EthMarket for UniswapV2EthPair {
         amount_in: ethers::types::U256,
     ) -> core::pin::Pin<
         Box<
-            dyn core::future::Future<Output = ethers::types::U256>
+            dyn core::future::Future<Output = dyn Future<Output = ethers::types::U256>>
                 + core::marker::Send
                 + 'async_trait,
         >,
@@ -43,7 +45,7 @@ impl market::EthMarket for UniswapV2EthPair {
         amount_out: ethers::types::U256,
     ) -> core::pin::Pin<
         Box<
-            dyn core::future::Future<Output = ethers::types::U256>
+            dyn core::future::Future<Output = dyn Future<Output = ethers::types::U256>>
                 + core::marker::Send
                 + 'async_trait,
         >,
@@ -62,7 +64,7 @@ impl market::EthMarket for UniswapV2EthPair {
     //     eth_market: dyn market::EthMarket,
     // ) -> core::pin::Pin<
     //     Box<
-    //         dyn core::future::Future<Output = market::MultipleCallData>
+    //         dyn core::future::Future<Output = dyn Future<Output = market::MultipleCallData>>
     //             + core::marker::Send
     //             + 'async_trait,
     //     >,
@@ -80,7 +82,11 @@ impl market::EthMarket for UniswapV2EthPair {
         amount_in: ethers::types::U256,
         recipient: String,
     ) -> core::pin::Pin<
-        Box<dyn core::future::Future<Output = String> + core::marker::Send + 'async_trait>,
+        Box<
+            dyn core::future::Future<Output = dyn Future<Output = String>>
+                + core::marker::Send
+                + 'async_trait,
+        >,
     >
     where
         'life0: 'async_trait,
@@ -93,7 +99,11 @@ impl market::EthMarket for UniswapV2EthPair {
         &'life0 self,
         token_address: String,
     ) -> core::pin::Pin<
-        Box<dyn core::future::Future<Output = bool> + core::marker::Send + 'async_trait>,
+        Box<
+            dyn core::future::Future<Output = dyn Future<Output = bool>>
+                + core::marker::Send
+                + 'async_trait,
+        >,
     >
     where
         'life0: 'async_trait,
@@ -108,7 +118,7 @@ impl market::EthMarket for UniswapV2EthPair {
         amount_in: ethers::types::U256,
     ) -> core::pin::Pin<
         Box<
-            dyn core::future::Future<Output = Vec<market::CallDetails>>
+            dyn core::future::Future<Output = dyn Future<Output = Vec<market::CallDetails>>>
                 + core::marker::Send
                 + 'async_trait,
         >,
