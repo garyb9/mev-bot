@@ -1,53 +1,51 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
+#![allow(unused)]
+
 use ethers::prelude::*;
-use ethers_flashbots::*;
-use reqwest::Url;
-use std::{env, str::FromStr, sync::Arc};
-
-mod arbitrage;
-mod listener;
-mod market;
-mod uniswap_v2;
-
-use crate::arbitrage::Arbitrage;
-use crate::listener::BlockListener;
-
-const FLASHBOTS_RELAY_URL_GOERLI: &str = "https://relay-goerli.flashbots.net";
+use mev_bot::address_book::UniQuery;
+use mev_bot::address_book::QUERY_CONTRACT;
+use mev_bot::address_book::SUSHISWAP_FACTORY;
+use mev_bot::address_book::UNISWAP_FACTORY;
+use mev_bot::crossed_pair::CrossedPairManager;
+use mev_bot::dex_factory::get_markets_by_token;
+use mev_bot::utils;
+use mev_bot::crossed_pair;
+use mev_bot::dex_factory;
+use mev_bot::address_book;
+use mev_bot::utils::Config;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> eyre::Result<()> {
     dotenv::dotenv().ok();
+    let config = Config::new().await;
+    println!("[STARTING]");
 
-    let goerli_rpc: String = env::var("GOERLI_RPC_URL").expect("GOERLI_RPC_URL not set");
+    let factory_addresses = vec![
+        UNISWAP_FACTORY, 
+        SUSHISWAP_FACTORY,
+    ]
+    .into_iter()
+    .map(|address| {
+        address
+            .parse::<Address>()
+            .expect("parse factory address failed")
+    })
+    .collect::<Vec<Address>>();
 
-    let provider: Provider<Http> =
-        Provider::<Http>::try_from(goerli_rpc).expect("could not instantiate HTTP Provider");
-    let provider_arc: Arc<Provider<Http>> = Arc::new(provider); // using Arc since provider will be shared across multiple classes
+    let flash_query_address = QUERY_CONTRACT.parse::<Address>().unwrap();
+    let flash_query_contract = UniQuery::new(flash_query_address, config.http.clone());
+    let grouped_pairs =
+        get_markets_by_token(factory_addresses, &flash_query_contract, config.http.clone()).await;
 
-    let private_key: String = env::var("PRIVATE_KEY").expect("PRIVATE_KEY not set");
-    let flashbots_key: String = env::var("FLASHBOTS_KEY").expect("FLASHBOTS_KEY not set");
+    let mut crossed_pair = CrossedPairManager::new(&grouped_pairs, &flash_query_contract);
+    crossed_pair.write_tokens();
 
-    let wallet = LocalWallet::from_str(&private_key)?;
-    let flashbots_wallet = LocalWallet::from_str(&flashbots_key)?;
-
-    // Print the wallet address to the console
-    println!("Wallet address: {:?}", wallet.address());
-    println!("Flashbots signer address: {:?}", flashbots_wallet.address());
-
-    let flashbots_middleware = FlashbotsMiddleware::new(
-        provider_arc.clone(),
-        Url::parse(FLASHBOTS_RELAY_URL_GOERLI)?,
-        flashbots_wallet,
-    );
-
-    // Add signer and Flashbots middleware
-    let client = SignerMiddleware::new(flashbots_middleware, wallet);
-
-    let arb = Arbitrage::new(client);
-
-    let listener: BlockListener = BlockListener::new(provider_arc);
-    listener.listen().await?;
-
+    loop {
+        let mut stream = config.wss.subscribe_blocks().await?;
+        while let Some(block) = stream.next().await {
+            dbg!(block.number.unwrap());
+            crossed_pair.update_reserve().await;
+            crossed_pair.find_arbitrage_opportunities();
+        }
+    }
     Ok(())
 }
