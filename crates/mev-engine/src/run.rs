@@ -5,12 +5,16 @@
 //! dirty coin once, and finally idles by spinning briefly and then blocking on
 //! both channels with a timeout at the next timer deadline.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, select};
 use mev_core::clock::{Clock, SystemClock};
 
 use crate::channels::Inputs;
+use crate::dispatch::StrategyDispatcher;
+use crate::instrument::{LatencyRecorder, Metric};
 use crate::routes::Routes;
 use crate::state::EngineState;
 use crate::timers::{TimerHeap, TimerId};
@@ -32,6 +36,30 @@ pub trait Dispatcher {
     fn on_timer(&mut self, _id: TimerId, _stamp: Stamp) {}
     /// A lossless account/control update arrived.
     fn on_account(&mut self, _update: &AccountUpdate) {}
+
+    /// Like [`Dispatcher::on_coin`], but with the loop's read-only market state
+    /// so a concrete dispatcher can build a strategy [`crate::strategy::Ctx`].
+    ///
+    /// The default forwards to [`Dispatcher::on_coin`], so the E-3 seam (and its
+    /// test dispatchers) keep working unchanged.
+    fn on_coin_state(&mut self, coin: CoinId, stamp: Stamp, _state: &EngineState) {
+        self.on_coin(coin, stamp);
+    }
+
+    /// Like [`Dispatcher::on_timer`], with the loop's market state.
+    fn on_timer_state(&mut self, id: TimerId, stamp: Stamp, _state: &EngineState) {
+        self.on_timer(id, stamp);
+    }
+
+    /// Like [`Dispatcher::on_account`], with the loop's market state.
+    fn on_account_state(&mut self, update: &AccountUpdate, _state: &EngineState) {
+        self.on_account(update);
+    }
+
+    /// Record one loop iteration's wall time and drained-event count (E-10).
+    ///
+    /// Default is a no-op so simple dispatchers pay nothing.
+    fn record_iteration(&mut self, _iteration_ns: u64, _events: usize) {}
 }
 
 /// Upper bound on how long `idle` blocks without a scheduled timer, so the
@@ -133,11 +161,12 @@ impl<D: Dispatcher> EngineLoop<D> {
 
     /// Run one pass of the §9 algorithm; returns the number of events drained.
     pub fn iterate(&mut self, now_mono_ns: u64) -> usize {
+        let iteration_start = std::time::Instant::now();
         let mut n = 0;
 
         // 1. Lossless account/control/exec updates first.
         while let Ok(update) = self.inputs.account.try_recv() {
-            self.dispatcher.on_account(&update);
+            self.dispatcher.on_account_state(&update, &self.state);
             n += 1;
         }
 
@@ -153,13 +182,17 @@ impl<D: Dispatcher> EngineLoop<D> {
             ..Default::default()
         };
         for id in self.timers.pop_due(now_mono_ns) {
-            self.dispatcher.on_timer(id, now_stamp);
+            self.dispatcher.on_timer_state(id, now_stamp, &self.state);
         }
 
         // 4. Dispatch each dirty coin once, in CoinId order.
         for coin in self.state.drain_dirty() {
-            self.dispatcher.on_coin(coin, now_stamp);
+            self.dispatcher.on_coin_state(coin, now_stamp, &self.state);
         }
+
+        // 5. Loop-health instrumentation (E-10 §17).
+        let iteration_ns = iteration_start.elapsed().as_nanos() as u64;
+        self.dispatcher.record_iteration(iteration_ns, n);
 
         n
     }
@@ -258,6 +291,53 @@ impl<D: Dispatcher> EngineLoop<D> {
             MarketUpdate::Gap { conn, .. } => Some(*conn),
             _ => None,
         }
+    }
+}
+
+/// Convenience wiring for the concrete [`StrategyDispatcher`] (E-13).
+///
+/// `EngineLoop::new` already accepts any `D: Dispatcher`; these methods add the
+/// sanctioned constructor name plus access to the dispatcher and its E-10
+/// latency recorder for the 1 s metrics exporter.
+impl EngineLoop<StrategyDispatcher> {
+    /// Build the v2 engine loop around the concrete strategy dispatcher.
+    pub fn with_dispatcher(
+        inputs: Inputs,
+        dispatcher: StrategyDispatcher,
+        config: LoopConfig,
+        stop: Receiver<()>,
+    ) -> Self {
+        Self::new(inputs, dispatcher, config, stop)
+    }
+
+    /// The concrete dispatcher (read-only).
+    pub fn dispatcher(&self) -> &StrategyDispatcher {
+        &self.dispatcher
+    }
+
+    /// The concrete dispatcher (mutable).
+    pub fn dispatcher_mut(&mut self) -> &mut StrategyDispatcher {
+        &mut self.dispatcher
+    }
+
+    /// The E-10 latency recorder.
+    pub fn recorder(&self) -> &LatencyRecorder {
+        self.dispatcher.recorder()
+    }
+
+    /// Mutable access to the E-10 latency recorder.
+    pub fn recorder_mut(&mut self) -> &mut LatencyRecorder {
+        self.dispatcher.recorder_mut()
+    }
+
+    /// Export the recorder's window and reset it (metrics exporter).
+    pub fn flush(&mut self) -> Vec<(&'static str, Metric)> {
+        self.dispatcher.flush()
+    }
+
+    /// A shared counter the market producer increments on a full channel.
+    pub fn market_drop_counter(&self) -> Arc<AtomicU64> {
+        self.dispatcher.market_drop_counter()
     }
 }
 
@@ -425,5 +505,124 @@ mod tests {
         assert_eq!(reason, StopReason::Requested);
         // And the loop then processes it.
         assert_eq!(engine.iterate(1), 1);
+    }
+
+    #[test]
+    fn strategy_dispatcher_smoke_emits_a_market_maker_post() {
+        use std::sync::Mutex;
+
+        use mev_hl_client::types::{AssetMeta as WireAssetMeta, Meta};
+        use mev_hl_client::{Action as VenueAction, AssetMap};
+        use rust_decimal::Decimal;
+
+        use crate::builder::AssetTable;
+        use crate::dispatch::{DispatcherConfig, StrategyDispatcher};
+        use crate::exec::{ExecBackend, UnsignedPost};
+        use crate::risk::RiskGate;
+        use crate::strategies::mm::{MarketMaker, MmConfig};
+        use crate::types::{BOOK_DEPTH, BookSnapshot, CoinRegistry, Level};
+
+        struct CapturingExec {
+            posts: Arc<Mutex<Vec<UnsignedPost>>>,
+            full: bool,
+        }
+        impl ExecBackend for CapturingExec {
+            fn try_send(&mut self, post: UnsignedPost) -> bool {
+                if self.full {
+                    return false;
+                }
+                self.posts.lock().unwrap().push(post);
+                true
+            }
+        }
+
+        fn book(px: &str) -> BookSnapshot {
+            let mut book = BookSnapshot {
+                bids: [Level::default(); BOOK_DEPTH],
+                asks: [Level::default(); BOOK_DEPTH],
+                n_bids: 1,
+                n_asks: 1,
+                time_ms: 0,
+            };
+            let level = Level {
+                px: px.parse().unwrap(),
+                sz: Decimal::ONE,
+                n: 1,
+            };
+            book.bids[0] = level;
+            book.asks[0] = level;
+            book
+        }
+
+        let registry = CoinRegistry::from_coins(&["BTC".into()]);
+        let mut map = AssetMap::new();
+        map.insert_perp_dex(
+            None,
+            None,
+            &Meta {
+                universe: vec![WireAssetMeta {
+                    name: "BTC".into(),
+                    sz_decimals: 3,
+                    max_leverage: 40,
+                    is_delisted: false,
+                    only_isolated: false,
+                }],
+            },
+        );
+        let table = AssetTable::from_markets(&registry, &map);
+
+        let exec = CapturingExec {
+            posts: Arc::new(Mutex::new(Vec::new())),
+            full: false,
+        };
+        let posts = exec.posts.clone();
+
+        let mm = MarketMaker::new(MmConfig {
+            coin: CoinId(0),
+            sz_decimals: 3,
+            levels: 2,
+            half_spread_bps: Decimal::from(5),
+            level_step_bps: Decimal::from(5),
+            size_per_level: Decimal::ONE,
+            max_inventory: Decimal::from(10),
+            max_skew_bps: Decimal::from(5),
+            vol_pull_bps: Decimal::from(50),
+            refresh_bps: Decimal::from(2),
+        });
+        let dispatcher = StrategyDispatcher::new(
+            vec![Box::new(mm)],
+            registry,
+            table,
+            RiskGate::default(),
+            Some(Box::new(exec)),
+            DispatcherConfig::default(),
+        );
+
+        let (handles, inputs) = inputs(16, 16);
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let config = LoopConfig {
+            spin_us: 0,
+            coin_count: 1,
+        };
+        let mut engine = EngineLoop::with_dispatcher(inputs, dispatcher, config, stop_rx);
+
+        handles.send_market(MarketUpdate::Book {
+            coin: CoinId(0),
+            stamp: Stamp {
+                mono_ns: 1_000,
+                ..Default::default()
+            },
+            book: book("100"),
+        });
+        assert_eq!(engine.iterate(1_000), 1);
+
+        let posts = posts.lock().unwrap();
+        assert_eq!(posts.len(), 1, "one bulk order post");
+        match &posts[0].action {
+            VenueAction::Order { orders, .. } => assert_eq!(orders.len(), 4),
+            other => panic!("expected an order post, got {other:?}"),
+        }
+        // E-10 wiring: the iteration was recorded.
+        assert!(engine.recorder().market_drops() == 0);
     }
 }
