@@ -16,6 +16,8 @@ http_port = 9090
 # Enable market-making too with: enabled = ["funding_basis", "market_making"]
 enabled = ["funding_basis"]
 min_edge_bps = 5
+# Slippage (bps) applied to aggressive (limit_px=None) orders, relative to the touch.
+max_slippage_bps = 10
 
 [strategy.market_making]
 coins = ["ETH"]

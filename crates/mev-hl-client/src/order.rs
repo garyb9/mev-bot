@@ -230,11 +230,31 @@ pub fn round_size(market: &Market, size: Decimal) -> Decimal {
 
 /// Round a price to `MAX_PRICE_SIG_FIGS`, capped by the market's decimal limit.
 pub fn round_price(market: &Market, price: Decimal) -> Decimal {
-    let mut rounded = round_sig_figs(price, MAX_PRICE_SIG_FIGS);
+    round_price_with(market, price, RoundingStrategy::MidpointAwayFromZero)
+}
+
+/// Round a price in the safe (aggressive) direction for a marketable order.
+///
+/// A taker buy must round **up** and a taker sell **down**, so rounding never
+/// moves the limit away from the touch and turns a fill into a miss
+/// (SPEC-0010 §12). The result still obeys the significant-figure and decimal
+/// caps.
+pub fn round_price_aggressive(market: &Market, price: Decimal, is_buy: bool) -> Decimal {
+    let strategy = if is_buy {
+        RoundingStrategy::ToPositiveInfinity
+    } else {
+        RoundingStrategy::ToNegativeInfinity
+    };
+    round_price_with(market, price, strategy)
+}
+
+/// Round a price with an explicit [`RoundingStrategy`].
+pub fn round_price_with(market: &Market, price: Decimal, strategy: RoundingStrategy) -> Decimal {
+    let mut rounded = round_sig_figs(price, MAX_PRICE_SIG_FIGS, strategy);
     let max_decimals = max_price_decimals(market);
     if rounded.scale() > max_decimals {
         rounded = rounded
-            .round_dp_with_strategy(max_decimals, RoundingStrategy::MidpointAwayFromZero)
+            .round_dp_with_strategy(max_decimals, strategy)
             .normalize();
     }
     rounded
@@ -281,8 +301,8 @@ pub fn wire_decimal(value: Decimal) -> String {
     value.normalize().to_string()
 }
 
-/// Round to `figs` significant figures (half away from zero).
-fn round_sig_figs(value: Decimal, figs: u32) -> Decimal {
+/// Round to `figs` significant figures with the given strategy.
+fn round_sig_figs(value: Decimal, figs: u32, strategy: RoundingStrategy) -> Decimal {
     if value.is_zero() {
         return value;
     }
@@ -293,10 +313,10 @@ fn round_sig_figs(value: Decimal, figs: u32) -> Decimal {
     let digits = significant_digits(value) as i32;
     let dp = scale - digits + figs as i32;
     let rounded = if dp >= 0 {
-        value.round_dp_with_strategy(dp as u32, RoundingStrategy::MidpointAwayFromZero)
+        value.round_dp_with_strategy(dp as u32, strategy)
     } else {
         let factor = Decimal::from(10i128.pow((-dp) as u32));
-        (value / factor).round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero) * factor
+        (value / factor).round_dp_with_strategy(0, strategy) * factor
     };
     rounded.normalize()
 }
@@ -461,6 +481,31 @@ mod tests {
             wire.c.as_deref(),
             Some("0x0123456789abcdef0123456789abcdef")
         );
+    }
+
+    #[test]
+    fn aggressive_rounding_never_softens_the_limit() {
+        let five_figs = market(0);
+        let raw = dec("12345.678");
+        let up = round_price_aggressive(&five_figs, raw, true);
+        let down = round_price_aggressive(&five_figs, raw, false);
+        assert!(up >= raw, "buy {up} < raw {raw}");
+        assert!(down <= raw, "sell {down} > raw {raw}");
+        assert_eq!(up, dec("12346"));
+        assert_eq!(down, dec("12345"));
+
+        // The decimal cap must also round in the safe direction.
+        let capped = market(5); // perp: max 1 decimal place
+        let raw = dec("1234.5678");
+        let buy = round_price_aggressive(&capped, raw, true);
+        let sell = round_price_aggressive(&capped, raw, false);
+        assert!(buy >= raw, "buy {buy} < raw {raw}");
+        assert!(sell <= raw, "sell {sell} > raw {raw}");
+        for px in [up, down, buy, sell] {
+            assert!(significant_digits(px) <= MAX_PRICE_SIG_FIGS, "{px}");
+        }
+        assert!(buy.scale() <= max_price_decimals(&capped));
+        assert!(sell.scale() <= max_price_decimals(&capped));
     }
 
     /// Rounded values always satisfy the venue's sig-fig / decimal / lot rules.

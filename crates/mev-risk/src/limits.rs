@@ -4,6 +4,8 @@
 //! on: order notional, projected per-coin position notional, open-order count,
 //! and margin utilization. Any missing or unknown input rejects the intent.
 
+use std::collections::BTreeMap;
+
 use rust_decimal::Decimal;
 
 use mev_strategy::OrderIntent;
@@ -44,23 +46,46 @@ impl Default for Limits {
 #[derive(Debug, Clone, Default)]
 pub struct LimitRisk {
     limits: Limits,
+    /// Signed base-unit size approved earlier in the current decision cycle, by
+    /// coin. Reset by [`LimitRisk::begin_cycle`]; projected exposure counts it
+    /// so several intents in one cycle cannot each pass and together breach a
+    /// cap (SPEC-0010 E-0).
+    pending: BTreeMap<String, Decimal>,
 }
 
 impl LimitRisk {
     /// Build a gate from explicit limits.
     pub fn new(limits: Limits) -> Self {
-        Self { limits }
+        Self {
+            limits,
+            pending: BTreeMap::new(),
+        }
     }
 
     /// The configured limits.
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
+
+    /// Start a new decision cycle: forget intents approved in the previous one.
+    pub fn begin_cycle(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Signed size already approved for `coin` this cycle.
+    pub fn pending_size(&self, coin: &str) -> Decimal {
+        self.pending.get(coin).copied().unwrap_or(Decimal::ZERO)
+    }
+
+    fn record_approved(&mut self, coin: &str, is_buy: bool, size: Decimal) {
+        let signed = if is_buy { size } else { -size };
+        *self.pending.entry(coin.to_string()).or_default() += signed;
+    }
 }
 
 impl RiskCheck for LimitRisk {
-    fn check(&self, intent: &OrderIntent, ctx: &RiskContext<'_>) -> Decision {
-        let limits = &self.limits;
+    fn check(&mut self, intent: &OrderIntent, ctx: &RiskContext<'_>) -> Decision {
+        let limits = self.limits.clone();
 
         if intent.size <= Decimal::ZERO {
             return Decision::Reject("non-positive size".into());
@@ -112,10 +137,11 @@ impl RiskCheck for LimitRisk {
         }
 
         // Projected position notional cap (skip for reduce-only and reductions).
+        // Count exposure approved earlier in this cycle as if already position.
         if let Some(cap) = limits.max_position_notional
             && !intent.reduce_only
         {
-            let current = ctx.account.position_szi(&intent.coin);
+            let current = ctx.account.position_szi(&intent.coin) + self.pending_size(&intent.coin);
             let signed = if intent.is_buy() { size } else { -size };
             let projected = (current + signed).abs();
             let current_abs = current.abs();
@@ -143,8 +169,10 @@ impl RiskCheck for LimitRisk {
             ));
         }
 
+        let final_size = if resized { size.normalize() } else { size };
+        self.record_approved(&intent.coin, intent.is_buy(), final_size);
         if resized {
-            Decision::Resize(size.normalize())
+            Decision::Resize(final_size)
         } else {
             Decision::Approve
         }
@@ -283,6 +311,43 @@ mod tests {
         assert_eq!(
             check(limits, &intent(Side::Buy, ds("8"), None), &account),
             Decision::Resize(ds("6"))
+        );
+    }
+
+    #[test]
+    fn same_cycle_intents_count_toward_position_cap() {
+        // Cap $1000 at mid 100 => max 10 BTC. Two 6 BTC buys cannot both pass.
+        let limits = Limits {
+            max_position_notional: Some(ds("1000")),
+            ..Default::default()
+        };
+        let market = market();
+        let ctx = RiskContext {
+            market: &market,
+            account: &AccountView::default(),
+            now_ms: 0,
+        };
+        let mut risk = LimitRisk::new(limits);
+        risk.begin_cycle();
+        assert_eq!(
+            risk.check(&intent(Side::Buy, ds("6"), None), &ctx),
+            Decision::Approve
+        );
+        assert_eq!(
+            risk.check(&intent(Side::Buy, ds("6"), None), &ctx),
+            Decision::Resize(ds("4"))
+        );
+        assert!(matches!(
+            risk.check(&intent(Side::Buy, ds("1"), None), &ctx),
+            Decision::Reject(_)
+        ));
+
+        // A new cycle forgets approvals the account snapshot has caught up on.
+        risk.begin_cycle();
+        assert_eq!(risk.pending_size("BTC"), Decimal::ZERO);
+        assert_eq!(
+            risk.check(&intent(Side::Buy, ds("6"), None), &ctx),
+            Decision::Approve
         );
     }
 

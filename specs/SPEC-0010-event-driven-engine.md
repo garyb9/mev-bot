@@ -345,7 +345,7 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 
 | ID | Title | Size | Depends on | Status |
 |---|---|---|---|---|
-| E-0 | **T0: Safety fixes on the current engine** (before any other work or testnet run) | S | — | ☐ |
+| E-0 | **T0: Safety fixes on the current engine** (before any other work or testnet run) | S | — | ✅ |
 | E-1 | Core types: `CoinId` interning, `Stamp`, `MarketUpdate`, `AccountUpdate`, `Level`, `BookSnapshot`, `Cloid` | S | — | ☐ |
 | E-2 | Typed ingest decoders (no `serde_json::Value`) + market/account channels; handoff bench | M | E-1, SPEC-0008 R-3 | ☐ |
 | E-3 | Engine thread + loop (§9), timers, routes, spin/park | M | E-1 | ☐ |

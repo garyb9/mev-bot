@@ -73,6 +73,9 @@ pub struct StrategyConfig {
     pub enabled: Vec<String>,
     /// Edge buffer in bps subtracted from every trade's gross edge.
     pub min_edge_bps: u32,
+    /// Max slippage (bps) used to price aggressive (`limit_px: None`) orders
+    /// relative to the touch (SPEC-0010 §12).
+    pub max_slippage_bps: u32,
     /// Delta-neutral funding/basis settings.
     pub funding: FundingSettings,
     /// Market-making settings.
@@ -124,6 +127,7 @@ impl Default for StrategyConfig {
         Self {
             enabled: vec!["funding_basis".to_string()],
             min_edge_bps: 5,
+            max_slippage_bps: 10,
             funding: FundingSettings::default(),
             market_making: MmSettings::default(),
         }
@@ -322,6 +326,38 @@ impl Config {
                     "live mode requires HL_ACCOUNT_ADDRESS".into(),
                 ));
             }
+            self.validate_live_limits()?;
+        }
+        Ok(())
+    }
+
+    /// Fail closed: every risk cap must be explicitly finite so no limit
+    /// silently means "unlimited" on the real-money path (SPEC-0004 K-1).
+    fn validate_live_limits(&self) -> Result<()> {
+        for (name, value) in [
+            ("max_order_notional_usd", self.risk.max_order_notional_usd),
+            (
+                "max_position_notional_usd",
+                self.risk.max_position_notional_usd,
+            ),
+            (
+                "max_margin_utilization_bps",
+                self.risk.max_margin_utilization_bps,
+            ),
+        ] {
+            match value {
+                Some(v) if v > Decimal::ZERO => {}
+                _ => {
+                    return Err(Error::Config(format!(
+                        "live mode requires a finite risk {name}"
+                    )));
+                }
+            }
+        }
+        if self.risk.max_open_orders.filter(|cap| *cap > 0).is_none() {
+            return Err(Error::Config(
+                "live mode requires a finite risk max_open_orders".into(),
+            ));
         }
         Ok(())
     }
@@ -409,5 +445,42 @@ mod tests {
         };
         // No HL_LIVE_CONFIRM, no keys: must fail.
         assert!(config.validate().is_err());
+    }
+
+    /// A `live`-shaped config that passes every gate *except* risk limits.
+    fn live_without_risk_limits() -> Config {
+        Config {
+            mode: Mode::Live,
+            account_address: Some("0x0000000000000000000000000000000000000000".into()),
+            agent_private_key: Some(SecretString::from("0x".to_string() + &"1".repeat(64))),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn live_refuses_unset_risk_limits() {
+        // HL_LIVE_CONFIRM is required first; set it only for this test process.
+        // SAFETY (2024 edition `unsafe` env): tests in this binary run in
+        // parallel but none other sets this variable.
+        unsafe { std::env::set_var("HL_LIVE_CONFIRM", "YES") };
+        let config = live_without_risk_limits();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_order_notional_usd"), "{err}");
+
+        let mut with_limits = config.clone();
+        with_limits.risk.max_order_notional_usd = Some(Decimal::from(1_000));
+        with_limits.risk.max_position_notional_usd = Some(Decimal::from(10_000));
+        with_limits.risk.max_margin_utilization_bps = Some(Decimal::from(5_000));
+        with_limits.risk.max_open_orders = Some(10);
+        assert!(with_limits.validate().is_ok());
+        unsafe { std::env::remove_var("HL_LIVE_CONFIRM") };
+    }
+
+    #[test]
+    fn default_risk_limits_are_unset_and_safe() {
+        let config = Config::default();
+        assert!(config.risk.max_order_notional_usd.is_none());
+        assert!(config.risk.max_open_orders.is_none());
+        assert_eq!(config.strategy.max_slippage_bps, 10);
     }
 }

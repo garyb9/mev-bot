@@ -43,9 +43,13 @@ pub struct RiskContext<'a> {
 }
 
 /// A pre-trade risk check. Implementations are synchronous and deterministic.
+///
+/// `check` takes `&mut self` so an implementation can account for intents it
+/// already approved in the same decision cycle (pending exposure the account
+/// snapshot does not yet reflect); see [`limits::LimitRisk::begin_cycle`].
 pub trait RiskCheck: Send + Sync {
     /// Evaluate an intent against current limits and portfolio state.
-    fn check(&self, intent: &OrderIntent, ctx: &RiskContext<'_>) -> Decision;
+    fn check(&mut self, intent: &OrderIntent, ctx: &RiskContext<'_>) -> Decision;
 }
 
 #[cfg(test)]

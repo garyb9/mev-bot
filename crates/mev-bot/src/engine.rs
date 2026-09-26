@@ -11,8 +11,9 @@ use mev_core::config::{Config, Mode, Network};
 use mev_core::db::writer::{DbWriter, WriteCmd};
 use mev_core::db::{Db, EventRow, FillRecord, OrderRecord};
 use mev_hl_client::{
-    AssetMap, CancelByCloidWire, CancelWire, ExchangeApi, InfoApi, MIN_ORDER_NOTIONAL,
-    MarketSelector, MarketState, OrderParams, Subscription, Tolerance, build_order_wire,
+    AssetMap, CancelByCloidWire, CancelWire, CloidFactory, ExchangeApi, InfoApi,
+    MIN_ORDER_NOTIONAL, Market, MarketSelector, MarketState, OrderParams, OrderStatus,
+    Subscription, Tolerance, build_order_wire, round_price_aggressive,
 };
 use mev_risk::{Decision, LimitRisk, Limits, RiskCheck, RiskContext};
 use mev_strategy::{
@@ -204,6 +205,8 @@ pub struct Engine {
     exchange: Option<Arc<dyn ExchangeApi>>,
     account: Arc<RwLock<AccountView>>,
     recorder: Recorder,
+    cloids: CloidFactory,
+    max_slippage_bps: Decimal,
 }
 
 impl Engine {
@@ -245,6 +248,8 @@ impl Engine {
             exchange,
             account: Arc::new(RwLock::new(AccountView::default())),
             recorder: Recorder::new(writer, session_id),
+            cloids: CloidFactory::new(),
+            max_slippage_bps: Decimal::from(cfg.strategy.max_slippage_bps),
         }
     }
 
@@ -269,6 +274,7 @@ impl Engine {
     }
 
     async fn step(&mut self, state: &Arc<RwLock<MarketState>>) -> Result<()> {
+        self.risk.begin_cycle();
         let now = SystemClock.now_ms();
         let market = {
             let guard = state.read().expect("market state lock poisoned");
@@ -377,6 +383,15 @@ impl Engine {
                 return Ok(Vec::new());
             }
         };
+        // Mandatory cloid: every accepted order is identifiable for
+        // reconciliation and idempotent retry (SPEC-0002 H-2).
+        let effective = match effective.cloid {
+            Some(_) => effective,
+            None => OrderIntent {
+                cloid: Some(self.cloids.next()),
+                ..effective
+            },
+        };
 
         self.record_order(&effective, "intent", None, now);
         match &mut self.paper {
@@ -444,9 +459,26 @@ impl Engine {
             warn!(coin = %intent.coin, "no market metadata; skipping live order");
             return Ok(());
         };
-        let Some(limit_px) = intent.limit_px.or_else(|| market.mid(&intent.coin)) else {
-            warn!(coin = %intent.coin, "no price to build live order");
-            return Ok(());
+        let limit_px = match intent.limit_px {
+            Some(px) => px,
+            None => {
+                // Aggressive orders take the touch plus slippage, never the mid
+                // (SPEC-0010 §12 / E-0).
+                match aggressive_limit_px(
+                    market_meta,
+                    market,
+                    &intent.coin,
+                    intent.is_buy(),
+                    self.max_slippage_bps,
+                ) {
+                    Some(px) => px,
+                    None => {
+                        warn!(coin = %intent.coin, "no touch to price aggressive live order");
+                        self.record_order(intent, "reject", Some("no reference price"), now);
+                        return Ok(());
+                    }
+                }
+            }
         };
         let params = OrderParams {
             is_buy: intent.is_buy(),
@@ -464,8 +496,16 @@ impl Engine {
                 return Ok(());
             }
         };
+        // Read the venue's per-order status instead of assuming "submitted":
+        // rejected orders must not look live (SPEC-0010 §2 item 7 / E-0).
         match exchange.place(vec![wire]).await {
-            Ok(_) => self.record_order(intent, "submitted", None, now),
+            Ok(response) => match response.statuses.first() {
+                Some(status) => {
+                    let (kind, label) = order_status_fields(status);
+                    self.record_order(intent, kind, Some(&label), now);
+                }
+                None => self.record_order(intent, "submitted", None, now),
+            },
             Err(err) => {
                 warn!(coin = %intent.coin, error = %err, "live submit failed");
                 self.record_order(intent, "reject", Some(&err.to_string()), now);
@@ -524,6 +564,58 @@ impl Engine {
 
 fn side_str(is_buy: bool) -> &'static str {
     if is_buy { "buy" } else { "sell" }
+}
+
+/// The best opposite touch for an aggressive order (buy lifts the ask, sell
+/// hits the bid), falling back to the mid when a side is empty.
+fn touch(market: &MarketView, coin: &str, is_buy: bool) -> Option<Decimal> {
+    market
+        .book(coin)
+        .and_then(|book| {
+            if is_buy {
+                book.best_ask()
+            } else {
+                book.best_bid()
+            }
+        })
+        .map(|(px, _)| px)
+        .or_else(|| market.mid(coin))
+}
+
+/// Aggressive limit for a `limit_px: None` order: the touch moved by
+/// `max_slippage_bps`, rounded in the safe direction and never the mid
+/// (SPEC-0010 §12).
+fn aggressive_limit_px(
+    meta: &Market,
+    market: &MarketView,
+    coin: &str,
+    is_buy: bool,
+    max_slippage_bps: Decimal,
+) -> Option<Decimal> {
+    let base = touch(market, coin, is_buy)?;
+    if base <= Decimal::ZERO {
+        return None;
+    }
+    let factor = if is_buy {
+        Decimal::ONE + max_slippage_bps / Decimal::from(10_000)
+    } else {
+        Decimal::ONE - max_slippage_bps / Decimal::from(10_000)
+    };
+    let raw = base * factor;
+    if raw <= Decimal::ZERO {
+        return None;
+    }
+    Some(round_price_aggressive(meta, raw, is_buy))
+}
+
+/// Map a venue per-order status to an order-record `(kind, status)` pair.
+fn order_status_fields(status: &OrderStatus) -> (&'static str, String) {
+    match status {
+        OrderStatus::Resting => ("resting", "resting".to_string()),
+        OrderStatus::Filled => ("filled", "filled".to_string()),
+        OrderStatus::Rejected(reason) => ("reject", format!("rejected:{}", reason.as_str())),
+        OrderStatus::Other(other) => ("other", other.clone()),
+    }
 }
 
 /// Poll `/info` for account state and publish it to the shared view.
@@ -811,6 +903,92 @@ mod tests {
             vol_pull_bps: ds("50"),
             refresh_bps: ds("2"),
         }))]
+    }
+
+    fn btc_market(sz_decimals: u32) -> Market {
+        use mev_hl_client::AssetMap;
+        use mev_hl_client::types::{AssetMeta, Meta};
+        let mut map = AssetMap::new();
+        map.insert_perp_dex(
+            None,
+            None,
+            &Meta {
+                universe: vec![AssetMeta {
+                    name: "BTC".into(),
+                    sz_decimals,
+                    max_leverage: 40,
+                    is_delisted: false,
+                    only_isolated: false,
+                }],
+            },
+        );
+        map.get("BTC").unwrap().clone()
+    }
+
+    fn market_view() -> MarketView {
+        let mut view = MarketView::new();
+        view.insert_book(
+            "BTC",
+            BookView {
+                bids: vec![(ds("9990"), ds("1"))],
+                asks: vec![(ds("10010"), ds("1"))],
+                sz_decimals: 0,
+                time: 0,
+            },
+        );
+        view
+    }
+
+    #[test]
+    fn aggressive_buy_takes_ask_and_never_mid() {
+        let meta = btc_market(0);
+        let view = market_view();
+        // Ask 10010 + 10 bps = 10020.01 -> rounded toward buying up.
+        let px = aggressive_limit_px(&meta, &view, "BTC", true, ds("10")).unwrap();
+        assert!(px > ds("10010"), "must be above the touch, got {px}");
+        assert!(px >= ds("10020.01"), "rounded up, got {px}");
+        assert!(px > view.mid("BTC").unwrap(), "must not be the mid");
+    }
+
+    #[test]
+    fn aggressive_sell_takes_bid_and_never_mid() {
+        let meta = btc_market(0);
+        let view = market_view();
+        // Bid 9990 - 10 bps = 9980.01 -> rounded toward selling down.
+        let px = aggressive_limit_px(&meta, &view, "BTC", false, ds("10")).unwrap();
+        assert!(px < ds("9990"), "must be below the touch, got {px}");
+        assert!(px <= ds("9980.01"), "rounded down, got {px}");
+        assert!(px < view.mid("BTC").unwrap(), "must not be the mid");
+    }
+
+    #[test]
+    fn aggressive_price_without_book_uses_mid_fallback() {
+        let meta = btc_market(0);
+        let mut view = MarketView::new();
+        let mut mids = BTreeMap::new();
+        mids.insert("BTC".to_string(), ds("100"));
+        view.set_mids(mids);
+        assert_eq!(
+            aggressive_limit_px(&meta, &view, "BTC", true, ds("10")).unwrap(),
+            ds("100.1")
+        );
+    }
+
+    #[test]
+    fn status_mapping_distinguishes_rejects() {
+        use mev_hl_client::RejectReason;
+        assert_eq!(
+            order_status_fields(&OrderStatus::Resting),
+            ("resting", "resting".to_string())
+        );
+        assert_eq!(
+            order_status_fields(&OrderStatus::Filled),
+            ("filled", "filled".to_string())
+        );
+        assert_eq!(
+            order_status_fields(&OrderStatus::Rejected(RejectReason::TickRejected)),
+            ("reject", "rejected:tickRejected".to_string())
+        );
     }
 
     #[tokio::test]

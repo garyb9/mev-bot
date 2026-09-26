@@ -6,6 +6,7 @@
 
 pub mod assets;
 pub mod client;
+pub mod cloid;
 pub mod deadman;
 pub mod exchange;
 pub mod market;
@@ -18,6 +19,7 @@ pub mod ws_exchange;
 
 pub use assets::{AssetMap, Market, MarketKind, MarketSelector};
 pub use client::{HttpInfo, InfoApi};
+pub use cloid::CloidFactory;
 pub use deadman::DeadMansSwitch;
 pub use exchange::{
     ActionResponse, ExchangeApi, ExchangeRequest, ExchangeResponse, HttpExchange, OrderResponse,
@@ -27,7 +29,8 @@ pub use market::{FEED_BOOK, FEED_CTX, FeedAge, MarketState, OrderBook, Tolerance
 pub use nonce::{NonceManager, ResetReason, now_ms};
 pub use order::{
     Action, CancelByCloidWire, CancelWire, Grouping, MIN_ORDER_NOTIONAL, OrderParams, OrderType,
-    OrderWire, Tif, Tpsl, build_order_wire, round_price, round_size, wire_decimal,
+    OrderWire, Tif, Tpsl, build_order_wire, round_price, round_price_aggressive, round_price_with,
+    round_size, wire_decimal,
 };
 pub use signing::{AgentSigner, Signature, action_hash, recover_address, signing_hash};
 pub use types::{
