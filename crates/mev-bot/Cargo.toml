@@ -1,0 +1,20 @@
+[package]
+name = "mev-bot"
+description = "Orchestration binary for the Hyperliquid-first trading system."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hl"
+path = "src/main.rs"
+
+[dependencies]
+mev-core.workspace = true
+mev-hl-client.workspace = true
+mev-hyperevm.workspace = true
+mev-metrics.workspace = true
+mev-risk.workspace = true
+mev-strategy.workspace = true
