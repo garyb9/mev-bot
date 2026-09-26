@@ -167,11 +167,11 @@ Metrics: submit latency histogram (by transport), order rejects by status, nonce
 
 ## 15. Acceptance criteria
 
-- Signatures recover to the configured agent address on mainnet and testnet.
-- Testnet order round-trip succeeds end-to-end; no nonce reuse observed.
-- Local rounding rejects invalid orders before any network call.
-- `observe` mode makes zero `/exchange` requests.
-- Sub-10 ms p50 (local) for build+sign of a single order on the reference machine (target, measured in SPEC-0001 harness).
+- [x] Signatures recover to the configured agent address on mainnet and testnet (golden vectors + official-SDK recovery).
+- [ ] **OPEN** — Testnet order round-trip succeeds end-to-end; no nonce reuse observed. Blocked on a funded, agent-approved testnet account; the path is wired and mock-tested only.
+- [x] Local rounding rejects invalid orders before any network call.
+- [x] `observe` mode makes zero `/exchange` requests.
+- [ ] Sub-10 ms p50 (local) for build+sign of a single order on the reference machine (target, measured in SPEC-0001 harness).
 
 ## 16. Resolved decisions
 
