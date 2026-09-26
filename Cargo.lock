@@ -2441,7 +2441,6 @@ dependencies = [
 name = "mev-strategy"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "mev-core",
  "mev-hl-client",
  "rust_decimal",

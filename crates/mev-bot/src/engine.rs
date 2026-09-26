@@ -10,16 +10,20 @@ use mev_core::clock::{Clock, SystemClock};
 use mev_core::config::{Config, Mode, Network};
 use mev_core::db::writer::{DbWriter, WriteCmd};
 use mev_core::db::{Db, EventRow, FillRecord, OrderRecord};
+use mev_engine::{
+    AccountState, Action, Actions, AssetCtxLite, BOOK_DEPTH, BookSnapshot, Cloid, CoinRegistry,
+    Ctx, FundingBasis, FundingConfig, Interests, Level, MarketMaker, MarketSlot, MmConfig,
+    OrderEvent, OrderEventKind, Stamp, Strategy, Stream,
+};
 use mev_hl_client::{
-    AssetMap, CancelByCloidWire, CancelWire, CloidFactory, ExchangeApi, InfoApi,
-    MIN_ORDER_NOTIONAL, Market, MarketSelector, MarketState, OrderParams, OrderResolution,
-    OrderStatus, Subscription, Tolerance, build_order_wire, round_price_aggressive,
+    AssetMap, CancelByCloidWire, CloidFactory, ExchangeApi, InfoApi, MIN_ORDER_NOTIONAL, Market,
+    MarketSelector, MarketState, OrderParams, OrderResolution, OrderStatus, Subscription,
+    Tolerance, build_order_wire, round_price_aggressive,
 };
 use mev_risk::{Decision, LimitRisk, Limits, RiskCheck, RiskContext};
 use mev_strategy::{
-    AccountView, Action, BookView, CancelIntent, CostModel, Event, FeeRates, FillEvent,
-    FundingBasis, FundingConfig, Instrument, MarketMaker, MarketView, MmConfig, OpenOrderView,
-    OrderIntent, PaperExecutor, PositionView, Strategy, StrategyContext, StrategyId, Trigger,
+    AccountView, BookView, CostModel, Event, FeeRates, FillEvent, Instrument, MarketView,
+    OpenOrderView, OrderIntent, PaperExecutor, PositionView, Side, StrategyId, TimeInForce,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -41,9 +45,15 @@ pub struct EngineBuild {
     pub instruments: BTreeMap<String, Instrument>,
     /// Resolved market metadata for live order building.
     pub markets: AssetMap,
+    /// Interned coin map shared with the strategies' configs.
+    pub registry: CoinRegistry,
 }
 
 /// Instantiate the enabled strategies from config.
+///
+/// Two passes: the first resolves every configured coin and builds the interned
+/// [`CoinRegistry`], the second constructs strategies with their `CoinId`s and
+/// derives the feed subscriptions from each strategy's [`Interests`].
 pub fn build(cfg: &Config, selector: &MarketSelector) -> Result<EngineBuild> {
     let cost = CostModel::new(Decimal::from(cfg.strategy.min_edge_bps));
     let mut build = EngineBuild {
@@ -53,15 +63,71 @@ pub fn build(cfg: &Config, selector: &MarketSelector) -> Result<EngineBuild> {
         sz_decimals: BTreeMap::new(),
         instruments: BTreeMap::new(),
         markets: selector.asset_map().clone(),
+        registry: CoinRegistry::default(),
     };
 
+    // Pass 1: register every strategy coin and its routing metadata.
     for id in &cfg.strategy.enabled {
         match id.as_str() {
-            mev_strategy::funding::ID => build_funding(&mut build, cfg, selector, cost)?,
-            mev_strategy::mm::ID => build_market_making(&mut build, cfg, selector)?,
+            mev_engine::strategies::funding::ID => {
+                let f = &cfg.strategy.funding;
+                let perp = selector
+                    .resolve(&f.perp_coin)
+                    .with_context(|| format!("resolving perp {}", f.perp_coin))?;
+                let spot = selector
+                    .resolve(&f.spot_pair)
+                    .with_context(|| format!("resolving spot {}", f.spot_pair))?;
+                build
+                    .instruments
+                    .insert(perp.coin.clone(), Instrument::perp());
+                build
+                    .instruments
+                    .insert(spot.coin.clone(), Instrument::spot(f.spot_token.clone()));
+                build
+                    .sz_decimals
+                    .insert(perp.coin.clone(), perp.sz_decimals);
+                build
+                    .sz_decimals
+                    .insert(spot.coin.clone(), spot.sz_decimals);
+                build.coins.push(perp.coin);
+                build.coins.push(spot.coin);
+            }
+            mev_engine::strategies::mm::ID => {
+                for coin in &cfg.strategy.market_making.coins {
+                    let market = selector
+                        .resolve(coin)
+                        .with_context(|| format!("resolving mm coin {coin}"))?;
+                    build
+                        .instruments
+                        .insert(market.coin.clone(), Instrument::perp());
+                    build
+                        .sz_decimals
+                        .insert(market.coin.clone(), market.sz_decimals);
+                    build.coins.push(market.coin);
+                }
+            }
             other => warn!(strategy = other, "unknown strategy id; ignoring"),
         }
     }
+    build.registry = CoinRegistry::from_coins(&build.coins);
+
+    // Pass 2: construct the strategies now that ids are stable.
+    for id in &cfg.strategy.enabled {
+        match id.as_str() {
+            mev_engine::strategies::funding::ID => {
+                build_funding(&mut build, cfg, selector, cost)?;
+            }
+            mev_engine::strategies::mm::ID => build_market_making(&mut build, cfg, selector)?,
+            _ => {}
+        }
+    }
+
+    let subscriptions: Vec<Subscription> = build
+        .strategies
+        .iter()
+        .flat_map(|strategy| interests_to_subscriptions(&strategy.interests(), &build.registry))
+        .collect();
+    build.subscriptions = subscriptions;
     Ok(build)
 }
 
@@ -75,14 +141,13 @@ fn build_market_making(
         let market = selector
             .resolve(coin)
             .with_context(|| format!("resolving mm coin {coin}"))?;
-        build
-            .instruments
-            .insert(market.coin.clone(), Instrument::perp());
-        build
-            .sz_decimals
-            .insert(market.coin.clone(), market.sz_decimals);
+        let coin_id = build
+            .registry
+            .id(&market.coin)
+            .with_context(|| format!("coin {} not interned", market.coin))?;
         let config = MmConfig {
-            coin: market.coin.clone(),
+            coin: coin_id,
+            sz_decimals: market.sz_decimals,
             levels: mm.levels,
             half_spread_bps: Decimal::from(mm.half_spread_bps),
             level_step_bps: Decimal::from(mm.level_step_bps),
@@ -92,10 +157,7 @@ fn build_market_making(
             vol_pull_bps: Decimal::from(mm.vol_pull_bps),
             refresh_bps: Decimal::from(mm.refresh_bps),
         };
-        let strategy = MarketMaker::new(config);
-        build.subscriptions.extend(strategy.subscriptions());
-        build.coins.push(market.coin);
-        build.strategies.push(Box::new(strategy));
+        build.strategies.push(Box::new(MarketMaker::new(config)));
     }
     Ok(())
 }
@@ -113,24 +175,20 @@ fn build_funding(
     let spot = selector
         .resolve(&f.spot_pair)
         .with_context(|| format!("resolving spot {}", f.spot_pair))?;
-
-    build
-        .instruments
-        .insert(perp.coin.clone(), Instrument::perp());
-    build
-        .instruments
-        .insert(spot.coin.clone(), Instrument::spot(f.spot_token.clone()));
-    build
-        .sz_decimals
-        .insert(perp.coin.clone(), perp.sz_decimals);
-    build
-        .sz_decimals
-        .insert(spot.coin.clone(), spot.sz_decimals);
+    let perp_id = build
+        .registry
+        .id(&perp.coin)
+        .with_context(|| format!("coin {} not interned", perp.coin))?;
+    let spot_id = build
+        .registry
+        .id(&spot.coin)
+        .with_context(|| format!("coin {} not interned", spot.coin))?;
 
     let config = FundingConfig {
-        perp_coin: perp.coin.clone(),
-        spot_coin: spot.coin.clone(),
+        perp_coin: perp_id,
+        spot_coin: spot_id,
         spot_token: f.spot_token.clone(),
+        spot_sz_decimals: spot.sz_decimals,
         target_notional: f.target_notional_usd,
         horizon_hours: Decimal::from(f.horizon_hours),
         exit_threshold_bps: Decimal::from(f.exit_threshold_bps),
@@ -138,11 +196,41 @@ fn build_funding(
         rebalance_drift_bps: Decimal::from(f.rebalance_drift_bps),
     };
     let strategy = FundingBasis::new(config, cost, FeeRates::PERP, FeeRates::SPOT, f.maker);
-    build.subscriptions.extend(strategy.subscriptions());
-    build.coins.push(perp.coin);
-    build.coins.push(spot.coin);
     build.strategies.push(Box::new(strategy));
     Ok(())
+}
+
+/// Map strategy [`Interests`] onto market-data [`Subscription`]s.
+///
+/// Book/BBO interest becomes an L2 book feed and context interest an asset
+/// context feed; duplicate subscriptions are collapsed.
+pub fn interests_to_subscriptions(
+    interests: &Interests,
+    registry: &CoinRegistry,
+) -> Vec<Subscription> {
+    let mut subs: Vec<Subscription> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (coin, stream) in &interests.coins {
+        let Some(name) = registry.coin(*coin) else {
+            continue;
+        };
+        let sub = match stream {
+            Stream::Book | Stream::Bbo => Subscription::L2Book {
+                coin: name.to_string(),
+            },
+            Stream::Ctx => Subscription::ActiveAssetCtx {
+                coin: name.to_string(),
+            },
+            Stream::Trades => Subscription::Trades {
+                coin: name.to_string(),
+            },
+        };
+        let key = serde_json::to_string(&sub).unwrap_or_default();
+        if seen.insert(key) {
+            subs.push(sub);
+        }
+    }
+    subs
 }
 
 /// Appends input events to the SQLite replay log.
@@ -199,6 +287,8 @@ pub struct Engine {
     strategies: Vec<Box<dyn Strategy>>,
     coins: Vec<String>,
     sz_decimals: BTreeMap<String, u32>,
+    /// Interned coin map backing the strategy context.
+    registry: CoinRegistry,
     markets: AssetMap,
     risk: LimitRisk,
     paper: Option<PaperExecutor>,
@@ -210,6 +300,22 @@ pub struct Engine {
     recorder: Recorder,
     cloids: CloidFactory,
     max_slippage_bps: Decimal,
+    /// Accepted placements keyed by cloid, so a v2 [`Action::Cancel`]/[`Action::Modify`]
+    /// (which carry only a cloid) can be routed to the venue and rebuilt.
+    tracked_cloids: BTreeMap<Cloid, TrackedOrder>,
+}
+
+/// Metadata about an accepted order, retained so a cloid-only modify can be
+/// turned into a cancel-then-place.
+#[derive(Debug, Clone)]
+struct TrackedOrder {
+    coin: String,
+    asset_id: u32,
+    strategy: StrategyId,
+    side: Side,
+    tif: TimeInForce,
+    reduce_only: bool,
+    rationale: String,
 }
 
 impl Engine {
@@ -245,6 +351,7 @@ impl Engine {
             strategies: build.strategies,
             coins: build.coins,
             sz_decimals: build.sz_decimals,
+            registry: build.registry,
             markets: build.markets,
             risk,
             paper,
@@ -254,6 +361,7 @@ impl Engine {
             recorder: Recorder::new(writer, session_id),
             cloids: CloidFactory::new(),
             max_slippage_bps: Decimal::from(cfg.strategy.max_slippage_bps),
+            tracked_cloids: BTreeMap::new(),
         }
     }
 
@@ -305,33 +413,39 @@ impl Engine {
         self.recorder.record(&Event::Account(account.clone()), now);
         self.recorder.record(&Event::Timer { every_ms: 1_000 }, now);
 
-        let mut proposals: Vec<Vec<Action>> = Vec::new();
-        for strategy in &mut self.strategies {
-            let ctx = StrategyContext {
-                now_ms: now,
-                trigger: Trigger::Timer,
-                market: &market,
-                account: &account,
+        // Build the v2 context from locals (including a cloned registry) so no
+        // `self` borrow is held while strategies are driven; engine state is
+        // only touched again after the strategy pass ends.
+        let registry = self.registry.clone();
+        let slots = to_slots(&registry, &market);
+        let account_state = to_account(&registry, &account);
+        let stamp = Stamp {
+            t_recv_ns: (now as i64) * 1_000_000,
+            ..Default::default()
+        };
+
+        let mut pending: Vec<Vec<Action>> = Vec::new();
+        {
+            let ctx = Ctx {
+                now: stamp,
+                markets: &slots,
+                account: &account_state,
+                registry: &registry,
             };
-            let actions = strategy.on_event(&ctx).await?;
-            if !actions.is_empty() {
-                proposals.push(actions);
+            for strategy in &mut self.strategies {
+                let mut actions = Actions::new();
+                for coin in strategy.interests().distinct_coins() {
+                    strategy.on_market(coin, &ctx, &mut actions);
+                }
+                if !actions.is_empty() {
+                    pending.push(actions.take().into_vec());
+                }
             }
         }
 
         let mut fills: Vec<FillEvent> = Vec::new();
-        for actions in proposals {
-            for action in actions {
-                match action {
-                    Action::Place(intent) => {
-                        fills.extend(
-                            self.gate_and_execute(intent, &market, &account, now)
-                                .await?,
-                        );
-                    }
-                    Action::Cancel(cancel) => self.cancel(&cancel, now).await,
-                }
-            }
+        for actions in pending {
+            fills.extend(self.apply_actions(actions, &market, &account, now).await?);
         }
 
         if let Some(paper) = &mut self.paper {
@@ -342,21 +456,87 @@ impl Engine {
         for fill in &fills {
             self.record_fill(fill, now);
         }
-        for fill in &fills {
-            let Some(sid) = fill.strategy.clone() else {
-                continue;
+
+        // Deliver fills back to the owning strategy as v2 order events.
+        let mut order_actions: Vec<Vec<Action>> = Vec::new();
+        if !fills.is_empty() {
+            let ctx = Ctx {
+                now: stamp,
+                markets: &slots,
+                account: &account_state,
+                registry: &registry,
             };
-            for strategy in &mut self.strategies {
-                if strategy.id() == sid {
-                    strategy.on_fill(fill).await?;
+            for fill in &fills {
+                let Some(sid) = fill.strategy.clone() else {
+                    continue;
+                };
+                let Some(coin) = registry.id(&fill.coin) else {
+                    continue;
+                };
+                let event = OrderEvent {
+                    stamp,
+                    cloid: None,
+                    oid: 0,
+                    coin,
+                    side: fill.side,
+                    px: fill.px,
+                    sz: fill.sz,
+                    fee: fill.fee,
+                    maker: fill.maker,
+                    reduce_only: fill.reduce_only,
+                    kind: OrderEventKind::Fill,
+                };
+                for strategy in &mut self.strategies {
+                    if strategy.id() == sid {
+                        let mut actions = Actions::new();
+                        strategy.on_order(&event, &ctx, &mut actions);
+                        if !actions.is_empty() {
+                            order_actions.push(actions.take().into_vec());
+                        }
+                    }
                 }
             }
+        }
+        for actions in order_actions {
+            fills.extend(self.apply_actions(actions, &market, &account, now).await?);
         }
 
         if let Some(paper) = &self.paper {
             metrics::gauge!(names::PAPER_FEES_PAID).set(paper.fees_paid().to_f64().unwrap_or(0.0));
         }
         Ok(())
+    }
+
+    /// Gate and execute a strategy's actions, returning any resulting fills.
+    async fn apply_actions(
+        &mut self,
+        actions: Vec<Action>,
+        market: &MarketView,
+        account: &AccountView,
+        now: u64,
+    ) -> Result<Vec<FillEvent>> {
+        let mut fills = Vec::new();
+        for action in actions {
+            match action {
+                Action::Place(intent) => {
+                    fills.extend(self.gate_and_execute(intent, market, account, now).await?);
+                }
+                Action::Cancel { cloid } => self.cancel_cloid(&cloid, now).await,
+                Action::Modify { cloid, px, sz } => {
+                    fills.extend(
+                        self.modify_cloid(&cloid, px, sz, market, account, now)
+                            .await?,
+                    );
+                }
+                Action::PlaceGroup(group) => {
+                    warn!(
+                        legs = group.legs.len(),
+                        "multi-leg PlaceGroup is not supported yet; ignoring"
+                    );
+                }
+            }
+        }
+        Ok(fills)
     }
 
     fn snapshot_market(&self, state: &MarketState) -> MarketView {
@@ -408,6 +588,27 @@ impl Engine {
                 ..effective
             },
         };
+        // Track the cloid so a later cloid-only cancel/modify can be routed
+        // (paper orders included: the simulate path needs it too).
+        if let Some(cloid) = effective.cloid.as_deref().and_then(Cloid::from_hex) {
+            let asset_id = self
+                .markets
+                .get(&effective.coin)
+                .map(Market::asset_id)
+                .unwrap_or(0);
+            self.tracked_cloids.insert(
+                cloid,
+                TrackedOrder {
+                    coin: effective.coin.clone(),
+                    asset_id,
+                    strategy: effective.strategy.clone(),
+                    side: effective.side,
+                    tif: effective.tif,
+                    reduce_only: effective.reduce_only,
+                    rationale: effective.rationale.clone(),
+                },
+            );
+        }
 
         self.record_order(&effective, "intent", None, now);
         match &mut self.paper {
@@ -419,42 +620,34 @@ impl Engine {
         }
     }
 
-    async fn cancel(&mut self, cancel: &CancelIntent, now: u64) {
+    /// Cancel an order by cloid (from a v2 [`Action::Cancel`]).
+    async fn cancel_cloid(&mut self, cloid: &Cloid, now: u64) {
+        let cloid_hex = cloid.to_hex();
         if let Some(paper) = &mut self.paper {
-            paper.cancel(cancel.cloid.as_deref(), cancel.oid);
+            paper.cancel(Some(&cloid_hex), None);
         }
+        let Some(order) = self.tracked_cloids.remove(cloid) else {
+            warn!(cloid = %cloid_hex, "cancel for untracked cloid; skipping");
+            return;
+        };
         if let Some(exchange) = &self.exchange
-            && let Some(market_meta) = self.markets.get(&cancel.coin)
+            && let Err(err) = exchange
+                .cancel_by_cloid(vec![CancelByCloidWire {
+                    asset: order.asset_id,
+                    cloid: cloid_hex.clone(),
+                }])
+                .await
         {
-            if let Some(cloid) = &cancel.cloid {
-                if let Err(err) = exchange
-                    .cancel_by_cloid(vec![CancelByCloidWire {
-                        asset: market_meta.asset_id(),
-                        cloid: cloid.clone(),
-                    }])
-                    .await
-                {
-                    warn!(coin = %cancel.coin, error = %err, "live cancel failed");
-                }
-            } else if let Some(oid) = cancel.oid
-                && let Err(err) = exchange
-                    .cancel(vec![CancelWire {
-                        a: market_meta.asset_id(),
-                        o: oid,
-                    }])
-                    .await
-            {
-                warn!(coin = %cancel.coin, error = %err, "live cancel failed");
-            }
+            warn!(coin = %order.coin, error = %err, "live cancel failed");
         }
         let record = OrderRecord {
             ts_ms: now,
-            strategy: Some(cancel.strategy.to_string()),
-            coin: cancel.coin.clone(),
-            side: String::new(),
+            strategy: Some(order.strategy.to_string()),
+            coin: order.coin,
+            side: side_str(order.side.is_buy()).to_string(),
             kind: "cancel".to_string(),
-            cloid: cancel.cloid.clone(),
-            oid: cancel.oid,
+            cloid: Some(cloid_hex),
+            oid: None,
             px: None,
             sz: None,
             reduce_only: None,
@@ -467,7 +660,43 @@ impl Engine {
         });
     }
 
-    async fn submit_live(&self, intent: &OrderIntent, market: &MarketView, now: u64) -> Result<()> {
+    /// Modify an order via cancel-then-place, rebuilt from the tracked cloid.
+    async fn modify_cloid(
+        &mut self,
+        cloid: &Cloid,
+        px: Decimal,
+        sz: Decimal,
+        market: &MarketView,
+        account: &AccountView,
+        now: u64,
+    ) -> Result<Vec<FillEvent>> {
+        let Some(order) = self.tracked_cloids.get(cloid).cloned() else {
+            warn!(cloid = %cloid.to_hex(), "modify for untracked cloid; skipping");
+            return Ok(Vec::new());
+        };
+        self.cancel_cloid(cloid, now).await;
+        let intent = OrderIntent {
+            strategy: order.strategy,
+            coin: order.coin,
+            side: order.side,
+            limit_px: Some(px),
+            size: sz,
+            tif: order.tif,
+            reduce_only: order.reduce_only,
+            rationale: order.rationale,
+            cloid: None,
+            signal_ms: now,
+            decision_ms: now,
+        };
+        self.gate_and_execute(intent, market, account, now).await
+    }
+
+    async fn submit_live(
+        &mut self,
+        intent: &OrderIntent,
+        market: &MarketView,
+        now: u64,
+    ) -> Result<()> {
         let Some(exchange) = &self.exchange else {
             return Ok(());
         };
@@ -540,7 +769,7 @@ impl Engine {
     /// Records the resolved state (`resting`/`filled`/`rejected`/…), or a
     /// `reconcile:unknown` marker when the read API is unavailable or the query
     /// fails. There is no path here that resends the order.
-    async fn reconcile_unknown(&self, intent: &OrderIntent, detail: &str, now: u64) {
+    async fn reconcile_unknown(&mut self, intent: &OrderIntent, detail: &str, now: u64) {
         let Some(cloid) = intent.cloid.as_deref() else {
             self.record_order(intent, "reconcile", Some("no-cloid"), now);
             return;
@@ -797,6 +1026,90 @@ fn build_market_view(
     view
 }
 
+/// Convert a [`MarketView`] into per-coin [`MarketSlot`]s.
+fn to_slots(registry: &CoinRegistry, market: &MarketView) -> Vec<MarketSlot> {
+    let mut slots = vec![MarketSlot::default(); registry.len()];
+    for (coin_id, coin) in registry.iter() {
+        let slot = &mut slots[coin_id.index()];
+        if let Some(book) = market.book(coin) {
+            let mut snapshot = BookSnapshot {
+                time_ms: book.time,
+                ..Default::default()
+            };
+            let mut n_bids = 0u8;
+            for (level, (px, sz)) in snapshot
+                .bids
+                .iter_mut()
+                .zip(book.bids.iter().take(BOOK_DEPTH))
+            {
+                *level = Level {
+                    px: *px,
+                    sz: *sz,
+                    n: 1,
+                };
+                n_bids += 1;
+            }
+            let mut n_asks = 0u8;
+            for (level, (px, sz)) in snapshot
+                .asks
+                .iter_mut()
+                .zip(book.asks.iter().take(BOOK_DEPTH))
+            {
+                *level = Level {
+                    px: *px,
+                    sz: *sz,
+                    n: 1,
+                };
+                n_asks += 1;
+            }
+            snapshot.n_bids = n_bids;
+            snapshot.n_asks = n_asks;
+            if let (Some((bid_px, bid_sz)), Some((ask_px, ask_sz))) =
+                (book.best_bid(), book.best_ask())
+            {
+                slot.bbo = Some((
+                    Level {
+                        px: bid_px,
+                        sz: bid_sz,
+                        n: 1,
+                    },
+                    Level {
+                        px: ask_px,
+                        sz: ask_sz,
+                        n: 1,
+                    },
+                    Stamp::default(),
+                ));
+            }
+            slot.book = Some((snapshot, Stamp::default()));
+        }
+        if let Some(ctx) = market.ctx(coin) {
+            slot.ctx = Some((
+                AssetCtxLite {
+                    funding: ctx.funding,
+                    mark_px: ctx.mark_px,
+                    oracle_px: ctx.oracle_px,
+                    open_interest: ctx.open_interest,
+                },
+                Stamp::default(),
+            ));
+        }
+    }
+    slots
+}
+
+/// Convert an [`AccountView`] into a per-coin [`AccountState`].
+fn to_account(registry: &CoinRegistry, view: &AccountView) -> AccountState {
+    let mut account = AccountState::new(registry.len());
+    for (coin_id, coin) in registry.iter() {
+        account.set_position_szi(coin_id, view.position_szi(coin));
+    }
+    account.spot = view.spot.clone();
+    account.account_value = view.account_value;
+    account.margin_used = view.margin_used;
+    account
+}
+
 /// Outcome of a deterministic replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayOutcome {
@@ -819,6 +1132,7 @@ pub async fn replay_events(
     strategies: &mut [Box<dyn Strategy>],
     coins: &[String],
     sz_decimals: &BTreeMap<String, u32>,
+    registry: &CoinRegistry,
 ) -> Result<ReplayOutcome> {
     let mut state = MarketState::new(Tolerance::default());
     for coin in coins {
@@ -837,14 +1151,23 @@ pub async fn replay_events(
             Event::Account(view) => account = view,
             Event::Timer { .. } => {
                 let market = build_market_view(&state, coins, sz_decimals);
+                let slots = to_slots(registry, &market);
+                let account_state = to_account(registry, &account);
+                let ctx = Ctx {
+                    now: Stamp {
+                        t_recv_ns: (row.ts_ms as i64) * 1_000_000,
+                        ..Default::default()
+                    },
+                    markets: &slots,
+                    account: &account_state,
+                    registry,
+                };
                 for strategy in strategies.iter_mut() {
-                    let ctx = StrategyContext {
-                        now_ms: row.ts_ms,
-                        trigger: Trigger::Timer,
-                        market: &market,
-                        account: &account,
-                    };
-                    for action in strategy.on_event(&ctx).await? {
+                    let mut actions = Actions::new();
+                    for coin in strategy.interests().distinct_coins() {
+                        strategy.on_market(coin, &ctx, &mut actions);
+                    }
+                    for action in actions.take() {
                         if let Action::Place(intent) = action {
                             intents += 1;
                             trace.push_str(&serde_json::to_string(&intent)?);
@@ -894,6 +1217,7 @@ pub async fn replay(
         &mut build.strategies,
         &build.coins,
         &build.sz_decimals,
+        &build.registry,
     )
     .await?;
     info!(
@@ -1038,6 +1362,7 @@ mod tests {
             sz_decimals: BTreeMap::new(),
             instruments: BTreeMap::new(),
             markets: AssetMap::new(),
+            registry: CoinRegistry::from_coins(&["BTC".into()]),
         };
         let cfg = Config::default();
         let mut engine = Engine::new(build, &cfg, None, writer, 1);
@@ -1070,7 +1395,7 @@ mod tests {
         let info: Arc<dyn InfoApi> = Arc::new(FakeInfo {
             response: Ok(status(Some("open"))),
         });
-        let engine = test_engine(Some(info));
+        let mut engine = test_engine(Some(info));
         let intent = intent_with_cloid(Some("0xdead"));
         engine.reconcile_unknown(&intent, "dropped", 1).await;
     }
@@ -1080,7 +1405,7 @@ mod tests {
         let not_found: Arc<dyn InfoApi> = Arc::new(FakeInfo {
             response: Ok(status(None)),
         });
-        let engine = test_engine(Some(not_found));
+        let mut engine = test_engine(Some(not_found));
         engine
             .reconcile_unknown(&intent_with_cloid(Some("0xdead")), "dropped", 1)
             .await;
@@ -1088,7 +1413,7 @@ mod tests {
         let failing: Arc<dyn InfoApi> = Arc::new(FakeInfo {
             response: Err("boom".into()),
         });
-        let engine = test_engine(Some(failing));
+        let mut engine = test_engine(Some(failing));
         engine
             .reconcile_unknown(&intent_with_cloid(Some("0xdead")), "dropped", 1)
             .await;
@@ -1097,7 +1422,7 @@ mod tests {
         engine
             .reconcile_unknown(&intent_with_cloid(None), "dropped", 1)
             .await;
-        let engine = test_engine(None);
+        let mut engine = test_engine(None);
         engine
             .reconcile_unknown(&intent_with_cloid(Some("0xdead")), "dropped", 1)
             .await;
@@ -1147,7 +1472,8 @@ mod tests {
 
     fn strategies() -> Vec<Box<dyn Strategy>> {
         vec![Box::new(MarketMaker::new(MmConfig {
-            coin: "BTC".into(),
+            coin: mev_engine::CoinId(0),
+            sz_decimals: 3,
             levels: 2,
             half_spread_bps: ds("5"),
             level_step_bps: ds("5"),
@@ -1257,13 +1583,14 @@ mod tests {
         let coins = vec!["BTC".to_string()];
         let mut sz_decimals = BTreeMap::new();
         sz_decimals.insert("BTC".to_string(), 3u32);
+        let registry = CoinRegistry::from_coins(&coins);
 
         let mut first = strategies();
-        let a = replay_events(&rows, &mut first, &coins, &sz_decimals)
+        let a = replay_events(&rows, &mut first, &coins, &sz_decimals, &registry)
             .await
             .unwrap();
         let mut second = strategies();
-        let b = replay_events(&rows, &mut second, &coins, &sz_decimals)
+        let b = replay_events(&rows, &mut second, &coins, &sz_decimals, &registry)
             .await
             .unwrap();
 

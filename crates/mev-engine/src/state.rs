@@ -4,6 +4,10 @@
 //! the account, order manager, and risk state arrive in E-5/E-8/E-9 and will
 //! extend this struct.
 
+use std::collections::BTreeMap;
+
+use rust_decimal::Decimal;
+
 use crate::types::{AssetCtxLite, BookSnapshot, CoinId, Level, Stamp};
 
 /// Per-coin market state, indexed by `CoinId`.
@@ -120,6 +124,54 @@ impl EngineState {
     }
 }
 
+/// Account state read by strategies and (later) risk (SPEC-0010 §7, §11).
+///
+/// Perp positions are indexed by [`CoinId`]; spot balances are keyed by token
+/// symbol (tokens are not interned). E-5/E-8/E-9 extend this with margin,
+/// open orders, and in-flight exposure.
+#[derive(Debug, Clone, Default)]
+pub struct AccountState {
+    /// Signed perp size per coin (positive long, negative short).
+    pub positions: Vec<Decimal>,
+    /// Spot balances by token symbol.
+    pub spot: BTreeMap<String, Decimal>,
+    /// Perp account value in USD.
+    pub account_value: Decimal,
+    /// Margin currently used.
+    pub margin_used: Decimal,
+}
+
+impl AccountState {
+    /// Build account state sized for `coin_count` coins.
+    pub fn new(coin_count: usize) -> Self {
+        Self {
+            positions: vec![Decimal::ZERO; coin_count],
+            ..Default::default()
+        }
+    }
+
+    /// Signed position size for a coin (zero when flat or out of range).
+    pub fn position_szi(&self, coin: CoinId) -> Decimal {
+        self.positions
+            .get(coin.index())
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    /// Set a coin's signed position size (grows the vector if needed).
+    pub fn set_position_szi(&mut self, coin: CoinId, szi: Decimal) {
+        if self.positions.len() <= coin.index() {
+            self.positions.resize(coin.index() + 1, Decimal::ZERO);
+        }
+        self.positions[coin.index()] = szi;
+    }
+
+    /// Spot balance for a token (zero when absent).
+    pub fn spot_balance(&self, token: &str) -> Decimal {
+        self.spot.get(token).copied().unwrap_or(Decimal::ZERO)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +238,18 @@ mod tests {
         let mut state = EngineState::new(1);
         state.mark_dirty(CoinId(9));
         assert!(!state.has_dirty());
+    }
+
+    #[test]
+    fn account_state_reads_positions_and_spot() {
+        let mut account = AccountState::new(2);
+        assert_eq!(account.position_szi(CoinId(0)), Decimal::ZERO);
+        account.set_position_szi(CoinId(1), Decimal::from(-3));
+        assert_eq!(account.position_szi(CoinId(1)), Decimal::from(-3));
+        account.set_position_szi(CoinId(5), Decimal::from(9));
+        assert_eq!(account.position_szi(CoinId(5)), Decimal::from(9));
+        account.spot.insert("UBTC".into(), Decimal::from(2));
+        assert_eq!(account.spot_balance("UBTC"), Decimal::from(2));
+        assert_eq!(account.spot_balance("NOPE"), Decimal::ZERO);
     }
 }

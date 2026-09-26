@@ -1,31 +1,29 @@
-//! Pluggable trading strategies and the shared cost/edge model (SPEC-0003).
+//! Strategy building blocks and the shared cost/edge model (SPEC-0003).
 //!
-//! Strategies turn market/account [`view`]s into exchange-agnostic
-//! [`OrderIntent`]s using the shared [`CostModel`]; risk (SPEC-0004) gates the
-//! intents and execution (SPEC-0002) acts on them. The engine feeds events and
-//! timers deterministically (SPEC-0003 §8), so a recorded event log replays to
-//! identical intents.
+//! This crate holds the venue-agnostic pieces strategies use: the
+//! [`CostModel`]/[`FeeRates`], market/account [`view`]s, [`OrderIntent`]s,
+//! sizing, the paper executor, and deterministic randomness. The synchronous
+//! [`mev_engine::Strategy`] trait the engine drives lives in `mev-engine`
+//! (SPEC-0010 §8): its context names engine types, and `mev-engine` already
+//! depends on this crate, so a trait here would invert the dependency.
+//!
+//! Strategies turn views into exchange-agnostic [`OrderIntent`]s; risk
+//! (SPEC-0004) gates them and execution (SPEC-0002) acts on them. The engine
+//! feeds events and timers deterministically, so a recorded event log replays
+//! to identical intents.
 
-pub mod action;
 pub mod cost;
 pub mod event;
-pub mod funding;
 pub mod id;
 pub mod intent;
-pub mod mm;
 pub mod paper;
 pub mod size;
-pub mod strategy;
 pub mod view;
 
-pub use action::{Action, CancelIntent};
 pub use cost::{CostModel, FeeRates};
 pub use event::{DeterministicRng, Event, FillEvent};
-pub use funding::{FundingBasis, FundingConfig};
 pub use id::StrategyId;
 pub use intent::{OrderIntent, Side, TimeInForce};
-pub use mm::{MarketMaker, MmConfig};
 pub use paper::{Instrument, PaperExecutor};
 pub use size::Sizer;
-pub use strategy::{Strategy, StrategyContext, Trigger};
 pub use view::{AccountView, BookView, MarketView, OpenOrderView, PositionView, Walk};

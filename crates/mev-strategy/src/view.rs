@@ -56,6 +56,31 @@ impl BookView {
         }
     }
 
+    /// Build a view from a fixed-size engine book snapshot (SPEC-0010 §6).
+    ///
+    /// The snapshot's levels are already best-first, so no reversal is needed.
+    /// Levels with zero size are dropped so the view matches the keyed-book
+    /// shape used elsewhere.
+    pub fn from_levels(
+        bids: impl IntoIterator<Item = (Decimal, Decimal)>,
+        asks: impl IntoIterator<Item = (Decimal, Decimal)>,
+        sz_decimals: u32,
+        time_ms: u64,
+    ) -> Self {
+        Self {
+            bids: bids
+                .into_iter()
+                .filter(|(_, sz)| *sz > Decimal::ZERO)
+                .collect(),
+            asks: asks
+                .into_iter()
+                .filter(|(_, sz)| *sz > Decimal::ZERO)
+                .collect(),
+            sz_decimals,
+            time: time_ms,
+        }
+    }
+
     /// Best bid as `(price, size)`.
     pub fn best_bid(&self) -> Option<(Decimal, Decimal)> {
         self.bids.first().copied()

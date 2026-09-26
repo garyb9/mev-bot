@@ -17,9 +17,18 @@ pub mod ingest;
 pub mod routes;
 pub mod run;
 pub mod state;
+pub mod strategies;
+pub mod strategy;
 pub mod timers;
 pub mod types;
 
+pub use state::{AccountState, EngineState, MarketSlot};
+pub use strategies::funding::{FundingBasis, FundingConfig};
+pub use strategies::mm::{MarketMaker, MmConfig};
+pub use strategy::{
+    Action, Actions, Ctx, GroupIntent, Interests, OrderEvent, OrderEventKind, Strategy, Stream,
+    TimerId,
+};
 pub use types::{
     AccountSnapshot, AccountUpdate, AssetCtxLite, AssetMetaLite, BOOK_DEPTH, BookSnapshot, Cloid,
     CoinId, CoinRegistry, ConnId, Control, Level, MarketUpdate, PostResult, Px, Side, Stamp, Sz,
