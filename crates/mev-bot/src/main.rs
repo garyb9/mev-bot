@@ -48,7 +48,12 @@ enum Command {
     Markets {
         /// Optional filter substring.
         query: Option<String>,
+        /// List a builder-deployed HIP-3 dex (e.g. `xyz`, `cash`) instead of the default.
+        #[arg(long)]
+        dex: Option<String>,
     },
+    /// List builder-deployed HIP-3 perpetual dexes (SPEC-0001).
+    Dexs,
     /// Show a live book snapshot (SPEC-0001).
     Book {
         /// Market symbol.
@@ -141,7 +146,8 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
             }
             Ok(())
         }
-        Command::Markets { query } => markets(network, query).await,
+        Command::Markets { query, dex } => markets(network, query, dex).await,
+        Command::Dexs => dexs(network).await,
         Command::Book { coin, levels } => book(network, coin, levels).await,
         Command::Watch { coins } => watch(network, coins).await,
         Command::Select { add, remove } => not_yet(&format!("select +{add:?} -{remove:?}")),
@@ -194,29 +200,69 @@ async fn run(
     Ok(())
 }
 
-async fn markets(network: Option<NetworkArg>, query: Option<String>) -> Result<()> {
+async fn markets(
+    network: Option<NetworkArg>,
+    query: Option<String>,
+    dex: Option<String>,
+) -> Result<()> {
     let network = resolve_network(network)?;
     let info = HttpInfo::new(network);
-    let meta = info.meta().await?;
-    let spot = info.spot_meta().await?;
 
     let filter = query.unwrap_or_default().to_lowercase();
     let matches = |name: &str| filter.is_empty() || name.to_lowercase().contains(&filter);
 
-    println!("perps ({}):", meta.universe.len());
-    for asset in &meta.universe {
-        if matches(&asset.name) {
-            println!(
-                "  {:<12} szDecimals={} maxLeverage={}",
-                asset.name, asset.sz_decimals, asset.max_leverage
-            );
+    match dex {
+        Some(dex) => {
+            let meta = info.meta_for(&dex).await?;
+            println!("{} perps ({}):", dex, meta.universe.len());
+            for asset in &meta.universe {
+                if matches(&asset.name) {
+                    println!(
+                        "  {:<20} szDecimals={} maxLeverage={}",
+                        asset.name, asset.sz_decimals, asset.max_leverage
+                    );
+                }
+            }
+        }
+        None => {
+            let meta = info.meta().await?;
+            let spot = info.spot_meta().await?;
+            let dexs = info.perp_dexs().await.unwrap_or_default();
+
+            println!("perps ({}):", meta.universe.len());
+            for asset in &meta.universe {
+                if matches(&asset.name) {
+                    println!(
+                        "  {:<12} szDecimals={} maxLeverage={}",
+                        asset.name, asset.sz_decimals, asset.max_leverage
+                    );
+                }
+            }
+
+            println!("spot ({}):", spot.universe.len());
+            for pair in &spot.universe {
+                if matches(&pair.name) {
+                    println!("  {:<12} @{}", pair.name, pair.index);
+                }
+            }
+
+            let names: Vec<&str> = dexs.iter().map(|d| d.name.as_str()).collect();
+            if !names.is_empty() {
+                println!("hip-3 dexes: {} (use --dex <name>)", names.join(", "));
+            }
         }
     }
+    Ok(())
+}
 
-    println!("spot ({}):", spot.universe.len());
-    for pair in &spot.universe {
-        if matches(&pair.name) {
-            println!("  {:<12} @{}", pair.name, pair.index);
+async fn dexs(network: Option<NetworkArg>) -> Result<()> {
+    let network = resolve_network(network)?;
+    let info = HttpInfo::new(network);
+    let dexs = info.perp_dexs().await?;
+    for dex in &dexs {
+        match &dex.full_name {
+            Some(full) => println!("{:<8} {}", dex.name, full),
+            None => println!("{}", dex.name),
         }
     }
     Ok(())

@@ -8,20 +8,26 @@ use mev_core::{
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use crate::types::{AllMids, AssetCtx, L2Book, Meta, MetaAndAssetCtxs, SpotMeta};
+use crate::types::{AllMids, AssetCtx, L2Book, Meta, MetaAndAssetCtxs, PerpDex, SpotMeta};
 
 /// Read-only HyperCore info API.
 #[async_trait]
 pub trait InfoApi: Send + Sync {
-    /// Perpetuals metadata.
+    /// Perpetuals metadata for the default dex.
     async fn meta(&self) -> Result<Meta>;
+    /// Perpetuals metadata for a builder-deployed HIP-3 dex.
+    async fn meta_for(&self, dex: &str) -> Result<Meta>;
+    /// List builder-deployed HIP-3 perpetual dexes.
+    async fn perp_dexs(&self) -> Result<Vec<PerpDex>>;
     /// Spot metadata.
     async fn spot_meta(&self) -> Result<SpotMeta>;
-    /// All mid prices.
+    /// All mid prices for the default dex.
     async fn all_mids(&self) -> Result<AllMids>;
-    /// L2 book snapshot for a coin.
+    /// All mid prices for a builder-deployed HIP-3 dex.
+    async fn all_mids_for(&self, dex: &str) -> Result<AllMids>;
+    /// L2 book snapshot for a coin (dex-qualified for HIP-3, e.g. `xyz:TSLA`).
     async fn l2_book(&self, coin: &str) -> Result<L2Book>;
-    /// Perpetuals metadata plus per-asset contexts.
+    /// Perpetuals metadata plus per-asset contexts for the default dex.
     async fn meta_and_asset_ctxs(&self) -> Result<MetaAndAssetCtxs>;
 }
 
@@ -78,12 +84,25 @@ impl InfoApi for HttpInfo {
         self.info(json!({ "type": "meta" })).await
     }
 
+    async fn meta_for(&self, dex: &str) -> Result<Meta> {
+        self.info(json!({ "type": "meta", "dex": dex })).await
+    }
+
+    async fn perp_dexs(&self) -> Result<Vec<PerpDex>> {
+        let dexs: Vec<Option<PerpDex>> = self.info(json!({ "type": "perpDexs" })).await?;
+        Ok(dexs.into_iter().flatten().collect())
+    }
+
     async fn spot_meta(&self) -> Result<SpotMeta> {
         self.info(json!({ "type": "spotMeta" })).await
     }
 
     async fn all_mids(&self) -> Result<AllMids> {
         self.info(json!({ "type": "allMids" })).await
+    }
+
+    async fn all_mids_for(&self, dex: &str) -> Result<AllMids> {
+        self.info(json!({ "type": "allMids", "dex": dex })).await
     }
 
     async fn l2_book(&self, coin: &str) -> Result<L2Book> {
@@ -156,6 +175,17 @@ mod tests {
         assert_eq!(meta.universe.len(), 1);
         assert_eq!(meta.universe[0].name, "BTC");
         assert_eq!(meta.universe[0].sz_decimals, 5);
+    }
+
+    #[tokio::test]
+    async fn parses_perp_dexs_skipping_null_default() {
+        let body = r#"[null,{"name":"xyz","fullName":"XYZ"},{"name":"cash"}]"#;
+        let server = mount(body).await;
+        let client = HttpInfo::with_base_url(server.uri());
+        let dexs = client.perp_dexs().await.unwrap();
+        assert_eq!(dexs.len(), 2);
+        assert_eq!(dexs[0].name, "xyz");
+        assert_eq!(dexs[1].name, "cash");
     }
 
     #[tokio::test]

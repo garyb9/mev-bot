@@ -11,7 +11,7 @@ pub mod ws;
 pub use client::{HttpInfo, InfoApi};
 pub use types::{
     AllMids, AssetCtx, AssetCtxUpdate, AssetMeta, Bbo, L2Book, Level, Meta, MetaAndAssetCtxs,
-    SpotMeta, SpotPair, SpotToken, Trade,
+    PerpDex, SpotMeta, SpotPair, SpotToken, Trade,
 };
 pub use ws::{MarketStream, StreamEvent, Subscription, WsMarketStream};
 

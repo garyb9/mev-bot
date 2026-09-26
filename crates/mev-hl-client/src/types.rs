@@ -185,6 +185,17 @@ pub struct AssetCtxUpdate {
     pub ctx: AssetCtx,
 }
 
+/// A builder-deployed HIP-3 perpetual dex (`perpDexs`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerpDex {
+    /// Short dex name, used as the `dex` parameter and coin prefix.
+    pub name: String,
+    /// Human-readable name.
+    #[serde(default)]
+    pub full_name: Option<String>,
+}
+
 /// `metaAndAssetCtxs` response: metadata plus per-asset contexts.
 #[derive(Debug, Clone)]
 pub struct MetaAndAssetCtxs {
