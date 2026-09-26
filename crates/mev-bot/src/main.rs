@@ -1,8 +1,7 @@
 //! `hl` — orchestration binary for the Hyperliquid-first trading system.
 //!
-//! Milestone M0.5 (SPEC-0000): tracing, metrics, health endpoints, and
-//! graceful shutdown. Config/modes from M0.4; the client wiring (SPEC-0001+)
-//! arrives in later milestones.
+//! M0.x: platform (config, observability, health, shutdown).
+//! M1.1:  REST `/info` client and the `markets`/`book` commands.
 
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -10,6 +9,7 @@ use anyhow::Result;
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
 use mev_core::config::{Config, ConfigOverrides, Mode, Network};
+use mev_hl_client::{HttpInfo, InfoApi};
 use mev_metrics::{health::Health, prometheus::PrometheusHandle};
 use tokio::signal;
 use tracing::{error, info};
@@ -17,6 +17,10 @@ use tracing::{error, info};
 #[derive(Parser)]
 #[command(name = "hl", version, about = "Hyperliquid-first trading system")]
 struct Cli {
+    /// Network override (default: from config).
+    #[arg(long, value_enum, global = true)]
+    network: Option<NetworkArg>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -28,9 +32,6 @@ enum Command {
         /// Execution mode (default: observe).
         #[arg(long, value_enum)]
         mode: Option<ModeArg>,
-        /// Network (default: mainnet).
-        #[arg(long, value_enum)]
-        network: Option<NetworkArg>,
         /// Comma-separated coin override, e.g. `--coins BTC,ETH`.
         #[arg(long, value_delimiter = ',')]
         coins: Option<Vec<String>>,
@@ -120,39 +121,38 @@ async fn main() {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Run {
         mode: None,
-        network: None,
         coins: None,
         db: None,
     });
 
-    if let Err(err) = dispatch(command).await {
+    if let Err(err) = dispatch(command, cli.network).await {
         error!(error = %err, "fatal");
         eprintln!("error: {err}");
         std::process::exit(1);
     }
 }
 
-async fn dispatch(command: Command) -> Result<()> {
+async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
     match command {
-        Command::Run {
-            mode,
-            network,
-            coins,
-            db,
-        } => run(mode, network, coins, db).await,
+        Command::Run { mode, coins, db } => run(mode, network, coins, db).await,
         Command::Config { cmd } => {
             match cmd {
                 ConfigCmd::Show => show_config()?,
             }
             Ok(())
         }
-        Command::Markets { query } => {
-            not_yet(&format!("markets {}", query.as_deref().unwrap_or("")))
-        }
-        Command::Book { coin, levels } => not_yet(&format!("book {coin} x{levels}")),
+        Command::Markets { query } => markets(network, query).await,
+        Command::Book { coin, levels } => book(network, coin, levels).await,
         Command::Watch { coins } => not_yet(&format!("watch {}", coins.join(","))),
         Command::Select { add, remove } => not_yet(&format!("select +{add:?} -{remove:?}")),
     }
+}
+
+fn resolve_network(network: Option<NetworkArg>) -> Result<Network> {
+    if let Some(network) = network {
+        return Ok(network.into());
+    }
+    Ok(Config::load(ConfigOverrides::default())?.network)
 }
 
 async fn run(
@@ -184,14 +184,69 @@ async fn run(
     health.set_ready(true);
     info!(mode = ?config.mode, "ready");
 
-    // No-op observe loop: in `observe` there is nothing to trade yet, but the
-    // process stays alive, reports liveness via heartbeat, and shuts down
-    // cleanly. Real ingestion/wiring lands with SPEC-0001.
+    // No-op observe loop: the process stays alive, reports liveness via
+    // heartbeat, and shuts down cleanly. Real ingestion lands with SPEC-0001.
     let heartbeat = tokio::spawn(heartbeat());
 
     serve(health, metrics, config.http_port).await?;
     heartbeat.abort();
     info!("shutdown complete");
+    Ok(())
+}
+
+async fn markets(network: Option<NetworkArg>, query: Option<String>) -> Result<()> {
+    let network = resolve_network(network)?;
+    let info = HttpInfo::new(network);
+    let meta = info.meta().await?;
+    let spot = info.spot_meta().await?;
+
+    let filter = query.unwrap_or_default().to_lowercase();
+    let matches = |name: &str| filter.is_empty() || name.to_lowercase().contains(&filter);
+
+    println!("perps ({}):", meta.universe.len());
+    for asset in &meta.universe {
+        if matches(&asset.name) {
+            println!(
+                "  {:<12} szDecimals={} maxLeverage={}",
+                asset.name, asset.sz_decimals, asset.max_leverage
+            );
+        }
+    }
+
+    println!("spot ({}):", spot.universe.len());
+    for pair in &spot.universe {
+        if matches(&pair.name) {
+            println!("  {:<12} @{}", pair.name, pair.index);
+        }
+    }
+    Ok(())
+}
+
+async fn book(network: Option<NetworkArg>, coin: String, levels: usize) -> Result<()> {
+    let network = resolve_network(network)?;
+    let info = HttpInfo::new(network);
+    let book = info.l2_book(&coin).await?;
+
+    println!("{}  time={}  mid={:?}", book.coin, book.time, book.mid());
+    println!("  bids:");
+    for level in book.levels[0].iter().take(levels) {
+        println!("    {:<16} {}", level.px, level.sz);
+    }
+    println!("  asks:");
+    for level in book.levels[1].iter().take(levels) {
+        println!("    {:<16} {}", level.px, level.sz);
+    }
+    Ok(())
+}
+
+fn show_config() -> Result<()> {
+    let config = Config::load(ConfigOverrides::default())?;
+    println!("{}", config.summary());
+    Ok(())
+}
+
+fn not_yet(what: &str) -> Result<()> {
+    println!("`{what}` is not implemented yet (arrives with SPEC-0001).");
     Ok(())
 }
 
@@ -207,17 +262,6 @@ async fn heartbeat() {
         metrics::counter!(mev_metrics::names::HEARTBEATS).increment(1);
         tracing::debug!(uptime_seconds = uptime, "heartbeat");
     }
-}
-
-fn show_config() -> Result<()> {
-    let config = Config::load(ConfigOverrides::default())?;
-    println!("{}", config.summary());
-    Ok(())
-}
-
-fn not_yet(what: &str) -> Result<()> {
-    println!("`{what}` is not implemented yet (arrives with SPEC-0001).");
-    Ok(())
 }
 
 #[derive(Clone)]

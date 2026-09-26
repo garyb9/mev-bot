@@ -20,4 +20,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 mev-core.workspace = true
+mev-hl-client.workspace = true
 mev-metrics.workspace = true

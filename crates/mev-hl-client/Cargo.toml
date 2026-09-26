@@ -9,3 +9,13 @@ repository.workspace = true
 
 [dependencies]
 mev-core.workspace = true
+
+async-trait.workspace = true
+reqwest.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock.workspace = true
