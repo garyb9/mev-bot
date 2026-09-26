@@ -352,7 +352,7 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 | E-4 | Strategy API v2 (sync) + port `FundingBasis` and `MarketMaker` | M | E-3 | ✅ |
 | E-5 | Order manager + state machine (§10), cloid assignment, in-flight exposure | M | E-3 | ✅ |
 | E-6 | Build/batch/sign on the engine thread + `WsExec` backend (§12) incl. `TCP_NODELAY`, aggressive-price rule, rate budgets | M | E-5, SPEC-0002 H-1, H-2 | 🔄 |
-| E-7 | `PaperExec` backend + `hl replay` over recorder segments; determinism test | M | E-5, SPEC-0008 R-7 | ☐ |
+| E-7 | `PaperExec` backend + `hl replay` over recorder segments; determinism test | M | E-5, SPEC-0008 R-7 | 🔄 |
 | E-8 | Account stream + reconciler integration; delete `account_poller` | M | E-5, SPEC-0002 H-3 | ☐ |
 | E-9 | Hot-path risk integration (§11) with SPEC-0004 K-tasks | M | E-5, SPEC-0004 K-1, K-2, K-3 | ☐ |
 | E-10 | Latency stamps, histograms, benches incl. zero-alloc (§17) | M | E-6 | ☐ |
@@ -404,6 +404,10 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 
 **E-7 — Paper + replay.** `PaperExec` (from `paper.rs`) behind the exec backend interface, with a latency model. `hl replay` reads SPEC-0008 segments. *Done when:* replaying a fixture segment twice gives byte-identical action logs, and a `simulate` run of `FundingBasis` produces the same decisions as replay over the same recorded window (within the latency model).
 
+**E-7 implemented, part 1 (2026-09-26) — `PaperExec` + latency + determinism.** `mev-engine/src/paper_exec.rs`: `PaperOrder`, `PaperConfig` (`latency_ms` default 20, `maker_fills` default true), and `PaperExec`, which matches takers at their `now_ms + latency_ms` deadline and fills resting ALO orders only after a later book crosses their limit (also latency-delayed), emitting `AccountUpdate::OrderUpdate`/`Fill` exactly as the live account stream would. `paper_orders_from_post`/`paper_cancels_from_post` convert a built `UnsignedPost` into paper orders/cancels (it takes the `AssetTable` because `OrderWire` carries numeric asset ids, not coins). A determinism test drives `MarketMaker` + `PaperExec` twice over a fixed, clock-free, random-free sequence and asserts identical action logs and account updates (FNV-1a fingerprint); latency-model tests cover the taker deadline, the resting cross, post-only rejection, and cancel.
+
+**E-7 blocked half (2026-09-26).** The `hl replay`-over-recorder-segments half and its "byte-identical action log from a fixture segment" done-when **depend on SPEC-0008 R-7 (`mev-recorder` segment reader), whose dependencies R-1 and R-2 are also unstarted and whose crate does not exist**. Per AGENTS.md §4 this dependency is unmet, so the segment-replay path and the `hl replay --from…--to…` CLI are not built here. Once R-1/R-2/R-7 land, E-7 part 2 wires the same ingest decoders and `PaperExec` over the reader with a `ReplayClock` (SPEC-0010 §13/§14). Until then, deterministic replay of the SQLite `Event` log remains available via the legacy `mev-bot` replay path.
+
 **E-8 — Account stream + reconciler.** Wire H-3 and the §15 reconciler. Delete `account_poller`. *Done when:* tests cover drift detection and correction, the account-gap halt/resume, and `Unknown` resolution through a mocked `orderStatus`.
 
 **E-9 — Risk integration.** Implement §11 against SPEC-0004's K-tasks. *Done when:* property tests show that no sequence of approved actions can push projected exposure over a cap, and the kill switch stops all new places within one iteration.
@@ -445,3 +449,4 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 4. **Q-Layering (answered in E-4).** §8 puts the `Strategy` trait in `mev-strategy`, but its `Ctx`/`Action` name engine types (`CoinId`, `Cloid`, `MarketSlot`, `AccountState`) and `mev-engine` depends on `mev-strategy`. Resolved by putting the trait and the ported strategies in `mev-engine`; `mev-strategy` stays the venue-agnostic library. Revisit only if a non-engine consumer needs the trait.
 5. **Q-Sign-Placement (E-6).** Does signing happen on the engine thread (§12, engine-owned `NonceManager`, agent signer inside `mev-engine`) or in the exec layer (part 1, keeps the key out of the engine crate)? Decision inputs: the sign budget (p50 ≤ 150 µs, §17), the AGENTS rule that only SPEC-0002 code holds the signer, and §23 Q3 (a second pinned signing thread). Decide in E-10 once sign latency is measured.
 6. **Q-BatchModify (E-6).** Exact `batchModify` wire fields need a source; until then `Action::Modify` is dropped by the builder (E-6 open item 2) and MM cannot re-quote on the new engine.
+7. **Q-Replay-Gap (E-7).** E-7's recorder-segment replay needs SPEC-0008 R-7 (blocked on R-1/R-2, crate absent). Sequence the recorder tasks before E-7 part 2, or accept the interim SQLite-log replay.

@@ -17,6 +17,7 @@ pub mod channels;
 pub mod exec;
 pub mod ingest;
 pub mod orders;
+pub mod paper_exec;
 pub mod routes;
 pub mod run;
 pub mod state;
@@ -34,6 +35,9 @@ pub use exec::{
     dispatch_batch,
 };
 pub use orders::{CloidAssigner, LiveOrder, OrderManager, OrderState};
+pub use paper_exec::{
+    PaperConfig, PaperExec, PaperOrder, paper_cancels_from_post, paper_orders_from_post,
+};
 pub use state::{AccountState, EngineState, MarketSlot};
 pub use strategies::funding::{FundingBasis, FundingConfig};
 pub use strategies::mm::{MarketMaker, MmConfig};

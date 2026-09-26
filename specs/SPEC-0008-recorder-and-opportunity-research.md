@@ -880,6 +880,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Do:** `crates/mev-recorder/src/reader.rs`: iterate the envelopes of a file (tolerates a truncated tail in `.crashed` files); merge several files by `(t_ns, conn, seq)`. Implement the `hl record inspect` and `hl record verify` outputs from §12.1.
 - **Tests:** a truncated file reads up to the last full line; merge order; `seq` hole detection.
 - **Done when:** tests pass.
+- **Blocks:** SPEC-0010 **E-7 part 2** (`hl replay` over recorder segments). E-7 part 1 (`PaperExec` + latency + determinism) is done; the segment replay is waiting on R-7 (and R-1/R-2). See SPEC-0010 §23 Q-Replay-Gap.
 
 #### R-8 — CEX sources
 - **Do:** `Protocol` implementations for `binance-usdm`, `binance-spot`, `bybit-linear` per §9 (confirmed by V-2). Add a `[cex]` section to the profile. Each venue gets its own `src` directory.
