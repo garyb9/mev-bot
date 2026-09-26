@@ -3,8 +3,16 @@
 //! See SPEC-0004. The risk engine is the mandatory gate between strategy
 //! [`mev_strategy::OrderIntent`]s and execution: every intent is approved,
 //! resized, or rejected (fail-closed) before it can be submitted.
+//!
+//! This crate currently ships the minimal, fail-closed [`LimitRisk`] gate used
+//! by M3. The full engine (drawdown/liquidation guard, reconciliation, PnL
+//! attribution) lands with SPEC-0004.
 
-use mev_strategy::OrderIntent;
+pub mod limits;
+
+pub use limits::{LimitRisk, Limits};
+
+use mev_strategy::{AccountView, MarketView, OrderIntent};
 
 /// Outcome of a pre-trade risk check.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,8 +25,37 @@ pub enum Decision {
     Reject(String),
 }
 
+impl Decision {
+    /// Whether the decision permits submission.
+    pub fn is_allowed(&self) -> bool {
+        !matches!(self, Decision::Reject(_))
+    }
+}
+
+/// Everything a risk check may read. Views are borrowed and immutable.
+pub struct RiskContext<'a> {
+    /// Current market snapshot.
+    pub market: &'a MarketView,
+    /// Current account snapshot.
+    pub account: &'a AccountView,
+    /// Decision time in milliseconds.
+    pub now_ms: u64,
+}
+
 /// A pre-trade risk check. Implementations are synchronous and deterministic.
 pub trait RiskCheck: Send + Sync {
     /// Evaluate an intent against current limits and portfolio state.
-    fn check(&self, intent: &OrderIntent) -> Decision;
+    fn check(&self, intent: &OrderIntent, ctx: &RiskContext<'_>) -> Decision;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decision_predicate() {
+        assert!(Decision::Approve.is_allowed());
+        assert!(Decision::Resize(rust_decimal::Decimal::ONE).is_allowed());
+        assert!(!Decision::Reject("no".into()).is_allowed());
+    }
 }
