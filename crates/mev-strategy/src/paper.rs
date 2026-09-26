@@ -119,6 +119,18 @@ impl PaperExecutor {
         self.fees_paid
     }
 
+    /// Cancel resting orders matching `cloid` and/or `oid`. Returns how many
+    /// were removed.
+    pub fn cancel(&mut self, cloid: Option<&str>, oid: Option<u64>) -> usize {
+        let before = self.resting.len();
+        self.resting.retain(|order| {
+            let cloid_match = cloid.is_some_and(|c| order.cloid == c);
+            let oid_match = oid.is_some_and(|o| order.oid == o);
+            !(cloid_match || oid_match)
+        });
+        before - self.resting.len()
+    }
+
     fn instrument(&self, coin: &str) -> Instrument {
         self.instruments
             .get(coin)
@@ -170,9 +182,10 @@ impl PaperExecutor {
         if intent.tif != TimeInForce::Ioc {
             let oid = self.next_oid;
             self.next_oid += 1;
+            let cloid = intent.cloid.clone().unwrap_or_else(|| cloid_for(oid));
             self.resting.push(RestingOrder {
                 oid,
-                cloid: cloid_for(oid),
+                cloid,
                 coin: intent.coin.clone(),
                 instrument: self.instrument(&intent.coin),
                 strategy: intent.strategy.clone(),
@@ -393,6 +406,7 @@ mod tests {
             tif,
             reduce_only: false,
             rationale: "test".into(),
+            cloid: None,
             signal_ms: 0,
             decision_ms: 0,
         }
@@ -461,6 +475,20 @@ mod tests {
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].sz, ds("5"));
         assert!(executor.open_orders().is_empty());
+    }
+
+    #[test]
+    fn cancel_by_cloid_removes_resting_order() {
+        let mut executor = executor();
+        let market = market();
+        let mut order = intent(Side::Buy, "100", "2", TimeInForce::Alo);
+        order.cloid = Some("0xabc".into());
+        executor.submit(&order, &market, 0);
+        assert_eq!(executor.open_orders().len(), 1);
+        assert_eq!(executor.cancel(Some("0xabc"), None), 1);
+        assert!(executor.open_orders().is_empty());
+        // Cancelling an unknown cloid is a no-op.
+        assert_eq!(executor.cancel(Some("0xdead"), None), 0);
     }
 
     #[test]

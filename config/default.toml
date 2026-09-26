@@ -13,8 +13,20 @@ schedule_cancel_ttl_ms = 30000
 http_port = 9090
 
 [strategy]
+# Enable market-making too with: enabled = ["funding_basis", "market_making"]
 enabled = ["funding_basis"]
 min_edge_bps = 5
+
+[strategy.market_making]
+coins = ["ETH"]
+levels = 3
+half_spread_bps = 4
+level_step_bps = 4
+size_per_level = 0.05
+max_inventory = 1.0
+max_skew_bps = 4
+vol_pull_bps = 30
+refresh_bps = 2
 
 [strategy.funding]
 perp_coin = "BTC"

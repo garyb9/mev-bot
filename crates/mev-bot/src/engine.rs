@@ -11,14 +11,14 @@ use mev_core::config::{Config, Mode, Network};
 use mev_core::db::writer::{DbWriter, WriteCmd};
 use mev_core::db::{FillRecord, OrderRecord};
 use mev_hl_client::{
-    AssetMap, ExchangeApi, InfoApi, MIN_ORDER_NOTIONAL, MarketSelector, MarketState, OrderParams,
-    Subscription, build_order_wire,
+    AssetMap, CancelByCloidWire, CancelWire, ExchangeApi, InfoApi, MIN_ORDER_NOTIONAL,
+    MarketSelector, MarketState, OrderParams, Subscription, build_order_wire,
 };
 use mev_risk::{Decision, LimitRisk, Limits, RiskCheck, RiskContext};
 use mev_strategy::{
-    AccountView, BookView, CostModel, FeeRates, FillEvent, FundingBasis, FundingConfig, Instrument,
-    MarketView, OpenOrderView, OrderIntent, PaperExecutor, PositionView, Strategy, StrategyContext,
-    StrategyId, Trigger,
+    AccountView, Action, BookView, CancelIntent, CostModel, FeeRates, FillEvent, FundingBasis,
+    FundingConfig, Instrument, MarketMaker, MarketView, MmConfig, OpenOrderView, OrderIntent,
+    PaperExecutor, PositionView, Strategy, StrategyContext, StrategyId, Trigger,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -57,10 +57,46 @@ pub fn build(cfg: &Config, selector: &MarketSelector) -> Result<EngineBuild> {
     for id in &cfg.strategy.enabled {
         match id.as_str() {
             mev_strategy::funding::ID => build_funding(&mut build, cfg, selector, cost)?,
+            mev_strategy::mm::ID => build_market_making(&mut build, cfg, selector)?,
             other => warn!(strategy = other, "unknown strategy id; ignoring"),
         }
     }
     Ok(build)
+}
+
+fn build_market_making(
+    build: &mut EngineBuild,
+    cfg: &Config,
+    selector: &MarketSelector,
+) -> Result<()> {
+    let mm = &cfg.strategy.market_making;
+    for coin in &mm.coins {
+        let market = selector
+            .resolve(coin)
+            .with_context(|| format!("resolving mm coin {coin}"))?;
+        build
+            .instruments
+            .insert(market.coin.clone(), Instrument::perp());
+        build
+            .sz_decimals
+            .insert(market.coin.clone(), market.sz_decimals);
+        let config = MmConfig {
+            coin: market.coin.clone(),
+            levels: mm.levels,
+            half_spread_bps: Decimal::from(mm.half_spread_bps),
+            level_step_bps: Decimal::from(mm.level_step_bps),
+            size_per_level: mm.size_per_level,
+            max_inventory: mm.max_inventory,
+            max_skew_bps: Decimal::from(mm.max_skew_bps),
+            vol_pull_bps: Decimal::from(mm.vol_pull_bps),
+            refresh_bps: Decimal::from(mm.refresh_bps),
+        };
+        let strategy = MarketMaker::new(config);
+        build.subscriptions.extend(strategy.subscriptions());
+        build.coins.push(market.coin);
+        build.strategies.push(Box::new(strategy));
+    }
+    Ok(())
 }
 
 fn build_funding(
@@ -196,7 +232,7 @@ impl Engine {
             None => self.account.read().expect("account lock poisoned").clone(),
         };
 
-        let mut proposals: Vec<Vec<OrderIntent>> = Vec::new();
+        let mut proposals: Vec<Vec<Action>> = Vec::new();
         for strategy in &mut self.strategies {
             let ctx = StrategyContext {
                 now_ms: now,
@@ -204,20 +240,23 @@ impl Engine {
                 market: &market,
                 account: &account,
             };
-            let intents = strategy.on_event(&ctx).await?;
-            if !intents.is_empty() {
-                proposals.push(intents);
+            let actions = strategy.on_event(&ctx).await?;
+            if !actions.is_empty() {
+                proposals.push(actions);
             }
         }
 
         let mut fills: Vec<FillEvent> = Vec::new();
-        for intents in proposals {
-            for intent in intents {
-                if let Some(fill) = self
-                    .gate_and_execute(intent, &market, &account, now)
-                    .await?
-                {
-                    fills.push(fill);
+        for actions in proposals {
+            for action in actions {
+                match action {
+                    Action::Place(intent) => {
+                        fills.extend(
+                            self.gate_and_execute(intent, &market, &account, now)
+                                .await?,
+                        );
+                    }
+                    Action::Cancel(cancel) => self.cancel(&cancel, now).await,
                 }
             }
         }
@@ -270,7 +309,7 @@ impl Engine {
         market: &MarketView,
         account: &AccountView,
         now: u64,
-    ) -> Result<Option<FillEvent>> {
+    ) -> Result<Vec<FillEvent>> {
         let sid = intent.strategy.as_str().to_string();
         metrics::counter!(names::STRATEGY_INTENTS, "strategy" => sid.clone()).increment(1);
 
@@ -297,21 +336,66 @@ impl Engine {
                 metrics::counter!(names::STRATEGY_GATES, "strategy" => sid, "decision" => "reject")
                     .increment(1);
                 self.record_order(&intent, "reject", Some(&reason), now);
-                return Ok(None);
+                return Ok(Vec::new());
             }
         };
 
         self.record_order(&effective, "intent", None, now);
         match &mut self.paper {
-            Some(paper) => {
-                let fills = paper.submit(&effective, market, now);
-                Ok(fills.into_iter().next())
-            }
+            Some(paper) => Ok(paper.submit(&effective, market, now)),
             None => {
                 self.submit_live(&effective, market, now).await?;
-                Ok(None)
+                Ok(Vec::new())
             }
         }
+    }
+
+    async fn cancel(&mut self, cancel: &CancelIntent, now: u64) {
+        if let Some(paper) = &mut self.paper {
+            paper.cancel(cancel.cloid.as_deref(), cancel.oid);
+        }
+        if let Some(exchange) = &self.exchange
+            && let Some(market_meta) = self.markets.get(&cancel.coin)
+        {
+            if let Some(cloid) = &cancel.cloid {
+                if let Err(err) = exchange
+                    .cancel_by_cloid(vec![CancelByCloidWire {
+                        asset: market_meta.asset_id(),
+                        cloid: cloid.clone(),
+                    }])
+                    .await
+                {
+                    warn!(coin = %cancel.coin, error = %err, "live cancel failed");
+                }
+            } else if let Some(oid) = cancel.oid
+                && let Err(err) = exchange
+                    .cancel(vec![CancelWire {
+                        a: market_meta.asset_id(),
+                        o: oid,
+                    }])
+                    .await
+            {
+                warn!(coin = %cancel.coin, error = %err, "live cancel failed");
+            }
+        }
+        let record = OrderRecord {
+            ts_ms: now,
+            strategy: Some(cancel.strategy.to_string()),
+            coin: cancel.coin.clone(),
+            side: String::new(),
+            kind: "cancel".to_string(),
+            cloid: cancel.cloid.clone(),
+            oid: cancel.oid,
+            px: None,
+            sz: None,
+            reduce_only: None,
+            rationale: None,
+            status: None,
+        };
+        self.writer.try_send(WriteCmd::Order {
+            session_id: self.session_id,
+            record,
+        });
     }
 
     async fn submit_live(&self, intent: &OrderIntent, market: &MarketView, now: u64) -> Result<()> {
@@ -332,7 +416,7 @@ impl Engine {
             limit_px,
             tif: intent.tif.into(),
             reduce_only: intent.reduce_only,
-            cloid: None,
+            cloid: intent.cloid.clone(),
         };
         let wire = match build_order_wire(market_meta, &params) {
             Ok(wire) => wire,
@@ -359,7 +443,7 @@ impl Engine {
             coin: intent.coin.clone(),
             side: side_str(intent.is_buy()).to_string(),
             kind: kind.to_string(),
-            cloid: None,
+            cloid: intent.cloid.clone(),
             oid: None,
             px: intent.limit_px.map(|px| px.normalize().to_string()),
             sz: Some(intent.size.normalize().to_string()),

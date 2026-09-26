@@ -17,6 +17,7 @@ use mev_core::error::Result;
 use mev_hl_client::ws::Subscription;
 use rust_decimal::Decimal;
 
+use crate::action::Action;
 use crate::cost::{CostModel, FeeRates};
 use crate::event::FillEvent;
 use crate::id::StrategyId;
@@ -28,6 +29,10 @@ use crate::view::MarketView;
 pub const ID: &str = "funding_basis";
 
 const MS_PER_HOUR: u64 = 3_600_000;
+
+fn places(intents: Vec<OrderIntent>) -> Vec<Action> {
+    intents.into_iter().map(Action::Place).collect()
+}
 
 /// Configuration for [`FundingBasis`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +163,7 @@ impl FundingBasis {
             },
             reduce_only,
             rationale,
+            cloid: None,
             signal_ms: now_ms,
             decision_ms: now_ms,
         }
@@ -333,7 +339,7 @@ impl Strategy for FundingBasis {
         vec![Duration::from_secs(1)]
     }
 
-    async fn on_event(&mut self, ctx: &StrategyContext<'_>) -> Result<Vec<OrderIntent>> {
+    async fn on_event(&mut self, ctx: &StrategyContext<'_>) -> Result<Vec<Action>> {
         let now_ms = ctx.now_ms;
         match self.state {
             State::Flat => {
@@ -344,7 +350,7 @@ impl Strategy for FundingBasis {
                 {
                     self.state = State::Entering;
                     self.entry_fills = 0;
-                    return Ok(intents);
+                    return Ok(places(intents));
                 }
                 Ok(Vec::new())
             }
@@ -361,14 +367,15 @@ impl Strategy for FundingBasis {
                         // Nothing to close (e.g. paper account not wired); reset.
                         self.state = State::Flat;
                         self.below_streak = 0;
-                        return Ok(intents);
+                        return Ok(Vec::new());
                     }
                     self.state = State::Exiting;
                     self.exit_fills = 0;
-                    return Ok(intents);
+                    return Ok(places(intents));
                 }
                 Ok(self
                     .rebalance_intent(ctx.market, ctx.account, now_ms)
+                    .map(Action::Place)
                     .into_iter()
                     .collect())
             }
@@ -452,6 +459,16 @@ mod tests {
         market
     }
 
+    fn places_of(actions: Vec<Action>) -> Vec<OrderIntent> {
+        actions
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Place(intent) => Some(intent),
+                Action::Cancel(_) => None,
+            })
+            .collect()
+    }
+
     fn config() -> FundingConfig {
         FundingConfig {
             perp_coin: "BTC".into(),
@@ -519,10 +536,12 @@ mod tests {
         let mut strategy = strategy();
         let market = market_with("0.001", "59990", "60010");
         let account = AccountView::default();
-        let intents = strategy
-            .on_event(&ctx_of(&market, &account, 0))
-            .await
-            .unwrap();
+        let intents = places_of(
+            strategy
+                .on_event(&ctx_of(&market, &account, 0))
+                .await
+                .unwrap(),
+        );
         assert_eq!(intents.len(), 2);
         assert_eq!(strategy.state(), "entering");
         assert!(intents[0].coin == "@1" && intents[0].side == Side::Buy);
@@ -604,10 +623,12 @@ mod tests {
         assert_eq!(strategy.state(), "hedged");
 
         // Hour 1: streak 2 => exit both legs.
-        let intents = strategy
-            .on_event(&ctx_of(&flat, &account, 2 * MS_PER_HOUR))
-            .await
-            .unwrap();
+        let intents = places_of(
+            strategy
+                .on_event(&ctx_of(&flat, &account, 2 * MS_PER_HOUR))
+                .await
+                .unwrap(),
+        );
         assert_eq!(intents.len(), 2);
         assert_eq!(strategy.state(), "exiting");
         let perp = intents.iter().find(|i| i.coin == "BTC").unwrap();
@@ -640,10 +661,12 @@ mod tests {
         );
         account.spot.insert("UBTC".into(), ds("0.20"));
         // Keep funding rich so no exit.
-        let intents = strategy
-            .on_event(&ctx_of(&rich, &account, 0))
-            .await
-            .unwrap();
+        let intents = places_of(
+            strategy
+                .on_event(&ctx_of(&rich, &account, 0))
+                .await
+                .unwrap(),
+        );
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].coin, "@1");
         assert_eq!(intents[0].side, Side::Sell);

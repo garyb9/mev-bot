@@ -191,6 +191,7 @@ mod tests {
             tif: TimeInForce::Alo,
             reduce_only: false,
             rationale: "test".into(),
+            cloid: None,
             signal_ms: 0,
             decision_ms: 0,
         }

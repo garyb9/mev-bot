@@ -75,6 +75,9 @@ pub struct OrderIntent {
     pub reduce_only: bool,
     /// Human-readable justification, logged for audit.
     pub rationale: String,
+    /// Optional client order id (`0x`-prefixed 16 bytes), used for
+    /// idempotent cancel/replace.
+    pub cloid: Option<String>,
     /// Event time the signal was observed (ms).
     pub signal_ms: u64,
     /// Event time the decision was made (ms).
@@ -107,6 +110,7 @@ mod tests {
             tif: TimeInForce::Alo,
             reduce_only: false,
             rationale: "test".into(),
+            cloid: None,
             signal_ms: 1,
             decision_ms: 2,
         }

@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use mev_core::error::Result;
 use mev_hl_client::ws::Subscription;
 
+use crate::action::Action;
 use crate::event::FillEvent;
 use crate::id::StrategyId;
-use crate::intent::OrderIntent;
 use crate::view::{AccountView, MarketView};
 
 /// What caused the current decision cycle.
@@ -76,8 +76,8 @@ pub trait Strategy: Send + Sync {
         Vec::new()
     }
 
-    /// React to an event, returning any orders to propose.
-    async fn on_event(&mut self, ctx: &StrategyContext<'_>) -> Result<Vec<OrderIntent>>;
+    /// React to an event, returning orders to place and/or cancel.
+    async fn on_event(&mut self, ctx: &StrategyContext<'_>) -> Result<Vec<Action>>;
 
     /// Observe a fill (own or simulated).
     async fn on_fill(&mut self, _fill: &FillEvent) -> Result<()> {
@@ -98,7 +98,7 @@ mod tests {
             StrategyId::from("noop")
         }
 
-        async fn on_event(&mut self, _ctx: &StrategyContext<'_>) -> Result<Vec<OrderIntent>> {
+        async fn on_event(&mut self, _ctx: &StrategyContext<'_>) -> Result<Vec<Action>> {
             Ok(Vec::new())
         }
     }

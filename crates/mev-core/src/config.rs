@@ -75,6 +75,48 @@ pub struct StrategyConfig {
     pub min_edge_bps: u32,
     /// Delta-neutral funding/basis settings.
     pub funding: FundingSettings,
+    /// Market-making settings.
+    pub market_making: MmSettings,
+}
+
+/// Market-making strategy settings (SPEC-0003 §7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MmSettings {
+    /// Coins to quote.
+    pub coins: Vec<String>,
+    /// Levels per side.
+    pub levels: u32,
+    /// Half-spread to the first level, in bps.
+    pub half_spread_bps: u32,
+    /// Spacing between levels, in bps.
+    pub level_step_bps: u32,
+    /// Size per level, in base units.
+    pub size_per_level: Decimal,
+    /// Absolute inventory cap, in base units.
+    pub max_inventory: Decimal,
+    /// Maximum reservation skew at full inventory, in bps.
+    pub max_skew_bps: u32,
+    /// Pull quotes when the spread exceeds this, in bps.
+    pub vol_pull_bps: u32,
+    /// Replace quotes when the mid moves by at least this, in bps.
+    pub refresh_bps: u32,
+}
+
+impl Default for MmSettings {
+    fn default() -> Self {
+        Self {
+            coins: vec!["ETH".to_string()],
+            levels: 3,
+            half_spread_bps: 4,
+            level_step_bps: 4,
+            size_per_level: Decimal::new(5, 2),
+            max_inventory: Decimal::ONE,
+            max_skew_bps: 4,
+            vol_pull_bps: 30,
+            refresh_bps: 2,
+        }
+    }
 }
 
 impl Default for StrategyConfig {
@@ -83,6 +125,7 @@ impl Default for StrategyConfig {
             enabled: vec!["funding_basis".to_string()],
             min_edge_bps: 5,
             funding: FundingSettings::default(),
+            market_making: MmSettings::default(),
         }
     }
 }
