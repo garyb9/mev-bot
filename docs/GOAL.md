@@ -15,8 +15,12 @@ There are two strategy families, both running on the same fast infrastructure:
 1. **Arbitrage / MEV-style** (primary): short-lived price dislocations where
    speed decides who captures the edge.
 2. **Options-informed directional trading** (secondary): using options-market
-   positioning (from the owner's `finsnap` project and Deribit) to trade
+   positioning (option chains this bot records itself, plus Deribit) to trade
    **HIP-3 tokenized-stock perps** and crypto bluechips over hours to days.
+
+**This repo is where we trade.** The owner's `finsnap` project is a view (a
+dashboard). It's a source of ideas and of past options snapshots, never a
+runtime dependency.
 
 When two designs are equally correct and equally safe, **choose the faster
 one**. Speed never overrides correctness or safety (§4), but it outranks
@@ -46,6 +50,23 @@ So in this project, "MEV/arb" means, in rough order of expected fit:
 
 Which of these we actually build is **decided by data** (SPEC-0008), not by
 preference. If you have a new idea, add it as a study there first.
+
+### 2.1 Priority tiers
+
+To keep the arb core from being starved by everything else, all work is tiered.
+Agents always pick the highest tier available. Full task list:
+SPEC-0008 §14.0–14.1.
+
+| Tier | What | Items | When |
+|---|---|---|---|
+| **T1: arb core** (latency-first) | Recorder, research toolkit, fast dislocation / arb studies, HyperEVM MEV feasibility (desk research), execution hardening (M2.5) | Items 1, 3, 6 (in-hours + closed-hours lead-lag), 7 (spread bands); study O8 Q1–Q4 | **First, always** |
+| **T2: adjacent** | Reuses T1 data, or waits on heavier infrastructure | Items 2 (needs HyperEVM RPC / node), 4, 5; HIP-3 funding patterns | When T1 is done, blocked, or taken |
+| **T3-data** | Starting the clock on forward options data | Options-chain and Deribit recording | **Any time** (small, time-sensitive) |
+| **T3: directional family** | Signals held hours to days | Item 8; open convergence and weekend → week-ahead (item 6); single-instrument Bollinger (item 7) | After the recorder is in production **and** ≥ 3 T1 studies have preliminary reports |
+
+Strategy code for any tier waits for gate G1, or an owner-approved G1.5 pilot.
+The funding pilot (M4) is a stack-prover, not a tier. **Market-making (M6) is on
+hold** until research supports it.
 
 ## 3. How we measure success
 
@@ -160,14 +181,17 @@ The recorder depends only on M1 (market data), so it can start immediately.
 
 ## 8. What to work on right now
 
-1. **SPEC-0008 Phase V and Phase R.** Verify facts, then build the recorder
-   and deploy it to a low-latency host.
-2. **SPEC-0008 lane F** (options & equities: V-9…V-12, F-1, R-11…R-13), early.
-   Study O9 needs weeks of forward-collected options data, so its clock
-   should start as soon as possible.
-3. **SPEC-0002 §17** (M2.5 hardening), in parallel.
-4. Then SPEC-0008 Phases P and S (research toolkit and studies), which end in
-   ADR-0002.
+Follow the tiers (§2.1):
+
+1. **T1: SPEC-0008 recorder** (V-1…V-4, V-11, V-12, R-1…R-8, R-10, R-13)
+   deployed to a low-latency host, **and SPEC-0002 §17** (M2.5 hardening), in
+   parallel.
+2. **T3-data, small and early:** V-9, V-10, V-13, R-11, R-12. Options
+   history needs calendar time, so start its clock now.
+3. **T1 research:** P-1…P-5, then studies O1, O2, O3, O5, O8 (desk), O10
+   A+D, O11 A.
+4. **T2** studies, then **T3** research once its gate opens. Everything ends
+   in ADR-0002.
 
 ## 9. Decision gates
 
@@ -194,6 +218,7 @@ The recorder depends only on M1 (market data), so it can start immediately.
 | Recorder | The M3 process that stores raw market data for research and replay (SPEC-0008). |
 | HIP-3 stock perp | A perp on a builder-deployed dex that tracks a stock or index (e.g. `xyz:TSLA`). Trades 24/7; the real stock doesn't. |
 | Options positioning | What the options market is betting on: put/call volume and OI balance, skew, strikes with large OI ("walls"), implied volatility. |
-| finsnap | The owner's separate project (`../finsnap`) that collects options chains and computes positioning. A data source for this bot. |
+| finsnap | The owner's separate dashboard project (`../finsnap`): a **view**. Its options formulas and past snapshots are reused here; it is never a runtime dependency. |
+| Tier (T1/T2/T3) | Work priority: T1 arb core first; T3 directional family gated (§2.1). |
 | Non-validator node | Our own copy of the Hyperliquid chain that follows the network without validating (SPEC-0009). |
 | PASS / MARGINAL / FAIL | Study verdicts against the APR target/floor and quality checks (SPEC-0008 §13.6). |

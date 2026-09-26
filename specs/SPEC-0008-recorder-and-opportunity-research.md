@@ -76,7 +76,7 @@ Components and where they live:
 | HyperEVM pool source | `crates/mev-recorder/src/sources/evm.rs` | Rust | R-9 |
 | Deployment | `deploy/recorder/`, `RUNBOOK.md` | systemd / docs | R-10 |
 | Research toolkit | `research/hlr/` | Python | P-1…P-5 |
-| Studies + reports | `research/studies/`, `research/reports/` | Python / Markdown | S-1…S-10 |
+| Studies + reports | `research/studies/`, `research/reports/` | Python / Markdown | S-1…S-11b |
 
 **Decision — Python for research.** Research uses Python 3.12 + `uv` + `polars` (+ `duckdb` where SQL is easier). Rationale: much faster iteration for analysis, and research code never touches money paths. Production stays Rust. Research code must not be imported by, or deployed with, the bot.
 
@@ -143,7 +143,8 @@ Rough volume: one `l2Book` stream is about 1–3 KB every ~0.5 s ⇒ ~0.2–0.5 
 | `binance-spot` | Binance spot `bookTicker` | R-8 |
 | `bybit-linear` | Bybit v5 linear `orderbook.1` | R-8 |
 | `hyperevm` | HyperEVM block headers + pool state | R-9 |
-| `finsnap` | Options positioning snapshots from the owner's finsnap service | R-11 |
+| `yahoo-options` | Option chains for mapped underlyings, every field (OI, volume, IV, bid, ask, last) | R-11 |
+| `finsnap` | Optional: the owner's finsnap view (`/snap` derived labels), recorded for comparison only | R-11 |
 | `deribit` | Deribit crypto options summaries (IV, OI, volume) | R-12 |
 | `equities` | Real-time US equity quotes for HIP-3 stock-perp underlyings | R-13 |
 | `hl-node` | Output files of our own node (SPEC-0009) | SPEC-0009 N-6 |
@@ -323,7 +324,8 @@ These feed studies **O9** and **O10**: options-informed trading of HIP-3 tokeniz
 
 | `src` | What | Cadence | Notes |
 |---|---|---|---|
-| `finsnap` | The owner's finsnap service (`../finsnap`, TypeScript, Yahoo Finance data): `GET /snap` JSON with per-expiry options positioning (`pcRatio`, `skewScore`, weighted-mean strike, wall inference, labels) and the per-strike profile | every 5 min during US regular hours, plus one snapshot after the close | Recorded raw as `rest` envelopes. Yahoo data is **delayed** ⚠ verify how much (V-9). finsnap today keeps only strike/volume/OI and drops IV/bid/ask; cross-repo task **F-1** adds them. finsnap's default options universe is ETFs (SPY, QQQ, sectors, IBIT), so single stocks behind HIP-3 perps must be added (F-1). |
+| `yahoo-options` | Option chains straight from Yahoo Finance's options endpoint (the same one finsnap's collector uses) for every underlying in `research/mappings/underlyings.toml` plus SPY/QQQ: per contract strike, expiry, OI, volume, **implied volatility, bid, ask, last** | every 15 min during US regular hours, plus one snapshot after the close | Unofficial endpoint: needs a cookie/crumb session and polite pacing ⚠ verify (V-9); finsnap's `yahooSession.ts` is the reference. Data is **delayed** ⚠ verify how much (V-9). This bot owns its options data and computes its own positioning metrics; it never depends on finsnap to trade. |
+| `finsnap` (optional) | The owner's finsnap dashboard (`../finsnap`) is a **view**, not a dependency. Two read-only uses: (1) P-7 imports its stored `option_snapshots` history once, for O9a; (2) optionally poll `GET /snap` every 5 min in US hours to record its derived labels for side-by-side comparison. | — | Nothing in this repo requires finsnap to be running. |
 | `deribit` | Deribit public API: `public/get_book_summary_by_currency` (`currency=BTC\|ETH`, `kind=option`) + `public/get_index_price` | every 60 s | Free and real-time; includes mark IV, OI, volume, and underlying price per instrument. The right options source for BTC/ETH (much better than Yahoo/IBIT). ⚠ verify endpoints, fields, and limits (V-10). |
 | `equities` | Streaming real-time quotes (bid/ask/last) for the underlyings of HIP-3 stock perps (e.g. TSLA, NVDA, the index behind `XYZ100`) | streaming during US hours (+ pre/post market if the provider has it) | Provider chosen in **V-11** (free feeds cover only part of the volume; consolidated feeds are paid). Check the provider's terms allow storing the data. |
 
@@ -413,8 +415,9 @@ Every study **must** use these definitions, so studies can be ranked against eac
 | `markets` | `snapshot_t_ns, market, kind(perp/spot/hip3), dex, base, quote, asset_id, sz_decimals, max_leverage` | REST meta snapshots |
 | `gaps` | `src, conn, start_ns, end_ns, reason` | `gap_start`/`gap_end`, crashed segments, `seq` holes |
 | `evm_pools` | `t_ns, block, pool, reserve0, reserve1, sqrt_price_x96, liquidity, tick` | R-9 records |
-| `options_expiry` | `t_ns, t_data, underlying, expiry, pc_ratio, skew_score, wmean_strike, wmean_std, wall_strike, wall_side, label, call_vol, put_vol, call_oi, put_oi` | `finsnap` (`t_data` = the data's own as-of time, which is **not** `t_ns`) |
-| `options_strikes` | `t_ns, t_data, underlying, strike, call_vol, call_oi, put_vol, put_oi, call_iv, put_iv` (IVs null until F-1) | `finsnap` strike profile |
+| `options_contracts` | `t_ns, t_data, underlying, expiry, strike, cp, oi, volume, iv, bid, ask, last` | `yahoo-options`; plus finsnap `option_snapshots` history via P-7 (`iv/bid/ask/last` null there). `t_data` = the data's own as-of time, which is **not** `t_ns`. |
+| `options_expiry` | `t_ns, t_data, underlying, expiry, pc_ratio, skew_score, wmean_strike, wmean_std, wall_strike, wall_side, label, call_vol, put_vol, call_oi, put_oi` | **Computed by our normalizer** from `options_contracts`, using the same formulas as finsnap (`pcRatio`, `skewScore = 0.5·(ln volRatio + ln oiRatio)`, volume-weighted strike mean/std, wall inference; see finsnap `AGENTS.md` "Options positioning") so results are comparable with what the owner sees |
+| `options_strikes` | `t_ns, t_data, underlying, strike, call_vol, call_oi, put_vol, put_oi, call_iv, put_iv` | Computed from `options_contracts` (per-strike profile across expiries) |
 | `deribit_options` | `t_ns, instrument, underlying, expiry, strike, cp, mark_iv, bid_iv, ask_iv, open_interest, volume, underlying_px, index_px` | `deribit` |
 | `equity_quotes` | `t_ns, ts_exch_ms, symbol, bid_px, bid_sz, ask_px, ask_sz, last_px, session(pre/regular/post)` | `equities` |
 | `bars` | `t_open_ms, interval(1s/10s/1m/5m/15m/1h/1d), venue, market, open, high, low, close, volume, n_trades, source(mid/trade/candle)` | Built from `bbo` mids and `trades`; plus HL `candleSnapshot` backfill (R-5) and stock bars (V-11 provider) for longer history |
@@ -568,7 +571,7 @@ Episodes (§13.3) fit fast dislocations. **Directional signals held for hours or
 
 ### 13.9 The studies
 
-Each study below is one task (S-1…S-10). All depend on P-1…P-5, plus the data listed.
+Each study below maps to one or more tasks (S-1…S-11b, tiered in §14.0–14.1). Fast studies depend on P-1…P-5, slow-signal parts also on P-6, plus the data listed.
 
 ### O1 — HIP-3 / main-dex same-underlying dislocations (task S-1)
 
@@ -658,20 +661,20 @@ The owner's thesis: tokenized-stock perps on HIP-3 dexes (and BTC/ETH on the mai
 |---|---|
 | Hypothesis | Options positioning in the underlying (put/call imbalance, skew, open-interest walls near expiry; for crypto, Deribit IV and skew) predicts the underlying's direction or pinning over hours to days, and trading the matching HL perp captures that net of fees and funding. |
 | Universe | HIP-3 stock perps whose underlying has a liquid US options chain (e.g. `xyz:TSLA` ↔ TSLA; an index perp ↔ QQQ/SPY), plus BTC/ETH (Deribit). Built in V-9 into `research/mappings/underlyings.toml`, e.g. `TSLA = { hl = ["xyz:TSLA"], options = "TSLA", equity = "TSLA" }`. |
-| Data | `options_expiry`, `options_strikes` (finsnap), `deribit_options`, `bbo` + `ctx` for the mapped perps, `equity_quotes` (the underlying's real price), `funding_hist` |
-| Pre-registered signals (v1) | **P1 wall pinning**: within 2 trading days of a large expiry, if spot is more than 1σ (the expiry's strike std) from the dominant OI strike, lean toward that strike; exit at expiry. **P2 skew extreme**: `skew_score` 60-day z-score beyond ±2 ⇒ contrarian position for H; the momentum sign is also tested and both are reported. **P3 crypto IV skew** (Deribit): 25-delta risk-reversal z-score beyond ±2 ⇒ contrarian BTC/ETH perp position. **P4 market regime**: SPY/QQQ positioning label (finsnap) as a filter on P1–P3 (trade only when the index label agrees). |
+| Data | `options_contracts` / `options_expiry` / `options_strikes`, `deribit_options`, `bbo` + `ctx` for the mapped perps, `equity_quotes` (the underlying's real price), `funding_hist` |
+| Pre-registered signals (v1) | **P1 wall pinning**: within 2 trading days of a large expiry, if spot is more than 1σ (the expiry's strike std) from the dominant OI strike, lean toward that strike; exit at expiry. **P2 skew extreme**: `skew_score` 60-day z-score beyond ±2 ⇒ contrarian position for H; the momentum sign is also tested and both are reported. **P3 crypto IV skew** (Deribit): 25-delta risk-reversal z-score beyond ±2 ⇒ contrarian BTC/ETH perp position. **P4 market regime**: SPY/QQQ positioning label (computed by our normalizer with finsnap's formulas) as a filter on P1–P3 (trade only when the index label agrees). |
 | Data history | O9a: as much history as finsnap's `option_snapshots` + V-13 purchases provide (target ≥ 2 years for a final O9a report). O9b: forward-collected; preliminary after ≥ 20 US trading days, final after ≥ 60 trading days **and** ≥ 30 out-of-sample signals per variant. |
 | HIP-3 specifics | Stock perps trade 24/7, but the underlying and its options trade only in US hours. Oracle, funding, fees, and leverage per dex come from V-12. Entry/exit prices outside US hours must use the HL perp price only. |
 | Owner prior | The owner has used options positioning in discretionary stock trading and saw it work, but it hasn't been tested quantitatively. finsnap's "context, never signal" label is a legal-style disclaimer, not a finding. O9 is the quantitative test. |
-| Two stages | **O9a (history, now):** test the signals on the **real stock** (as a proxy for the HL perp, which tracks the stock during US hours), using finsnap's stored `option_snapshots` (daily, per contract, since finsnap started collecting) plus bought history if V-13 approves it, and stock bars from the V-11 provider. This can produce a verdict in days, not months. **O9b (forward):** the same pre-registered signals on the actual HL perps with HL prices, fees, and funding, confirming the edge transfers (off-hours behavior, funding drag). |
+| Two stages | **O9a (history, now):** test the signals on the **real stock** (as a proxy for the HL perp, which tracks the stock during US hours), using finsnap's stored `option_snapshots` (daily, per contract, since finsnap started collecting; imported read-only by P-7) plus bought history if V-13 approves it, and stock bars from the V-11 provider. This can produce a verdict in days, not months. **O9b (forward):** the same pre-registered signals on the actual HL perps with HL prices, fees, and funding, confirming the edge transfers (off-hours behavior, funding drag). |
 
-### O10 — HIP-3 stock perps vs the real stock (task S-10)
+### O10 — HIP-3 stock perps vs the real stock (tasks S-10a T1: Parts A, D · S-10b T2: Part C · S-10c T3: Parts B, E)
 
 | Item | Detail |
 |---|---|
 | Hypothesis | HIP-3 stock perps are priced off the real stock during US hours and trade on their own the rest of the time. That creates (A) short-lived dislocations vs the live stock price, (B) predictable convergence at the US open after nights/weekends, and (C) persistent funding/premium patterns. |
 | Part A: market-hours dislocation | Fair = equity mid (`equity_quotes`) + rolling 5-min median basis. Episodes per §13.3 when the HL perp is through fair by more than HL taker + buffer. HL-only execution; a hedge in the stock needs a brokerage, so it's measured only (like O5). **Latency grid applies.** |
-| Part B: open convergence | For every US open after a closed period (overnight, weekend, holiday): compare the perp's last price before 09:30 ET with the stock's opening print. Measure whether the perp's closed-hours move over- or under-shoots, overall and relative to the options-implied move (IV from F-1 or Deribit-style straddle pricing). Pre-registered trade: fade closed-hours perp moves larger than k × implied move (k ∈ {1, 1.5, 2}) shortly before the open, exit after the open. §13.8 method. |
+| Part B: open convergence | For every US open after a closed period (overnight, weekend, holiday): compare the perp's last price before 09:30 ET with the stock's opening print. Measure whether the perp's closed-hours move over- or under-shoots, overall and relative to the options-implied move (IV from `yahoo-options`). Pre-registered trade: fade closed-hours perp moves larger than k × implied move (k ∈ {1, 1.5, 2}) shortly before the open, exit after the open. §13.8 method. |
 | Part C: funding and premium | Distribution of HIP-3 stock-perp funding and perp-vs-stock premium by session (regular / pre / post / closed / weekend). Report whether a carry-like pattern clears costs. |
 | Part D: closed-hours lead-lag (arb-like, both directions) | When US markets are closed (nights, weekends, holidays), the only live prices are HL perps. BTC/ETH and index perps move first, and single-stock perps with high market or crypto beta (e.g. COIN, MSTR, HOOD, NVDA, TSLA) may lag. Estimate each stock perp's rolling beta to BTC and to the index perp in closed sessions; fair = stock-perp last + β × (driver return since); episodes per §13.3 when the stock perp is through fair by more than fees + buffer. Long **and** short. **Latency grid applies.** |
 | Part E: closed-hours move → next-session / week-ahead edge | Pre-registered: signal = the stock perp's closed-period return (Fri US close → Mon pre-open for weekends; US close → next open for overnights), optionally scaled by the options-implied move. Trades: (i) on the perp from Sunday evening / late night into the US open (continuation vs fade, both reported); (ii) on the perp from the US open over horizons 1 d, 3 d, 5 d (weekend) or 1 d (overnight). §13.8 method. History: HL `candleSnapshot` 1h candles for HIP-3 perps since listing (R-5), plus forward data. |
@@ -679,7 +682,7 @@ The owner's thesis: tokenized-stock perps on HIP-3 dexes (and BTC/ETH on the mai
 | Data | `bbo`, `ctx`, `bars` for HIP-3 stock perps, BTC/ETH, and index perps; `equity_quotes`; `options_*` (for Part B/E implied moves); HIP-3 oracle updates from the node (SPEC-0009, optional) |
 | Prereq | V-11 + R-13 for Parts A/B; Parts C, D, E need only HL data (+ options for the implied-move variants) |
 
-### O11 — Bollinger-band mean reversion, arb-style (task S-11)
+### O11 — Bollinger-band mean reversion, arb-style (tasks S-11a T1: Part A · S-11b T3: Parts B, C)
 
 Prior: in finsnap's backtests across its whole universe, **Bollinger Reversion** (20-period SMA ± 2σ / 3σ; buy a close at or below the lower band, sell a close at or above the upper band; next-bar-open fills) had the best historical average of all 20 strategies. That was on daily bars of US ETFs. O11 tests whether the same idea (price stretched ~2σ from its rolling mean tends to revert) pays on Hyperliquid at arb-like speeds and timeframes.
 
@@ -698,55 +701,71 @@ Prior: in finsnap's backtests across its whole universe, **Bollinger Reversion**
 
 Status: ☐ not started · 🔄 in progress · ✅ done. Size: **S** ≤ ½ day, **M** ≤ 2 days, **L** ≤ 5 days (for a focused agent).
 
+### 14.0 Priority tiers (read before picking a task)
+
+Work is tiered so the arb core isn't starved by the directional family ([`docs/GOAL.md`](../docs/GOAL.md) §2.1).
+
+| Tier | What | Rule |
+|---|---|---|
+| **T1: arb core** (latency-first) | Recorder, research toolkit, fast dislocation / arb studies, and the HyperEVM MEV feasibility desk research | **Always pick T1 first.** |
+| **T2: adjacent** | Studies that reuse T1 data (flow, carry, funding patterns) or are blocked on heavier infrastructure (HyperEVM RPC / node) | When every T1 task is done, blocked, or already taken. |
+| **T3-data: directional-family data collection** | Small tasks that start the clock on forward data (options chains, Deribit) | **Allowed any time.** They're small, and calendar time is the constraint. |
+| **T3: directional family** (signals held hours–days) | The slow-signal backtester and the O9, O10 B/E, and O11 B/C studies | Starts only when **both**: (1) R-10 is ✅ (recorder in production), and (2) ≥ 3 T1 studies have preliminary reports. |
+
+Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pilot).
+
 ### 14.1 Summary table
 
-| ID | Title | Size | Depends on | Status |
-|---|---|---|---|---|
-| V-1 | Verify HL WS/REST facts | S | — | ☐ |
-| V-2 | Verify CEX endpoints, fields, fees, reachability | S | — | ☐ |
-| V-3 | Verify HIP-3 fees and the spot quote-token set | S | — | ☐ |
-| V-4 | Measure latency from candidate regions; pick a host | M | R-6 (`hl probe latency`) | ☐ |
-| V-5 | Verify HyperEVM facts (blocks, mempool, gas, Core↔EVM transfers) | M | — | ☐ |
-| V-6 | Build the HyperEVM pool list | M | V-5 | ☐ |
-| V-7 | Measure data volume per stream | S | R-6 | ☐ |
-| V-8 | Check the HL public S3 archive for backfill | S | — | ☐ |
-| V-9 | finsnap integration + HIP-3 stock universe mapping | S | — | ☐ |
-| V-10 | Verify the Deribit public API (endpoints, fields, limits, reachability) | S | — | ☐ |
-| V-11 | Choose a real-time US equities data provider (owner approves) | S | — | ☐ |
-| V-12 | HIP-3 stock-perp mechanics (oracle in/out of hours, funding, fees, leverage, halts) | S | — | ☐ |
-| V-13 | Historical options data: vendors, coverage, cost; owner decides whether to buy | S | V-9 | ☐ |
-| F-1 | **finsnap repo:** keep IV/bid/ask/last in options data; add HIP-3 underlyings to the options universe | M | V-9 | ☐ |
-| R-1 | `mev-recorder` crate skeleton + envelope types | S | — | ☐ |
-| R-2 | Segment writer (zstd, rotation, manifest, crash recovery, disk guard) | M | R-1 | ☐ |
-| R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | M | — | ☐ |
-| R-4 | Subscription planner + universe selectors | M | R-1 | ☐ |
-| R-5 | HL REST snapshotter with weight budget | M | R-1, R-2 | ☐ |
-| R-6 | `hl record` / `record plan` / `probe latency` CLI, profiles, metrics, health | M | R-2, R-3, R-4, R-5 | ☐ |
-| R-7 | Segment reader + `hl record inspect` / `verify` | S | R-2 | ☐ |
-| R-8 | Binance/Bybit sources | S | R-3, R-6, V-2 | ☐ |
-| R-9 | HyperEVM pool source | L | R-6, V-5, V-6 | ☐ |
-| R-10 | Deploy recorder (systemd, chrony, runbook, optional shipping) | M | R-6, R-7, V-4 | ☐ |
-| R-11 | `finsnap` poller source | S | R-5, V-9 | ☐ |
-| R-12 | `deribit` options summary source | S | R-5, V-10 | ☐ |
-| R-13 | `equities` real-time quote source | M | R-3, V-11 | ☐ |
-| P-1 | `research/` scaffold + segment reader in Python | S | R-2 (format frozen) | ☐ |
-| P-2 | Normalizer → Parquet tables (§13.1) | M | P-1, V-1 | ☐ |
-| P-3 | Cost model module + `costs.toml` | S | P-1, V-2, V-3 | ☐ |
-| P-4 | Episode detector + latency capture (§13.3–13.5) | M | P-2, P-3 | ☐ |
-| P-5 | Report template + `RANKING.md` generator | S | P-4 | ☐ |
-| P-6 | Slow-signal backtester (§13.8) | M | P-2, P-3 | ☐ |
-| S-1 | Study O1 HIP-3 dislocations | M | P-5 | ☐ |
-| S-2 | Study O2 spot triangles | M | P-5 | ☐ |
-| S-3 | Study O3 spot-perp dislocation | S | P-5 | ☐ |
-| S-4 | Study O4 Core↔EVM | L | P-5, R-9 | ☐ |
-| S-5 | Study O5 CEX lead-lag | M | P-5, R-8 | ☐ |
-| S-6 | Study O6 liquidation/flow events | M | P-5 | ☐ |
-| S-7 | Study O7 funding carry | M | P-5 | ☐ |
-| S-8 | Study O8 HyperEVM MEV feasibility | M | V-5, V-6 (R-9 for Q5) | ☐ |
-| S-9 | Study O9 options positioning (O9a history on stocks now; O9b forward on HL perps) | L | P-6, V-9 (O9a); + R-11, R-12, V-12, ≥ 20 trading days (O9b) | ☐ |
-| S-10 | Study O10 HIP-3 stock perps vs the real stock (Parts A–E) | L | P-4, P-6, V-12 (R-13 for A/B) | ☐ |
-| S-11 | Study O11 Bollinger mean reversion (spread + single-instrument) | M | P-4, P-6, R-5 candle backfill | ☐ |
-| D-1 | `RANKING.md` + ADR-0002 + first strategy spec stub | S | all S-tasks that are feasible | ☐ |
+| ID | Title | Tier | Size | Depends on | Status |
+|---|---|---|---|---|---|
+| V-1 | Verify HL WS/REST facts | T1 | S | — | ☐ |
+| V-2 | Verify CEX endpoints, fields, fees, reachability | T1 | S | — | ☐ |
+| V-3 | Verify HIP-3 fees and the spot quote-token set | T1 | S | — | ☐ |
+| V-4 | Measure latency from candidate regions; pick a host | T1 | M | R-6 (`hl probe latency`) | ☐ |
+| V-5 | Verify HyperEVM facts (blocks, mempool, gas, Core↔EVM transfers) | T1 | M | — | ☐ |
+| V-6 | Build the HyperEVM pool list | T2 | M | V-5 | ☐ |
+| V-7 | Measure data volume per stream | T1 | S | R-6 | ☐ |
+| V-8 | Check the HL public S3 archive for backfill | T1 | S | — | ☐ |
+| V-9 | Options data sources (Yahoo chains, finsnap history) + HIP-3 stock universe mapping | T3-data | S | — | ☐ |
+| V-10 | Verify the Deribit public API (endpoints, fields, limits, reachability) | T3-data | S | — | ☐ |
+| V-11 | Choose a real-time US equities data provider (owner approves) | T1 | S | — | ☐ |
+| V-12 | HIP-3 stock-perp mechanics (oracle in/out of hours, funding, fees, leverage, halts) | T1 | S | — | ☐ |
+| V-13 | Historical options data: vendors, coverage, cost; owner decides whether to buy | T3-data | S | V-9 | ☐ |
+| R-1 | `mev-recorder` crate skeleton + envelope types | T1 | S | — | ☐ |
+| R-2 | Segment writer (zstd, rotation, manifest, crash recovery, disk guard) | T1 | M | R-1 | ☐ |
+| R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | T1 | M | — | ☐ |
+| R-4 | Subscription planner + universe selectors | T1 | M | R-1 | ☐ |
+| R-5 | HL REST snapshotter with weight budget (incl. candle backfill) | T1 | M | R-1, R-2 | ☐ |
+| R-6 | `hl record` / `record plan` / `probe latency` CLI, profiles, metrics, health | T1 | M | R-2, R-3, R-4, R-5 | ☐ |
+| R-7 | Segment reader + `hl record inspect` / `verify` | T1 | S | R-2 | ☐ |
+| R-8 | Binance/Bybit sources | T1 | S | R-3, R-6, V-2 | ☐ |
+| R-9 | HyperEVM pool source | T2 | L | R-6, V-5, V-6 (+ SPEC-0009 node or a provider) | ☐ |
+| R-10 | Deploy recorder (systemd, chrony, runbook, optional shipping) | T1 | M | R-6, R-7, V-4 | ☐ |
+| R-11 | Options-chain sources: `yahoo-options` chains (all fields) + optional `finsnap` `/snap` poller | T3-data | S | R-5, V-9 | ☐ |
+| R-12 | `deribit` options summary source | T3-data | S | R-5, V-10 | ☐ |
+| R-13 | `equities` real-time quote source | T1 | M | R-3, V-11 | ☐ |
+| P-1 | `research/` scaffold + segment reader in Python | T1 | S | R-2 (format frozen) | ☐ |
+| P-2 | Normalizer → Parquet tables (§13.1) | T1 | M | P-1, V-1 | ☐ |
+| P-3 | Cost model module + `costs.toml` + `thresholds.toml` | T1 | S | P-1, V-2, V-3 | ☐ |
+| P-4 | Episode detector + latency capture (§13.3–13.5) | T1 | M | P-2, P-3 | ☐ |
+| P-5 | Report template + `RANKING.md` generator | T1 | S | P-4 | ☐ |
+| P-6 | Slow-signal backtester (§13.8) | T3 | M | P-2, P-3, T3 gate | ☐ |
+| P-7 | Read-only import of finsnap's `option_snapshots` history (for O9a) | T3 | S | P-2, V-9, T3 gate | ☐ |
+| S-1 | Study O1 HIP-3 dislocations | T1 | M | P-5 | ☐ |
+| S-2 | Study O2 spot triangles | T1 | M | P-5 | ☐ |
+| S-3 | Study O3 spot-perp dislocation | T1 | S | P-5 | ☐ |
+| S-4 | Study O4 Core↔EVM | T2 | L | P-5, R-9 | ☐ |
+| S-5 | Study O5 CEX lead-lag | T1 | M | P-5, R-8 | ☐ |
+| S-6 | Study O6 liquidation/flow events | T2 | M | P-5 | ☐ |
+| S-7 | Study O7 funding carry | T2 | M | P-5 | ☐ |
+| S-8 | Study O8 HyperEVM MEV feasibility (Q1–Q4 desk research T1; Q5 pool data T2) | T1 | M | V-5 (+ V-6, R-9 for Q5) | ☐ |
+| S-9 | Study O9 options positioning (O9a history on stocks; O9b forward on HL perps) | T3 | L | P-6, P-7 (O9a); + R-11, R-12, V-12, ≥ 20 trading days (O9b) | ☐ |
+| S-10a | Study O10 Parts A + D: stock perp vs stock in hours; closed-hours lead-lag | T1 | M | P-4, V-12, R-13 (Part A) | ☐ |
+| S-10b | Study O10 Part C: HIP-3 stock-perp funding and premium by session | T2 | S | P-4, V-12 | ☐ |
+| S-10c | Study O10 Parts B + E: open convergence; weekend/overnight → next session/week | T3 | M | P-6, V-12 | ☐ |
+| S-11a | Study O11 Part A: Bollinger bands on spreads (stat-arb) | T1 | M | P-4 | ☐ |
+| S-11b | Study O11 Parts B + C: single-instrument bands; bands as a filter | T3 | M | P-6, R-5 candle backfill | ☐ |
+| D-1 | `RANKING.md` + ADR-0002 + first strategy spec stub | T1 | S | all S-tasks that are feasible | ☐ |
 
 **Critical path to "recording in production":** R-1 → R-2 → R-4/R-5 (parallel with R-3) → R-6 → V-4 → R-10. Get this done first; the research tasks can start once a few days of data exist.
 
@@ -757,9 +776,10 @@ Status: ☐ not started · 🔄 in progress · ✅ done. Size: **S** ≤ ½ day,
 | A (recorder core) | R-1 → R-2 → R-5 → R-7 |
 | B (connectivity) | R-3 → R-4 → R-6 → R-8 |
 | C (facts) | V-1, V-2, V-3, V-8, V-5 → V-6 |
-| F (options & equities) | V-9, V-10, V-11, V-12, V-13 → F-1 (in `../finsnap`) → R-11, R-12, R-13 → start collecting early: O9b needs weeks of forward data; O9a can start as soon as P-6 exists |
+| F (T3-data, allowed early) | V-9, V-10, V-13 → R-11, R-12. Starts the clock on forward options data (O9b needs weeks). No T3 *studies* until the T3 gate. |
+| G (equities for T1) | V-11, V-12 → R-13 (feeds S-10a) |
 | D (ops) | V-4 → R-10 → V-7 |
-| E (research, after ~3 days of data) | P-1 → P-2 → P-3 → P-4 → P-5 → S-* |
+| E (research, after ~3 days of data) | P-1 → P-2 → P-3 → P-4 → P-5 → T1 studies (S-1, S-2, S-3, S-5, S-8, S-10a, S-11a) → T2 → T3 after the gate |
 
 ### 14.2 Task details
 
@@ -798,9 +818,9 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Do:** Hyperliquid is believed to publish historical data to a requester-pays S3 bucket (e.g. `s3://hyperliquid-archive/…`, possibly also node data buckets) ⚠ unverified. Confirm the bucket(s), the paths, the data types (l2Book snapshots? asset ctxs? fills?), the formats (lz4?), the update lag, and the cost. Download one sample file per data type into the scratchpad and describe it.
 - **Done when:** §15 has an "S3 archive" block; if usable, add a follow-up task `P-6 backfill importer` to §14 (don't implement it now).
 
-#### V-9 — finsnap integration + HIP-3 stock universe mapping
-- **Do:** Read `../finsnap` (its `AGENTS.md`, `apps/backend/src/collectors/options.ts`, `analyzers/options.ts`, the `/snap` route). Document the `/snap` JSON shape for options (field names, as-of timestamps), the data delay of the Yahoo source, how to run finsnap next to the recorder (Docker Compose), and its options universe (`OPTIONS_SYMBOLS`). List every HIP-3 stock/index perp (`hl dexs`, `hl markets --dex …`), and map each one to its underlying stock/ETF and options symbol in `research/mappings/underlyings.toml`.
-- **Done when:** §15 has the finsnap block; the mapping file covers every HIP-3 stock perp with a liquid US options chain (or marks it "no chain").
+#### V-9 — Options data sources + HIP-3 stock universe mapping
+- **Do:** (1) Using finsnap's collector as a reference (`../finsnap/apps/backend/src/collectors/options.ts`, `yahooSession.ts`), document Yahoo's options endpoint: URL, session/crumb requirements, every field per contract (OI, volume, `impliedVolatility`, bid, ask, `lastPrice`), data delay, and safe request pacing. (2) Document finsnap's `option_snapshots` table (columns, date range, symbols) and its `/snap` options JSON, for the read-only uses in §9.1. (3) List every HIP-3 stock/index perp (`hl dexs`, `hl markets --dex …`) and map each one to its underlying stock/ETF and options symbol in `research/mappings/underlyings.toml`.
+- **Done when:** §15 has the Yahoo and finsnap blocks; the mapping file covers every HIP-3 stock perp with a liquid US options chain (or marks it "no chain").
 
 #### V-10 — Verify the Deribit public API
 - **Do:** Confirm the §9.1 endpoints, response fields (`mark_iv`, `open_interest`, `volume`, `underlying_price`, `instrument_name` format), rate limits, and reachability from the recorder host.
@@ -822,10 +842,6 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 #### V-12 — HIP-3 stock-perp mechanics
 - **Do:** For each HIP-3 dex listing stock/index perps: how the oracle/mark is set during US regular hours, pre/post market, overnight, and weekends; funding formula and cadence; fees (links to V-3); max leverage; trading halts and behavior around corporate actions (splits, dividends, earnings). Sources required.
 - **Done when:** §15 has a per-dex table.
-
-#### F-1 — finsnap: richer options data (in the `../finsnap` repo)
-- **Do:** In the finsnap repo, following **its** `AGENTS.md`: keep `impliedVolatility`, `bid`, `ask`, `lastPrice` per contract in the options collector/store (the Yahoo response already carries them; `normalizeContracts` drops them today), expose them in the `/snap` options payload, and add the HIP-3 underlyings from V-9 to the options universe. Commit in the finsnap repo, not here.
-- **Done when:** finsnap tests pass, and `/snap` shows IVs for the new symbols. Record the finsnap commit SHA in §15.
 
 #### R-1 — `mev-recorder` crate skeleton + envelope
 - **Do:** Create `crates/mev-recorder` (add it to the workspace `members`). Define `Envelope` (§5.1) and `Kind` (§5.3) with `serde`, plus constructors that take `t_ns`/`mono_ns` from an injectable clock (reuse the `mev_core::clock::Clock` pattern; add a monotonic-ns source). `raw` is stored as `String` and serialized as a JSON string.
@@ -873,10 +889,10 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Tests:** unit tests for multicall encoding and decoding with fixed vectors; a mock JSON-RPC test for the per-block flow.
 - **Done when:** tests pass; a manual 10-minute run against the configured RPC records one state snapshot per block for every pool in the list.
 
-#### R-11 — `finsnap` poller
-- **Do:** A source that polls the configured finsnap base URL (`HL_FINSNAP_URL`, profile `[finsnap]` section with the cadence from §9.1, gated to US market hours using an exchange calendar) and records raw responses as `rest` envelopes under `src:"finsnap"`. Reuse the R-5 scheduling code; no weight budget, but back off on errors.
-- **Tests:** `wiremock` → envelopes; the market-hours gate on a fixed-clock test (weekday / weekend / holiday).
-- **Done when:** tests pass; a 1-day run shows the expected snapshot count.
+#### R-11 — Options-chain sources
+- **Do:** (1) `yahoo-options`: fetch full option chains (every expiry) for the mapped underlyings + SPY/QQQ on the §9.1 cadence, gated to US market hours with an exchange calendar, with V-9's session handling and pacing; record raw responses as `rest` envelopes. (2) Optional `finsnap` poller of `GET /snap` (`HL_FINSNAP_URL`, disabled by default) for comparison. Reuse R-5's scheduling; back off on errors; never fail the recorder if either source is down (emit gaps).
+- **Tests:** `wiremock` → envelopes for both; the market-hours gate on a fixed-clock test (weekday / weekend / holiday); a session-refresh test for the Yahoo crumb.
+- **Done when:** tests pass; a 1-day run shows the expected snapshot count per underlying.
 
 #### R-12 — `deribit` source
 - **Do:** Poll the §9.1 Deribit endpoints every 60 s for the configured currencies; record `rest` envelopes under `src:"deribit"`. Respect V-10's rate limits.
@@ -922,7 +938,12 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Tests:** synthetic price paths with known returns → exact PnL; the availability rule blocks lookahead (a signal with `t_data + delay` in the future is never filled early); the random-baseline p-value on a known-null signal is not significant.
 - **Done when:** tests pass.
 
-#### S-1 … S-11 — Studies
+#### P-7 — Import finsnap history (read-only)
+- **Do:** `uv run hlr-import-finsnap --dsn …`: read finsnap's `option_snapshots` (read-only DB user or a dump) and write `options_contracts` partitions with `iv/bid/ask/last` null and `t_data` = the snapshot date at the US close. Never write to finsnap.
+- **Tests:** a fixture dump → expected rows; re-running is idempotent.
+- **Done when:** tests pass; §15 records the imported date range and symbols.
+
+#### S-1 … S-11b — Studies
 - **Do:** Implement the study in `research/studies/o{n}_{slug}.py` (entry point `uv run python -m studies.o{n}_{slug} --from … --to …`) following its §13.9 block exactly, and write the report via P-5. Run it first as **preliminary** (≥ 3 days of data), then **final** (≥ 14 days). O9, the §13.8 parts of O10, and O11 Part B use the data requirements stated in their blocks.
 - **Done when:** the final report exists with all §13.7 sections, including the hand-checked sanity section; the verdict is stated; the report front-matter feeds `RANKING.md`.
 
@@ -949,12 +970,12 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 | Data volume per stream (MB/h raw, zst) | | | | V-7 |
 | S3 archive availability | | | | V-8 |
 | Recorder production start date + host | | | | R-10 |
-| finsnap `/snap` options shape, data delay, run mode | | | | V-9 |
+| Yahoo options endpoint (fields, session, delay, pacing); finsnap `option_snapshots` + `/snap` shape | | | | V-9 |
 | Deribit endpoints, fields, limits | | | | V-10 |
 | Equities provider comparison + owner approval | | | | V-11 |
 | HIP-3 stock-perp mechanics per dex | | | | V-12 |
 | finsnap `option_snapshots` coverage; options-history vendors; owner decision | | | | V-13 |
-| finsnap F-1 commit SHA | | | | F-1 |
+| finsnap history imported (range, symbols) | | | | P-7 |
 
 ## 16. Acceptance criteria
 
