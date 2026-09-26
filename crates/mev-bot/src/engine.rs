@@ -1,35 +1,38 @@
-//! Strategy engine: builds views, drives strategies, gates intents through
-//! risk, and executes them (paper in `simulate`, `/exchange` in `live`).
+//! Strategy/config building, recording, and replay helpers for the `hl`
+//! binary.
+//!
+//! SPEC-0010 E-13 removed the legacy 1 s tick engine: the decision loop now
+//! lives in [`mev_engine::run::EngineLoop`] over a
+//! [`mev_engine::StrategyDispatcher`]. This module keeps the pieces that are
+//! reusable and not tied to the tick loop:
+//!
+//! - strategy/config construction ([`build`], [`EngineBuild`]) and the
+//!   [`Interests`] → market [`Subscription`] mapping;
+//! - the SQLite [`Recorder`] for market/replay input;
+//! - the REST account reconciler backstop that feeds the engine's account
+//!   channel (SPEC-0010 §15);
+//! - the deterministic replay helpers ([`replay`], [`replay_events`]) used by
+//!   `hl replay`.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use mev_core::clock::{Clock, SystemClock};
-use mev_core::config::{Config, Mode, Network};
+use mev_core::config::Config;
 use mev_core::db::writer::{DbWriter, WriteCmd};
-use mev_core::db::{Db, EventRow, FillRecord, OrderRecord};
+use mev_core::db::{Db, EventRow};
+use mev_engine::channels::InputHandles;
+use mev_engine::reconcile::Reconciler;
 use mev_engine::{
-    AccountState, Action, Actions, AssetCtxLite, BOOK_DEPTH, BookSnapshot, Cloid, CoinRegistry,
-    Ctx, FundingBasis, FundingConfig, Interests, Level, MarketMaker, MarketSlot, MmConfig,
-    OrderEvent, OrderEventKind, Stamp, Strategy, Stream,
+    AccountSnapshot, AccountState, AccountUpdate, Action, Actions, AssetCtxLite, BOOK_DEPTH,
+    BookSnapshot, CoinRegistry, Ctx, FundingBasis, FundingConfig, Interests, Level, MarketMaker,
+    MarketSlot, MmConfig, Stamp, Strategy, Stream,
 };
-use mev_hl_client::{
-    AssetMap, CancelByCloidWire, CloidFactory, ExchangeApi, InfoApi, MIN_ORDER_NOTIONAL, Market,
-    MarketSelector, MarketState, OrderParams, OrderResolution, OrderStatus, Subscription,
-    Tolerance, build_order_wire, round_price_aggressive,
-};
-use mev_risk::{Decision, LimitRisk, Limits, RiskCheck, RiskContext};
-use mev_strategy::{
-    AccountView, BookView, CostModel, Event, FeeRates, FillEvent, Instrument, MarketView,
-    OpenOrderView, OrderIntent, PaperExecutor, PositionView, Side, StrategyId, TimeInForce,
-};
+use mev_hl_client::{InfoApi, MarketSelector, MarketState, Subscription, Tolerance};
+use mev_strategy::{AccountView, BookView, CostModel, Event, FeeRates, Instrument, MarketView};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use tracing::{info, warn};
-
-use mev_metrics::names;
 
 /// Strategies plus the market feeds they need.
 pub struct EngineBuild {
@@ -43,8 +46,6 @@ pub struct EngineBuild {
     pub sz_decimals: BTreeMap<String, u32>,
     /// Instruments for paper routing.
     pub instruments: BTreeMap<String, Instrument>,
-    /// Resolved market metadata for live order building.
-    pub markets: AssetMap,
     /// Interned coin map shared with the strategies' configs.
     pub registry: CoinRegistry,
 }
@@ -62,7 +63,6 @@ pub fn build(cfg: &Config, selector: &MarketSelector) -> Result<EngineBuild> {
         coins: Vec::new(),
         sz_decimals: BTreeMap::new(),
         instruments: BTreeMap::new(),
-        markets: selector.asset_map().clone(),
         registry: CoinRegistry::default(),
     };
 
@@ -246,16 +246,6 @@ impl Recorder {
         Self { writer, session_id }
     }
 
-    /// The underlying writer (for order/fill records).
-    pub fn writer(&self) -> &Arc<DbWriter> {
-        &self.writer
-    }
-
-    /// The session these events belong to.
-    pub fn session_id(&self) -> i64 {
-        self.session_id
-    }
-
     /// Record one input event at `ts_ms`.
     pub fn record(&self, event: &Event, ts_ms: u64) {
         match serde_json::to_string(event) {
@@ -282,660 +272,30 @@ pub fn event_kind(event: &Event) -> &'static str {
     }
 }
 
-/// The running strategy engine.
-pub struct Engine {
-    strategies: Vec<Box<dyn Strategy>>,
-    coins: Vec<String>,
-    sz_decimals: BTreeMap<String, u32>,
-    /// Interned coin map backing the strategy context.
-    registry: CoinRegistry,
-    markets: AssetMap,
-    risk: LimitRisk,
-    paper: Option<PaperExecutor>,
-    exchange: Option<Arc<dyn ExchangeApi>>,
-    /// Read API + account address, used to reconcile unknown order outcomes by
-    /// cloid before anything is resent (SPEC-0002 H-2).
-    info: Option<(Arc<dyn InfoApi>, String)>,
-    account: Arc<RwLock<AccountView>>,
-    recorder: Recorder,
-    cloids: CloidFactory,
-    max_slippage_bps: Decimal,
-    /// Accepted placements keyed by cloid, so a v2 [`Action::Cancel`]/[`Action::Modify`]
-    /// (which carry only a cloid) can be routed to the venue and rebuilt.
-    tracked_cloids: BTreeMap<Cloid, TrackedOrder>,
-}
-
-/// Metadata about an accepted order, retained so a cloid-only modify can be
-/// turned into a cancel-then-place.
-#[derive(Debug, Clone)]
-struct TrackedOrder {
-    coin: String,
-    asset_id: u32,
-    strategy: StrategyId,
-    side: Side,
-    tif: TimeInForce,
-    reduce_only: bool,
-    rationale: String,
-}
-
-impl Engine {
-    /// Construct the engine for the given mode.
-    pub fn new(
-        build: EngineBuild,
-        cfg: &Config,
-        exchange: Option<Arc<dyn ExchangeApi>>,
-        writer: Arc<DbWriter>,
-        session_id: i64,
-    ) -> Self {
-        let paper = (cfg.mode == Mode::Simulate).then(|| {
-            let seeded = AccountView {
-                account_value: Decimal::from(100_000),
-                fees: FeeRates::PERP,
-                ..Default::default()
-            };
-            PaperExecutor::new(
-                build.instruments.clone(),
-                seeded,
-                FeeRates::PERP,
-                FeeRates::SPOT,
-            )
-        });
-        let risk = LimitRisk::new(Limits {
-            min_notional: MIN_ORDER_NOTIONAL,
-            max_order_notional: cfg.risk.max_order_notional_usd,
-            max_position_notional: cfg.risk.max_position_notional_usd,
-            max_open_orders: cfg.risk.max_open_orders,
-            max_margin_utilization_bps: cfg.risk.max_margin_utilization_bps,
-        });
-        Self {
-            strategies: build.strategies,
-            coins: build.coins,
-            sz_decimals: build.sz_decimals,
-            registry: build.registry,
-            markets: build.markets,
-            risk,
-            paper,
-            exchange,
-            info: None,
-            account: Arc::new(RwLock::new(AccountView::default())),
-            recorder: Recorder::new(writer, session_id),
-            cloids: CloidFactory::new(),
-            max_slippage_bps: Decimal::from(cfg.strategy.max_slippage_bps),
-            tracked_cloids: BTreeMap::new(),
-        }
-    }
-
-    /// Attach the read API and account address used to reconcile unknown order
-    /// outcomes by `cloid` (SPEC-0002 H-2).
-    pub fn with_info(mut self, info: Arc<dyn InfoApi>, address: impl Into<String>) -> Self {
-        self.info = Some((info, address.into()));
-        self
-    }
-
-    /// The shared live-account view (updated by [`account_reconciler`]).
-    pub fn account(&self) -> Arc<RwLock<AccountView>> {
-        self.account.clone()
-    }
-
-    /// A handle to the risk gate's sticky trading-halt flag.
-    pub fn halt(&self) -> mev_risk::TradingHalt {
-        self.risk.halt()
-    }
-
-    /// Run the decision loop until the task is aborted.
-    pub async fn run(mut self, state: Arc<RwLock<MarketState>>) {
-        info!(
-            strategies = self.strategies.len(),
-            "strategy engine started"
-        );
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            tick.tick().await;
-            if let Err(err) = self.step(&state).await {
-                warn!(error = %err, "engine step failed");
-            }
-        }
-    }
-
-    async fn step(&mut self, state: &Arc<RwLock<MarketState>>) -> Result<()> {
-        self.risk.begin_cycle();
-        let now = SystemClock.now_ms();
-        let market = {
-            let guard = state.read().expect("market state lock poisoned");
-            self.snapshot_market(&guard)
-        };
-        let account = match &self.paper {
-            Some(paper) => paper.account().clone(),
-            None => self.account.read().expect("account lock poisoned").clone(),
-        };
-
-        // Record the decision-cycle inputs so the run can be replayed offline.
-        self.recorder.record(&Event::Account(account.clone()), now);
-        self.recorder.record(&Event::Timer { every_ms: 1_000 }, now);
-
-        // Build the v2 context from locals (including a cloned registry) so no
-        // `self` borrow is held while strategies are driven; engine state is
-        // only touched again after the strategy pass ends.
-        let registry = self.registry.clone();
-        let slots = to_slots(&registry, &market);
-        let account_state = to_account(&registry, &account);
-        let stamp = Stamp {
-            t_recv_ns: (now as i64) * 1_000_000,
-            ..Default::default()
-        };
-
-        let mut pending: Vec<Vec<Action>> = Vec::new();
-        {
-            let ctx = Ctx {
-                now: stamp,
-                markets: &slots,
-                account: &account_state,
-                registry: &registry,
-            };
-            for strategy in &mut self.strategies {
-                let mut actions = Actions::new();
-                for coin in strategy.interests().distinct_coins() {
-                    strategy.on_market(coin, &ctx, &mut actions);
-                }
-                if !actions.is_empty() {
-                    pending.push(actions.take().into_vec());
-                }
-            }
-        }
-
-        let mut fills: Vec<FillEvent> = Vec::new();
-        for actions in pending {
-            fills.extend(self.apply_actions(actions, &market, &account, now).await?);
-        }
-
-        if let Some(paper) = &mut self.paper {
-            let maker_fills = paper.on_market(&market, now);
-            fills.extend(maker_fills);
-        }
-
-        for fill in &fills {
-            self.record_fill(fill, now);
-        }
-
-        // Deliver fills back to the owning strategy as v2 order events.
-        let mut order_actions: Vec<Vec<Action>> = Vec::new();
-        if !fills.is_empty() {
-            let ctx = Ctx {
-                now: stamp,
-                markets: &slots,
-                account: &account_state,
-                registry: &registry,
-            };
-            for fill in &fills {
-                let Some(sid) = fill.strategy.clone() else {
-                    continue;
-                };
-                let Some(coin) = registry.id(&fill.coin) else {
-                    continue;
-                };
-                let event = OrderEvent {
-                    stamp,
-                    cloid: None,
-                    oid: 0,
-                    coin,
-                    side: fill.side,
-                    px: fill.px,
-                    sz: fill.sz,
-                    fee: fill.fee,
-                    maker: fill.maker,
-                    reduce_only: fill.reduce_only,
-                    kind: OrderEventKind::Fill,
-                };
-                for strategy in &mut self.strategies {
-                    if strategy.id() == sid {
-                        let mut actions = Actions::new();
-                        strategy.on_order(&event, &ctx, &mut actions);
-                        if !actions.is_empty() {
-                            order_actions.push(actions.take().into_vec());
-                        }
-                    }
-                }
-            }
-        }
-        for actions in order_actions {
-            fills.extend(self.apply_actions(actions, &market, &account, now).await?);
-        }
-
-        if let Some(paper) = &self.paper {
-            metrics::gauge!(names::PAPER_FEES_PAID).set(paper.fees_paid().to_f64().unwrap_or(0.0));
-        }
-        Ok(())
-    }
-
-    /// Gate and execute a strategy's actions, returning any resulting fills.
-    async fn apply_actions(
-        &mut self,
-        actions: Vec<Action>,
-        market: &MarketView,
-        account: &AccountView,
-        now: u64,
-    ) -> Result<Vec<FillEvent>> {
-        let mut fills = Vec::new();
-        for action in actions {
-            match action {
-                Action::Place(intent) => {
-                    fills.extend(self.gate_and_execute(intent, market, account, now).await?);
-                }
-                Action::Cancel { cloid } => self.cancel_cloid(&cloid, now).await,
-                Action::Modify { cloid, px, sz } => {
-                    fills.extend(
-                        self.modify_cloid(&cloid, px, sz, market, account, now)
-                            .await?,
-                    );
-                }
-                Action::PlaceGroup(group) => {
-                    warn!(
-                        legs = group.legs.len(),
-                        "multi-leg PlaceGroup is not supported yet; ignoring"
-                    );
-                }
-            }
-        }
-        Ok(fills)
-    }
-
-    fn snapshot_market(&self, state: &MarketState) -> MarketView {
-        build_market_view(state, &self.coins, &self.sz_decimals)
-    }
-
-    async fn gate_and_execute(
-        &mut self,
-        intent: OrderIntent,
-        market: &MarketView,
-        account: &AccountView,
-        now: u64,
-    ) -> Result<Vec<FillEvent>> {
-        let sid = intent.strategy.as_str().to_string();
-        metrics::counter!(names::STRATEGY_INTENTS, "strategy" => sid.clone()).increment(1);
-
-        let decision = self.risk.check(
-            &intent,
-            &RiskContext {
-                market,
-                account,
-                now_ms: now,
-            },
-        );
-        let effective = match decision {
-            Decision::Approve => {
-                metrics::counter!(names::STRATEGY_GATES, "strategy" => sid, "decision" => "approve")
-                    .increment(1);
-                intent
-            }
-            Decision::Resize(size) => {
-                metrics::counter!(names::STRATEGY_GATES, "strategy" => sid, "decision" => "resize")
-                    .increment(1);
-                OrderIntent { size, ..intent }
-            }
-            Decision::Reject(reason) => {
-                metrics::counter!(names::STRATEGY_GATES, "strategy" => sid, "decision" => "reject")
-                    .increment(1);
-                self.record_order(&intent, "reject", Some(&reason), now);
-                return Ok(Vec::new());
-            }
-        };
-        // Mandatory cloid: every accepted order is identifiable for
-        // reconciliation and idempotent retry (SPEC-0002 H-2).
-        let effective = match effective.cloid {
-            Some(_) => effective,
-            None => OrderIntent {
-                cloid: Some(self.cloids.next()),
-                ..effective
-            },
-        };
-        // Track the cloid so a later cloid-only cancel/modify can be routed
-        // (paper orders included: the simulate path needs it too).
-        if let Some(cloid) = effective.cloid.as_deref().and_then(Cloid::from_hex) {
-            let asset_id = self
-                .markets
-                .get(&effective.coin)
-                .map(Market::asset_id)
-                .unwrap_or(0);
-            self.tracked_cloids.insert(
-                cloid,
-                TrackedOrder {
-                    coin: effective.coin.clone(),
-                    asset_id,
-                    strategy: effective.strategy.clone(),
-                    side: effective.side,
-                    tif: effective.tif,
-                    reduce_only: effective.reduce_only,
-                    rationale: effective.rationale.clone(),
-                },
-            );
-        }
-
-        self.record_order(&effective, "intent", None, now);
-        match &mut self.paper {
-            Some(paper) => Ok(paper.submit(&effective, market, now)),
-            None => {
-                self.submit_live(&effective, market, now).await?;
-                Ok(Vec::new())
-            }
-        }
-    }
-
-    /// Cancel an order by cloid (from a v2 [`Action::Cancel`]).
-    async fn cancel_cloid(&mut self, cloid: &Cloid, now: u64) {
-        let cloid_hex = cloid.to_hex();
-        if let Some(paper) = &mut self.paper {
-            paper.cancel(Some(&cloid_hex), None);
-        }
-        let Some(order) = self.tracked_cloids.remove(cloid) else {
-            warn!(cloid = %cloid_hex, "cancel for untracked cloid; skipping");
-            return;
-        };
-        if let Some(exchange) = &self.exchange
-            && let Err(err) = exchange
-                .cancel_by_cloid(vec![CancelByCloidWire {
-                    asset: order.asset_id,
-                    cloid: cloid_hex.clone(),
-                }])
-                .await
-        {
-            warn!(coin = %order.coin, error = %err, "live cancel failed");
-        }
-        let record = OrderRecord {
-            ts_ms: now,
-            strategy: Some(order.strategy.to_string()),
-            coin: order.coin,
-            side: side_str(order.side.is_buy()).to_string(),
-            kind: "cancel".to_string(),
-            cloid: Some(cloid_hex),
-            oid: None,
-            px: None,
-            sz: None,
-            reduce_only: None,
-            rationale: None,
-            status: None,
-        };
-        self.recorder.writer().try_send(WriteCmd::Order {
-            session_id: self.recorder.session_id(),
-            record,
-        });
-    }
-
-    /// Modify an order via cancel-then-place, rebuilt from the tracked cloid.
-    async fn modify_cloid(
-        &mut self,
-        cloid: &Cloid,
-        px: Decimal,
-        sz: Decimal,
-        market: &MarketView,
-        account: &AccountView,
-        now: u64,
-    ) -> Result<Vec<FillEvent>> {
-        let Some(order) = self.tracked_cloids.get(cloid).cloned() else {
-            warn!(cloid = %cloid.to_hex(), "modify for untracked cloid; skipping");
-            return Ok(Vec::new());
-        };
-        self.cancel_cloid(cloid, now).await;
-        let intent = OrderIntent {
-            strategy: order.strategy,
-            coin: order.coin,
-            side: order.side,
-            limit_px: Some(px),
-            size: sz,
-            tif: order.tif,
-            reduce_only: order.reduce_only,
-            rationale: order.rationale,
-            cloid: None,
-            signal_ms: now,
-            decision_ms: now,
-        };
-        self.gate_and_execute(intent, market, account, now).await
-    }
-
-    async fn submit_live(
-        &mut self,
-        intent: &OrderIntent,
-        market: &MarketView,
-        now: u64,
-    ) -> Result<()> {
-        let Some(exchange) = &self.exchange else {
-            return Ok(());
-        };
-        let Some(market_meta) = self.markets.get(&intent.coin) else {
-            warn!(coin = %intent.coin, "no market metadata; skipping live order");
-            return Ok(());
-        };
-        let limit_px = match intent.limit_px {
-            Some(px) => px,
-            None => {
-                // Aggressive orders take the touch plus slippage, never the mid
-                // (SPEC-0010 §12 / E-0).
-                match aggressive_limit_px(
-                    market_meta,
-                    market,
-                    &intent.coin,
-                    intent.is_buy(),
-                    self.max_slippage_bps,
-                ) {
-                    Some(px) => px,
-                    None => {
-                        warn!(coin = %intent.coin, "no touch to price aggressive live order");
-                        self.record_order(intent, "reject", Some("no reference price"), now);
-                        return Ok(());
-                    }
-                }
-            }
-        };
-        let params = OrderParams {
-            is_buy: intent.is_buy(),
-            size: intent.size,
-            limit_px,
-            tif: intent.tif.into(),
-            reduce_only: intent.reduce_only,
-            cloid: intent.cloid.clone(),
-        };
-        let wire = match build_order_wire(market_meta, &params) {
-            Ok(wire) => wire,
-            Err(err) => {
-                warn!(coin = %intent.coin, error = %err, "order build rejected");
-                self.record_order(intent, "reject", Some(&err.to_string()), now);
-                return Ok(());
-            }
-        };
-        // Read the venue's per-order status instead of assuming "submitted":
-        // rejected orders must not look live (SPEC-0010 §2 item 7 / E-0).
-        match exchange.place(vec![wire]).await {
-            Ok(response) => match response.statuses.first() {
-                Some(status) => {
-                    let (kind, label) = order_status_fields(status);
-                    self.record_order(intent, kind, Some(&label), now);
-                }
-                None => self.record_order(intent, "submitted", None, now),
-            },
-            Err(mev_core::error::Error::UnknownOutcome(detail)) => {
-                // The order may or may not be live. Reconcile by cloid before
-                // recording anything; never resend (SPEC-0002 H-2).
-                self.reconcile_unknown(intent, &detail, now).await;
-            }
-            Err(err) => {
-                warn!(coin = %intent.coin, error = %err, "live submit failed");
-                self.record_order(intent, "reject", Some(&err.to_string()), now);
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolve an unknown order outcome via `orderStatus` by `cloid`.
-    ///
-    /// Records the resolved state (`resting`/`filled`/`rejected`/…), or a
-    /// `reconcile:unknown` marker when the read API is unavailable or the query
-    /// fails. There is no path here that resends the order.
-    async fn reconcile_unknown(&mut self, intent: &OrderIntent, detail: &str, now: u64) {
-        let Some(cloid) = intent.cloid.as_deref() else {
-            self.record_order(intent, "reconcile", Some("no-cloid"), now);
-            return;
-        };
-        let Some((info, address)) = &self.info else {
-            warn!(cloid, "unknown outcome but no read API to reconcile");
-            self.record_order(intent, "reconcile", Some(&format!("no-info:{detail}")), now);
-            return;
-        };
-        match info.order_status_by_cloid(address, cloid).await {
-            Ok(status) => {
-                let resolution = status.resolution();
-                metrics::counter!(
-                    names::ORDER_RECONCILE,
-                    "resolution" => resolution.label(),
-                )
-                .increment(1);
-                let kind = match resolution {
-                    OrderResolution::Resting | OrderResolution::Triggered => "resting",
-                    OrderResolution::Filled => "filled",
-                    OrderResolution::Rejected => "reject",
-                    OrderResolution::Cancelled => "cancelled",
-                    OrderResolution::NotFound => "reconcile",
-                    OrderResolution::Other(_) => "reconcile",
-                };
-                let label = match resolution {
-                    OrderResolution::NotFound => format!("not-found:{detail}"),
-                    other => other.label(),
-                };
-                self.record_order(intent, kind, Some(&label), now);
-            }
-            Err(err) => {
-                warn!(cloid, error = %err, "reconciliation query failed");
-                self.record_order(
-                    intent,
-                    "reconcile",
-                    Some(&format!("query-failed:{err}")),
-                    now,
-                );
-            }
-        }
-    }
-
-    fn record_order(&self, intent: &OrderIntent, kind: &str, status: Option<&str>, now: u64) {
-        let record = OrderRecord {
-            ts_ms: now,
-            strategy: Some(intent.strategy.to_string()),
-            coin: intent.coin.clone(),
-            side: side_str(intent.is_buy()).to_string(),
-            kind: kind.to_string(),
-            cloid: intent.cloid.clone(),
-            oid: None,
-            px: intent.limit_px.map(|px| px.normalize().to_string()),
-            sz: Some(intent.size.normalize().to_string()),
-            reduce_only: Some(intent.reduce_only),
-            rationale: Some(intent.rationale.clone()),
-            status: status.map(str::to_string),
-        };
-        self.recorder.writer().try_send(WriteCmd::Order {
-            session_id: self.recorder.session_id(),
-            record,
-        });
-    }
-
-    fn record_fill(&self, fill: &FillEvent, now: u64) {
-        let sid = fill
-            .strategy
-            .as_ref()
-            .map(StrategyId::to_string)
-            .unwrap_or_default();
-        metrics::counter!(names::STRATEGY_FILLS, "strategy" => sid.clone()).increment(1);
-        let record = FillRecord {
-            ts_ms: now,
-            tid: None,
-            oid: None,
-            coin: fill.coin.clone(),
-            side: side_str(fill.side.is_buy()).to_string(),
-            px: fill.px.normalize().to_string(),
-            sz: fill.sz.normalize().to_string(),
-            fee: Some(fill.fee.normalize().to_string()),
-            builder_fee: None,
-            closed_pnl: None,
-            strategy: fill.strategy.as_ref().map(StrategyId::to_string),
-        };
-        self.recorder.writer().try_send(WriteCmd::Fill {
-            session_id: self.recorder.session_id(),
-            record,
-        });
-    }
-}
-
-fn side_str(is_buy: bool) -> &'static str {
-    if is_buy { "buy" } else { "sell" }
-}
-
-/// The best opposite touch for an aggressive order (buy lifts the ask, sell
-/// hits the bid), falling back to the mid when a side is empty.
-fn touch(market: &MarketView, coin: &str, is_buy: bool) -> Option<Decimal> {
-    market
-        .book(coin)
-        .and_then(|book| {
-            if is_buy {
-                book.best_ask()
-            } else {
-                book.best_bid()
-            }
-        })
-        .map(|(px, _)| px)
-        .or_else(|| market.mid(coin))
-}
-
-/// Aggressive limit for a `limit_px: None` order: the touch moved by
-/// `max_slippage_bps`, rounded in the safe direction and never the mid
-/// (SPEC-0010 §12).
-fn aggressive_limit_px(
-    meta: &Market,
-    market: &MarketView,
-    coin: &str,
-    is_buy: bool,
-    max_slippage_bps: Decimal,
-) -> Option<Decimal> {
-    let base = touch(market, coin, is_buy)?;
-    if base <= Decimal::ZERO {
-        return None;
-    }
-    let factor = if is_buy {
-        Decimal::ONE + max_slippage_bps / Decimal::from(10_000)
-    } else {
-        Decimal::ONE - max_slippage_bps / Decimal::from(10_000)
-    };
-    let raw = base * factor;
-    if raw <= Decimal::ZERO {
-        return None;
-    }
-    Some(round_price_aggressive(meta, raw, is_buy))
-}
-
-/// Map a venue per-order status to an order-record `(kind, status)` pair.
-fn order_status_fields(status: &OrderStatus) -> (&'static str, String) {
-    match status {
-        OrderStatus::Resting => ("resting", "resting".to_string()),
-        OrderStatus::Filled => ("filled", "filled".to_string()),
-        OrderStatus::Rejected(reason) => ("reject", format!("rejected:{}", reason.as_str())),
-        OrderStatus::Other(other) => ("other", other.clone()),
-    }
-}
-
-/// Refresh the shared account view on the reconciler cadence.
+/// Refresh the engine's account snapshot on the reconciler cadence.
 ///
 /// SPEC-0010 §15: the H-3 stream is the source of truth for own orders and
 /// fills; the REST reconciler is the backstop and runs every 30 s (and after a
 /// reconnect). This replaces the former 5 s `account_poller`. It is a background
-/// task, never on the order path.
+/// task, never on the order path. The snapshot is delivered losslessly through
+/// the engine's account channel as [`AccountUpdate::Reconcile`].
 pub async fn account_reconciler(
     info: Arc<dyn InfoApi>,
     address: String,
-    account: Arc<RwLock<AccountView>>,
-    network: Network,
+    registry: CoinRegistry,
+    handles: InputHandles,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         interval.tick().await;
-        match load_account(&*info, &address, network).await {
-            Ok(view) => {
-                if let Ok(mut guard) = account.write() {
-                    *guard = view;
+        match load_account_snapshot(&*info, &address, &registry).await {
+            Ok(snapshot) => {
+                let update = AccountUpdate::Reconcile {
+                    stamp: now_stamp(),
+                    snapshot,
+                };
+                if !handles.send_account(update) {
+                    break;
                 }
             }
             Err(err) => warn!(error = %err, "account reconcile failed"),
@@ -943,70 +303,28 @@ pub async fn account_reconciler(
     }
 }
 
-async fn load_account(info: &dyn InfoApi, address: &str, _network: Network) -> Result<AccountView> {
+async fn load_account_snapshot(
+    info: &dyn InfoApi,
+    address: &str,
+    registry: &CoinRegistry,
+) -> Result<AccountSnapshot> {
     let clearing = info.clearinghouse_state(address).await?;
-    let spot = info
-        .spot_clearinghouse_state(address)
-        .await
-        .unwrap_or_default();
     let open_orders = info.open_orders(address).await.unwrap_or_default();
-    let fees = info.user_fees(address).await.ok();
+    let now_ns = i64::try_from(SystemClock.now_ms().saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+    let snapshot = Reconciler::build_snapshot(&clearing, &open_orders, registry, now_ns);
+    Ok(snapshot.account_snapshot())
+}
 
-    let mut positions = BTreeMap::new();
-    for entry in &clearing.asset_positions {
-        let position = &entry.position;
-        positions.insert(
-            position.coin.clone(),
-            PositionView {
-                coin: position.coin.clone(),
-                szi: position.szi,
-                entry_px: position.entry_px,
-                position_value: position.position_value,
-                unrealized_pnl: position.unrealized_pnl,
-                margin_used: position.margin_used,
-            },
-        );
+/// A receive stamp for an account update read off-thread.
+pub fn now_stamp() -> Stamp {
+    let now = SystemClock.now_ms();
+    Stamp {
+        t_recv_ns: i64::try_from(now)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000_000),
+        mono_ns: now.saturating_mul(1_000_000),
+        ts_exch_ms: 0,
     }
-
-    let mut spot_balances = BTreeMap::new();
-    for balance in &spot.balances {
-        spot_balances.insert(balance.coin.clone(), balance.total);
-    }
-
-    let open_views = open_orders
-        .iter()
-        .map(|order| OpenOrderView {
-            coin: order.coin.clone(),
-            oid: Some(order.oid),
-            cloid: order.cloid.clone(),
-            side: if order.is_buy() {
-                mev_strategy::Side::Buy
-            } else {
-                mev_strategy::Side::Sell
-            },
-            limit_px: order.limit_px,
-            sz: order.sz,
-            reduce_only: order.reduce_only,
-        })
-        .collect();
-
-    let fee_rates = match fees {
-        Some(fees) => FeeRates {
-            maker: fees.user_add_rate.unwrap_or(FeeRates::PERP.maker),
-            taker: fees.user_cross_rate.unwrap_or(FeeRates::PERP.taker),
-        },
-        None => FeeRates::PERP,
-    };
-
-    Ok(AccountView {
-        positions,
-        spot: spot_balances,
-        open_orders: open_views,
-        fees: fee_rates,
-        account_value: clearing.margin_summary.account_value,
-        margin_used: clearing.margin_summary.total_margin_used,
-        withdrawable: clearing.withdrawable,
-    })
 }
 
 /// Build a market snapshot from state for the given coins.
@@ -1238,199 +556,22 @@ pub async fn replay(
 mod tests {
     use std::collections::BTreeMap;
     use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
-    use mev_core::db::writer::DbWriter;
-    use mev_core::error::Error;
-    use mev_hl_client::StreamEvent;
-    use mev_hl_client::types::{
-        AllMids, ClearinghouseState, L2Book, Level, Meta, MetaAndAssetCtxs, OpenOrder,
-        OrderStatusResponse, PerpDex, SpotClearinghouseState, SpotMeta, UserFees, UserFill,
-        UserFunding, UserRateLimit,
-    };
+    use mev_engine::builder::AssetTable;
+    use mev_engine::channels::inputs;
+    use mev_engine::dispatch::{DispatcherConfig, StrategyDispatcher};
+    use mev_engine::exec::{ExecBackend, UnsignedPost};
+    use mev_engine::risk::RiskGate;
+    use mev_engine::run::{EngineLoop, LoopConfig};
+    use mev_engine::types::{CoinId, MarketUpdate};
+    use mev_hl_client::types::{AssetMeta, L2Book, Level as WireLevel, Meta};
+    use mev_hl_client::{AssetMap, StreamEvent};
 
     use super::*;
 
     fn ds(value: &str) -> Decimal {
         Decimal::from_str(value).unwrap()
-    }
-
-    /// A stub info API returning a fixed `orderStatus` body (or an error).
-    struct FakeInfo {
-        response: std::result::Result<OrderStatusResponse, String>,
-    }
-
-    #[async_trait]
-    impl InfoApi for FakeInfo {
-        async fn order_status_by_cloid(
-            &self,
-            _user: &str,
-            _cloid: &str,
-        ) -> std::result::Result<OrderStatusResponse, Error> {
-            match &self.response {
-                Ok(status) => Ok(status.clone()),
-                Err(message) => Err(Error::Http(message.clone())),
-            }
-        }
-        async fn meta(&self) -> std::result::Result<Meta, Error> {
-            Err(Error::Unimplemented("meta"))
-        }
-        async fn meta_for(&self, _dex: &str) -> std::result::Result<Meta, Error> {
-            Err(Error::Unimplemented("meta_for"))
-        }
-        async fn perp_dexs(&self) -> std::result::Result<Vec<PerpDex>, Error> {
-            Err(Error::Unimplemented("perp_dexs"))
-        }
-        async fn spot_meta(&self) -> std::result::Result<SpotMeta, Error> {
-            Err(Error::Unimplemented("spot_meta"))
-        }
-        async fn all_mids(&self) -> std::result::Result<AllMids, Error> {
-            Err(Error::Unimplemented("all_mids"))
-        }
-        async fn all_mids_for(&self, _dex: &str) -> std::result::Result<AllMids, Error> {
-            Err(Error::Unimplemented("all_mids_for"))
-        }
-        async fn l2_book(&self, _coin: &str) -> std::result::Result<L2Book, Error> {
-            Err(Error::Unimplemented("l2_book"))
-        }
-        async fn meta_and_asset_ctxs(&self) -> std::result::Result<MetaAndAssetCtxs, Error> {
-            Err(Error::Unimplemented("meta_and_asset_ctxs"))
-        }
-        async fn clearinghouse_state(
-            &self,
-            _user: &str,
-        ) -> std::result::Result<ClearinghouseState, Error> {
-            Err(Error::Unimplemented("clearinghouse_state"))
-        }
-        async fn open_orders(&self, _user: &str) -> std::result::Result<Vec<OpenOrder>, Error> {
-            Err(Error::Unimplemented("open_orders"))
-        }
-        async fn order_status(
-            &self,
-            _user: &str,
-            _oid: u64,
-        ) -> std::result::Result<OrderStatusResponse, Error> {
-            Err(Error::Unimplemented("order_status"))
-        }
-        async fn spot_clearinghouse_state(
-            &self,
-            _user: &str,
-        ) -> std::result::Result<SpotClearinghouseState, Error> {
-            Err(Error::Unimplemented("spot_clearinghouse_state"))
-        }
-        async fn user_funding(
-            &self,
-            _user: &str,
-            _start_ms: u64,
-        ) -> std::result::Result<Vec<UserFunding>, Error> {
-            Err(Error::Unimplemented("user_funding"))
-        }
-        async fn user_fills_by_time(
-            &self,
-            _user: &str,
-            _start_ms: u64,
-        ) -> std::result::Result<Vec<UserFill>, Error> {
-            Err(Error::Unimplemented("user_fills_by_time"))
-        }
-        async fn user_fees(&self, _user: &str) -> std::result::Result<UserFees, Error> {
-            Err(Error::Unimplemented("user_fees"))
-        }
-        async fn user_rate_limit(&self, _user: &str) -> std::result::Result<UserRateLimit, Error> {
-            Err(Error::Unimplemented("user_rate_limit"))
-        }
-    }
-
-    fn status(found_state: Option<&str>) -> OrderStatusResponse {
-        match found_state {
-            Some(state) => OrderStatusResponse {
-                status: "order".into(),
-                order: Some(mev_hl_client::OrderStatusOrder {
-                    order: None,
-                    status: state.into(),
-                    status_timestamp: 1,
-                }),
-            },
-            None => OrderStatusResponse {
-                status: "unknownOid".into(),
-                order: None,
-            },
-        }
-    }
-
-    fn test_engine(info: Option<Arc<dyn InfoApi>>) -> Engine {
-        let db = Db::open_in_memory().unwrap();
-        let writer = Arc::new(DbWriter::spawn(db, 512));
-        let build = EngineBuild {
-            strategies: Vec::new(),
-            subscriptions: Vec::new(),
-            coins: vec!["BTC".into()],
-            sz_decimals: BTreeMap::new(),
-            instruments: BTreeMap::new(),
-            markets: AssetMap::new(),
-            registry: CoinRegistry::from_coins(&["BTC".into()]),
-        };
-        let cfg = Config::default();
-        let mut engine = Engine::new(build, &cfg, None, writer, 1);
-        if let Some(info) = info {
-            engine = engine.with_info(info, "0xaccount");
-        }
-        engine
-    }
-
-    fn intent_with_cloid(cloid: Option<&str>) -> OrderIntent {
-        OrderIntent {
-            strategy: StrategyId::from("test"),
-            coin: "BTC".into(),
-            side: mev_strategy::Side::Buy,
-            limit_px: Some(ds("100")),
-            size: ds("1"),
-            tif: mev_strategy::TimeInForce::Gtc,
-            reduce_only: false,
-            rationale: "test".into(),
-            cloid: cloid.map(str::to_string),
-            signal_ms: 0,
-            decision_ms: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn reconcile_unknown_resolves_by_cloid_without_resending() {
-        // The fake info reports the order resting; reconciliation must record
-        // it and must not submit anything (the engine has no exchange).
-        let info: Arc<dyn InfoApi> = Arc::new(FakeInfo {
-            response: Ok(status(Some("open"))),
-        });
-        let mut engine = test_engine(Some(info));
-        let intent = intent_with_cloid(Some("0xdead"));
-        engine.reconcile_unknown(&intent, "dropped", 1).await;
-    }
-
-    #[tokio::test]
-    async fn reconcile_unknown_handles_not_found_and_query_failure() {
-        let not_found: Arc<dyn InfoApi> = Arc::new(FakeInfo {
-            response: Ok(status(None)),
-        });
-        let mut engine = test_engine(Some(not_found));
-        engine
-            .reconcile_unknown(&intent_with_cloid(Some("0xdead")), "dropped", 1)
-            .await;
-
-        let failing: Arc<dyn InfoApi> = Arc::new(FakeInfo {
-            response: Err("boom".into()),
-        });
-        let mut engine = test_engine(Some(failing));
-        engine
-            .reconcile_unknown(&intent_with_cloid(Some("0xdead")), "dropped", 1)
-            .await;
-
-        // No cloid and no info are both handled without panicking.
-        engine
-            .reconcile_unknown(&intent_with_cloid(None), "dropped", 1)
-            .await;
-        let mut engine = test_engine(None);
-        engine
-            .reconcile_unknown(&intent_with_cloid(Some("0xdead")), "dropped", 1)
-            .await;
     }
 
     fn row(seq: u64, ts_ms: u64, kind: &str, event: &Event) -> EventRow {
@@ -1447,12 +588,12 @@ mod tests {
             coin: "BTC".into(),
             time: ts_ms,
             levels: [
-                vec![Level {
+                vec![WireLevel {
                     px: ds(bid),
                     sz: ds("10"),
                     n: 1,
                 }],
-                vec![Level {
+                vec![WireLevel {
                     px: ds(ask),
                     sz: ds("10"),
                     n: 1,
@@ -1490,92 +631,6 @@ mod tests {
         }))]
     }
 
-    fn btc_market(sz_decimals: u32) -> Market {
-        use mev_hl_client::AssetMap;
-        use mev_hl_client::types::{AssetMeta, Meta};
-        let mut map = AssetMap::new();
-        map.insert_perp_dex(
-            None,
-            None,
-            &Meta {
-                universe: vec![AssetMeta {
-                    name: "BTC".into(),
-                    sz_decimals,
-                    max_leverage: 40,
-                    is_delisted: false,
-                    only_isolated: false,
-                }],
-            },
-        );
-        map.get("BTC").unwrap().clone()
-    }
-
-    fn market_view() -> MarketView {
-        let mut view = MarketView::new();
-        view.insert_book(
-            "BTC",
-            BookView {
-                bids: vec![(ds("9990"), ds("1"))],
-                asks: vec![(ds("10010"), ds("1"))],
-                sz_decimals: 0,
-                time: 0,
-            },
-        );
-        view
-    }
-
-    #[test]
-    fn aggressive_buy_takes_ask_and_never_mid() {
-        let meta = btc_market(0);
-        let view = market_view();
-        // Ask 10010 + 10 bps = 10020.01 -> rounded toward buying up.
-        let px = aggressive_limit_px(&meta, &view, "BTC", true, ds("10")).unwrap();
-        assert!(px > ds("10010"), "must be above the touch, got {px}");
-        assert!(px >= ds("10020.01"), "rounded up, got {px}");
-        assert!(px > view.mid("BTC").unwrap(), "must not be the mid");
-    }
-
-    #[test]
-    fn aggressive_sell_takes_bid_and_never_mid() {
-        let meta = btc_market(0);
-        let view = market_view();
-        // Bid 9990 - 10 bps = 9980.01 -> rounded toward selling down.
-        let px = aggressive_limit_px(&meta, &view, "BTC", false, ds("10")).unwrap();
-        assert!(px < ds("9990"), "must be below the touch, got {px}");
-        assert!(px <= ds("9980.01"), "rounded down, got {px}");
-        assert!(px < view.mid("BTC").unwrap(), "must not be the mid");
-    }
-
-    #[test]
-    fn aggressive_price_without_book_uses_mid_fallback() {
-        let meta = btc_market(0);
-        let mut view = MarketView::new();
-        let mut mids = BTreeMap::new();
-        mids.insert("BTC".to_string(), ds("100"));
-        view.set_mids(mids);
-        assert_eq!(
-            aggressive_limit_px(&meta, &view, "BTC", true, ds("10")).unwrap(),
-            ds("100.1")
-        );
-    }
-
-    #[test]
-    fn status_mapping_distinguishes_rejects() {
-        use mev_hl_client::RejectReason;
-        assert_eq!(
-            order_status_fields(&OrderStatus::Resting),
-            ("resting", "resting".to_string())
-        );
-        assert_eq!(
-            order_status_fields(&OrderStatus::Filled),
-            ("filled", "filled".to_string())
-        );
-        assert_eq!(
-            order_status_fields(&OrderStatus::Rejected(RejectReason::TickRejected)),
-            ("reject", "rejected:tickRejected".to_string())
-        );
-    }
-
     #[tokio::test]
     async fn replay_is_deterministic() {
         let rows = vec![
@@ -1602,5 +657,112 @@ mod tests {
         assert_eq!(a, b, "same log must replay identically");
         assert!(a.intents > 0, "the ladder should place quotes");
         assert_ne!(a.fingerprint, 0);
+    }
+
+    struct CapturingExec {
+        posts: Arc<Mutex<Vec<UnsignedPost>>>,
+    }
+
+    impl ExecBackend for CapturingExec {
+        fn try_send(&mut self, post: UnsignedPost) -> bool {
+            self.posts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(post);
+            true
+        }
+    }
+
+    fn btc_asset_map() -> AssetMap {
+        let mut map = AssetMap::new();
+        map.insert_perp_dex(
+            None,
+            None,
+            &Meta {
+                universe: vec![AssetMeta {
+                    name: "BTC".into(),
+                    sz_decimals: 3,
+                    max_leverage: 40,
+                    is_delisted: false,
+                    only_isolated: false,
+                }],
+            },
+        );
+        map
+    }
+
+    fn book_snapshot(px: &str) -> BookSnapshot {
+        let mut book = BookSnapshot {
+            bids: [Level::default(); BOOK_DEPTH],
+            asks: [Level::default(); BOOK_DEPTH],
+            n_bids: 1,
+            n_asks: 1,
+            time_ms: 0,
+        };
+        let level = Level {
+            px: ds(px),
+            sz: ds("1"),
+            n: 1,
+        };
+        book.bids[0] = level;
+        book.asks[0] = level;
+        book
+    }
+
+    /// The v2 `EngineLoop` + `StrategyDispatcher` is what runs: a market event
+    /// dispatched through the loop yields a built order post.
+    #[test]
+    fn v2_loop_turns_a_market_event_into_a_post() {
+        let registry = CoinRegistry::from_coins(&["BTC".into()]);
+        let table = AssetTable::from_markets(&registry, &btc_asset_map());
+        let exec = CapturingExec {
+            posts: Arc::new(Mutex::new(Vec::new())),
+        };
+        let posts = exec.posts.clone();
+        let mm = MarketMaker::new(MmConfig {
+            coin: CoinId(0),
+            sz_decimals: 3,
+            levels: 2,
+            half_spread_bps: ds("5"),
+            level_step_bps: ds("5"),
+            size_per_level: ds("1"),
+            max_inventory: ds("10"),
+            max_skew_bps: ds("5"),
+            vol_pull_bps: ds("50"),
+            refresh_bps: ds("2"),
+        });
+        let dispatcher = StrategyDispatcher::new(
+            vec![Box::new(mm)],
+            registry,
+            table,
+            RiskGate::default(),
+            Some(Box::new(exec)),
+            DispatcherConfig::default(),
+        );
+
+        let (handles, inputs) = inputs(16, 16);
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let mut engine = EngineLoop::with_dispatcher(
+            inputs,
+            dispatcher,
+            LoopConfig {
+                spin_us: 0,
+                coin_count: 1,
+            },
+            stop_rx,
+        );
+
+        handles.send_market(MarketUpdate::Book {
+            coin: CoinId(0),
+            stamp: Stamp {
+                mono_ns: 1_000,
+                ..Default::default()
+            },
+            book: book_snapshot("100"),
+        });
+        assert_eq!(engine.iterate(1_000), 1);
+
+        let posts = posts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(posts.len(), 1, "one bulk order post from the loop");
     }
 }

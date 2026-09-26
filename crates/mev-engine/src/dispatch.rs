@@ -48,7 +48,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use mev_core::clock::{Clock, SystemClock};
 use mev_hl_client::RejectReason;
@@ -61,6 +61,7 @@ use crate::builder::{AssetTable, plan_iteration};
 use crate::exec::{ExecBackend, ReqIds, UnsignedPost, apply_post_ack, dispatch};
 use crate::instrument::{LatencyRecorder, Metric, Stamps};
 use crate::orders::{CloidAssigner, LiveOrder, OrderManager, OrderState};
+use crate::paper_exec::{PaperExec, paper_cancels_from_post, paper_orders_from_post};
 use crate::risk::{RiskCtx, RiskGate, cancel_all_cloids};
 use crate::routes::{Interests as RouteInterests, Routes, Stream as RouteStream};
 use crate::run::Dispatcher;
@@ -119,6 +120,10 @@ pub struct StrategyDispatcher {
     assigner: CloidAssigner,
     req_ids: ReqIds,
     exec: Option<Box<dyn ExecBackend + Send>>,
+    /// Paper backend for `simulate`: fills on the engine thread, no I/O.
+    paper: Option<PaperExec>,
+    /// Account updates emitted by the paper backend, applied on the next tick.
+    paper_updates: Vec<AccountUpdate>,
     recorder: LatencyRecorder,
     /// Reusable action buffer; strategies push into it and the pipeline drains it.
     actions: Actions,
@@ -139,6 +144,9 @@ pub struct StrategyDispatcher {
     market_drops: Arc<AtomicU64>,
     /// Drops already folded into the recorder.
     drops_seen: u64,
+    /// Shared resting-order count, refreshed once per iteration for the
+    /// dead-man switch (read without touching the order path).
+    resting_orders: Arc<AtomicUsize>,
     config: DispatcherConfig,
 }
 
@@ -186,6 +194,8 @@ impl StrategyDispatcher {
             assigner: CloidAssigner::new(),
             req_ids: ReqIds::new(),
             exec,
+            paper: None,
+            paper_updates: Vec::new(),
             recorder: LatencyRecorder::new(),
             actions: Actions::new(),
             owners: BTreeMap::new(),
@@ -196,6 +206,7 @@ impl StrategyDispatcher {
             req_cloids: BTreeMap::new(),
             market_drops: Arc::new(AtomicU64::new(0)),
             drops_seen: 0,
+            resting_orders: Arc::new(AtomicUsize::new(0)),
             config,
         }
     }
@@ -218,6 +229,25 @@ impl StrategyDispatcher {
     /// Replace the exec backend (`None` for `observe`).
     pub fn set_exec(&mut self, exec: Option<Box<dyn ExecBackend + Send>>) {
         self.exec = exec;
+    }
+
+    /// Attach the paper backend used by `simulate`.
+    ///
+    /// The paper backend fills synchronously on the engine thread against the
+    /// same market state, emitting account updates that are folded back into the
+    /// order manager; it is mutually exclusive with `exec` (an iteration that
+    /// has paper never touches the live exec channel).
+    pub fn with_paper(mut self, paper: PaperExec) -> Self {
+        self.paper = Some(paper);
+        self
+    }
+
+    /// A shared resting-order count refreshed once per loop iteration.
+    ///
+    /// The dead-man switch reads it off the order path; the engine stores it
+    /// (relaxed) in [`Self::record_iteration`], so reading never blocks an order.
+    pub fn resting_order_counter(&self) -> Arc<AtomicUsize> {
+        self.resting_orders.clone()
     }
 
     /// Set or clear the kill switch and the dispatch halt.
@@ -322,6 +352,7 @@ impl StrategyDispatcher {
         }
         let t_decided = now_ns();
         self.run_actions(stamp, state, t_recv, t_decided);
+        self.tick_paper(state);
     }
 
     fn dispatch_timer(&mut self, id: HeapTimerId, stamp: Stamp, state: &EngineState) {
@@ -343,6 +374,7 @@ impl StrategyDispatcher {
         self.strategies[index].on_timer(timer, &ctx, &mut self.actions);
         let t_decided = now_ns();
         self.run_actions(stamp, state, 0, t_decided);
+        self.tick_paper(state);
     }
 
     fn apply_account(&mut self, update: &AccountUpdate, state: &EngineState) {
@@ -716,28 +748,33 @@ impl StrategyDispatcher {
         }
 
         let batch_reqs: SmallVec<[u64; 2]> = batch.posts.iter().map(|post| post.req_id).collect();
-        for post in &batch.posts {
-            self.req_cloids.insert(post.req_id, post.cloids.clone());
+        let paper_mode = self.exec.is_none() && self.paper.is_some();
+        if !paper_mode {
+            for post in &batch.posts {
+                self.req_cloids.insert(post.req_id, post.cloids.clone());
+            }
         }
 
         let t_signed = now_ns();
-        match self.exec.as_mut() {
-            Some(exec) => {
-                if dispatch(batch, exec, &mut self.orders).is_err() {
-                    // Outbound channel full or exec down: fail closed. Rare, so
-                    // a WARN is allowed (never per-event at INFO; §4).
-                    let _ = self.risk.breakers_mut().trip("exec_backpressure");
-                    tracing::warn!(
-                        drop = batch_reqs.len(),
-                        "exec backpressure: batch rejected, breaker tripped"
-                    );
-                    self.reject_requests(&batch_reqs);
-                }
-            }
-            None => {
-                // No backend (`observe`): never leave orders pending. Fail closed.
+        if let Some(exec) = self.exec.as_mut() {
+            if dispatch(batch, exec, &mut self.orders).is_err() {
+                // Outbound channel full or exec down: fail closed. Rare, so
+                // a WARN is allowed (never per-event at INFO; §4).
+                let _ = self.risk.breakers_mut().trip("exec_backpressure");
+                tracing::warn!(
+                    drop = batch_reqs.len(),
+                    "exec backpressure: batch rejected, breaker tripped"
+                );
                 self.reject_requests(&batch_reqs);
             }
+        } else if paper_mode {
+            // `simulate`: the paper backend fills synchronously; its account
+            // updates are applied on this iteration's paper tick.
+            let updates = self.feed_paper(&batch, now_ms());
+            self.paper_updates.extend(updates);
+        } else {
+            // No backend (`observe`): never leave orders pending. Fail closed.
+            self.reject_requests(&batch_reqs);
         }
         let t_handoff = now_ns();
 
@@ -755,6 +792,49 @@ impl StrategyDispatcher {
             t_written: 0,
             t_ack: 0,
         });
+    }
+
+    /// Feed one built batch to the paper backend, returning its immediate
+    /// account updates (cancel acknowledgements; places are queued for latency).
+    fn feed_paper(
+        &mut self,
+        batch: &crate::builder::BuiltBatch,
+        now_ms: u64,
+    ) -> Vec<AccountUpdate> {
+        let Some(paper) = self.paper.as_mut() else {
+            return Vec::new();
+        };
+        let mut updates = Vec::new();
+        for post in &batch.posts {
+            match &post.action {
+                mev_hl_client::Action::Order { .. } => {
+                    let orders = paper_orders_from_post(post, &self.registry, &self.table);
+                    updates.extend(paper.submit(&orders, &self.registry, &[], now_ms));
+                }
+                mev_hl_client::Action::CancelByCloid { .. } => {
+                    let cancels = paper_cancels_from_post(post);
+                    updates.extend(paper.cancel(&cancels, now_ms));
+                }
+                _ => {}
+            }
+        }
+        updates
+    }
+
+    /// Advance the paper backend against the current books and fold its account
+    /// updates (fills, status changes) back through [`Self::apply_account`].
+    fn tick_paper(&mut self, state: &EngineState) {
+        if self.paper.is_none() {
+            return;
+        }
+        let now_ms = now_ms();
+        let mut updates = std::mem::take(&mut self.paper_updates);
+        if let Some(paper) = self.paper.as_mut() {
+            updates.extend(paper.on_market(&self.registry, state.slots(), now_ms));
+        }
+        for update in &updates {
+            self.apply_account(update, state);
+        }
     }
 
     /// Mark every `PendingNew` order from these requests rejected (fail closed).
@@ -797,6 +877,8 @@ impl Dispatcher for StrategyDispatcher {
     fn record_iteration(&mut self, iteration_ns: u64, events: usize) {
         self.recorder.record_iteration(iteration_ns, events);
         self.sync_market_drops();
+        self.resting_orders
+            .store(self.orders.resting_count(), Ordering::Relaxed);
     }
 }
 
@@ -1403,6 +1485,69 @@ mod tests {
         assert_eq!(h.dispatcher.account.account_value, ds("1000"));
         assert_eq!(h.dispatcher.account.margin_used, ds("250"));
         assert!(!h.dispatcher.stream.places_halted());
+    }
+
+    #[test]
+    fn paper_backend_fills_a_taker_and_updates_the_account() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        use mev_strategy::{AccountView, FeeRates, Instrument};
+
+        use crate::paper_exec::{PaperConfig, PaperExec};
+
+        // A Gtc buy above the ask takes liquidity once its latency elapses.
+        let mut buy = intent("BTC", Side::Buy);
+        buy.limit_px = Some(ds("101"));
+        buy.tif = TimeInForce::Gtc;
+        let strategy = Recording::new("test", CoinId(0)).with_script(vec![Action::Place(buy)]);
+        let events = strategy.events();
+
+        let mut instruments = BTreeMap::new();
+        instruments.insert("BTC".to_string(), Instrument::perp());
+        let paper = PaperExec::new(
+            PaperConfig {
+                latency_ms: 20,
+                maker_fills: true,
+            },
+            AccountView {
+                account_value: ds("1000"),
+                ..Default::default()
+            },
+            instruments,
+            FeeRates::PERP,
+            FeeRates::SPOT,
+        );
+        let mut dispatcher = StrategyDispatcher::new(
+            vec![Box::new(strategy)],
+            registry(),
+            table(),
+            RiskGate::default(),
+            None,
+            DispatcherConfig::default(),
+        )
+        .with_paper(paper);
+
+        let state = state_with("100", "100");
+        dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+        // The order is queued but not yet eligible.
+        assert_eq!(dispatcher.account().position_szi(CoinId(0)), Decimal::ZERO);
+
+        sleep(Duration::from_millis(25));
+        dispatcher.on_coin_state(CoinId(0), stamp(30), &state);
+        assert_eq!(
+            dispatcher.account().position_szi(CoinId(0)),
+            Decimal::ONE,
+            "paper taker should fill and move the position"
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == OrderEventKind::Fill),
+            "the owning strategy should receive the fill"
+        );
     }
 
     #[test]

@@ -210,19 +210,26 @@ impl<D: Dispatcher> EngineLoop<D> {
                 if let Some(slot) = self.state.slot_mut(*coin) {
                     slot.bbo = Some((*bid, *ask, stamp));
                 }
+                // Fresh data proves the feed for this coin is live again.
+                self.state.mark_fresh(*coin);
             }
             MarketUpdate::Book { coin, book, .. } => {
                 if let Some(slot) = self.state.slot_mut(*coin) {
                     slot.book = Some((*book, stamp));
                 }
+                self.state.mark_fresh(*coin);
             }
-            MarketUpdate::Trades { .. } => {}
+            MarketUpdate::Trades { coin, .. } => self.state.mark_fresh(*coin),
             MarketUpdate::Ctx { coin, ctx, .. } => {
                 if let Some(slot) = self.state.slot_mut(*coin) {
                     slot.ctx = Some((*ctx, stamp));
                 }
+                self.state.mark_fresh(*coin);
             }
-            MarketUpdate::Gap { .. } => {}
+            // A gap on a shared connection cannot be attributed to one coin, so
+            // mark every coin stale until fresh data arrives (SPEC-0010 §16).
+            MarketUpdate::Gap { open: true, .. } => self.state.mark_all_stale(),
+            MarketUpdate::Gap { open: false, .. } => {}
         }
         self.dispatcher.on_market(update);
         if let Some(coin) = update_coin(update) {
@@ -440,6 +447,27 @@ mod tests {
         // Account first (counted), then each coin dispatched once, in id order.
         assert_eq!(record.accounts, 1);
         assert_eq!(record.coins, vec![CoinId(0), CoinId(1)]);
+    }
+
+    #[test]
+    fn gap_marks_coins_stale_until_fresh_data_arrives() {
+        let record = Arc::new(Mutex::new(Record::default()));
+        let (mut engine, handles, _stop) = loop_with(record, 2, 0);
+
+        handles.send_market(MarketUpdate::Gap {
+            conn: ConnId(0),
+            stamp: Stamp::default(),
+            open: true,
+        });
+        engine.iterate(1_000);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+        assert!(engine.state().slot(CoinId(1)).unwrap().stale);
+
+        // Fresh data for coin 1 clears only coin 1.
+        handles.send_market(bbo(1, 1));
+        engine.iterate(2_000);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+        assert!(!engine.state().slot(CoinId(1)).unwrap().stale);
     }
 
     #[test]

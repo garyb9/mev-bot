@@ -4,16 +4,19 @@
 //! M1.1:  REST `/info` client and the `markets`/`book` commands.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 mod engine;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
 use mev_core::{
@@ -21,14 +24,31 @@ use mev_core::{
     config::{Config, ConfigOverrides, Mode, Network},
     db::{Db, writer::DbWriter},
 };
+use mev_engine::{
+    AccountUpdate, CoinRegistry, Control, MarketUpdate, PostResult, Stamp, StrategyDispatcher,
+    VenueOrderStatus,
+    builder::AssetTable,
+    channels::{
+        ACCOUNT_CHANNEL_CAP, InputHandles, MARKET_CHANNEL_CAP, MarketSend, inputs, outbound,
+    },
+    dispatch::DispatcherConfig,
+    exec::UnsignedPost,
+    ingest::Ingest,
+    paper_exec::{PaperConfig, PaperExec},
+    risk::RiskGate,
+    run::{EngineLoop, LoopConfig},
+    types::ConnId,
+};
 use mev_hl_client::{
-    Action, AgentSigner, AssetMap, DeadMansSwitch, ExchangeApi, HttpInfo, InfoApi, Market,
-    MarketKind, MarketSelector, MarketState, MarketStream, OrderParams, StreamEvent, Subscription,
-    Tif, Tolerance, WsExchange, WsMarketStream, build_order_wire, build_request, now_ms,
+    Action, AgentSigner, AssetMap, DeadMansSwitch, ExchangeApi, HlProtocol, HttpInfo, InfoApi,
+    Market, MarketKind, MarketSelector, MarketState, MarketStream, OrderParams, OrderStatus,
+    RawEvent, RawWsConn, StreamEvent, Subscription, Tif, Tolerance, WsExchange, WsMarketStream,
+    build_order_wire, build_request, now_ms,
 };
 use mev_metrics::{health::Health, prometheus::PrometheusHandle};
-use mev_risk::TradingHalt;
-use mev_strategy::AccountView;
+use mev_strategy::{AccountView, FeeRates, Instrument};
+use rust_decimal::Decimal;
+use smallvec::SmallVec;
 use tokio::signal;
 use tracing::{error, info};
 
@@ -299,10 +319,11 @@ async fn run(
     };
 
     let (subscriptions, book_coins, ctx_coins) = build_subscriptions(&watchlist, plan.as_ref());
-    let health = Health::new();
-    let state = Arc::new(RwLock::new(MarketState::new(Tolerance::default())));
-    {
-        let mut guard = state.write().expect("market state lock poisoned");
+
+    // Health-only market snapshot: it drives `/readyz` and feed staleness
+    // metrics and never gates a decision (the engine owns trading state).
+    let health_state = Arc::new(RwLock::new(MarketState::new(Tolerance::default())));
+    if let Ok(mut guard) = health_state.write() {
         for coin in &book_coins {
             guard.expect_book(coin);
         }
@@ -310,8 +331,7 @@ async fn run(
             guard.expect_ctx(coin);
         }
     }
-
-    let exchange = live_exchange(&config)?;
+    let health = Health::new();
 
     // Simulate/live record their inputs to SQLite for deterministic replay.
     let session = if config.mode == Mode::Observe {
@@ -332,59 +352,118 @@ async fn run(
         .map(|(writer, session_id)| engine::Recorder::new(writer.clone(), *session_id));
 
     let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::new(config.network));
-    let engine_task = plan.map(|plan| {
-        let (writer, session_id) = session
-            .clone()
-            .expect("engine requires a recording session");
-        let mut engine = engine::Engine::new(plan, &config, exchange.clone(), writer, session_id);
-        // Live runs reconcile unknown order outcomes by cloid (SPEC-0002 H-2).
-        if let Some(address) = config.account_address.clone() {
-            engine = engine.with_info(info.clone(), address);
+    let exchange = live_exchange(&config)?;
+
+    // Interned coins: the strategy universe when strategies run, else the
+    // watchlist. The market decoder resolves names through this registry.
+    let registry = plan.as_ref().map_or_else(
+        || CoinRegistry::from_coins(&watchlist),
+        |build| build.registry.clone(),
+    );
+    let coin_count = registry.len();
+
+    // Inbound channels (market lossy, account lossless) and the loop stop flag.
+    let (handles, inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+
+    // Exec backend: the paper backend fills in-process for `simulate`; `live`
+    // hands unsigned posts to a WS writer; `observe` has no backend.
+    let mut exec_writer = None;
+    let exec: Option<Box<dyn mev_engine::exec::ExecBackend + Send>> = match config.mode {
+        Mode::Live => {
+            let exchange = exchange
+                .clone()
+                .context("live mode requires a configured exchange")?;
+            let (out, posts) = outbound::<UnsignedPost>(ACCOUNT_CHANNEL_CAP);
+            exec_writer = Some(spawn_exec_writer(posts, exchange, handles.clone()));
+            Some(Box::new(out))
         }
-        let account = engine.account();
-        let halt = engine.halt();
-        // SPEC-0010 §15: the H-3 stream is the source of truth; this is the
-        // REST reconciler backstop, not the order path.
-        let reconciler = config.account_address.clone().map(|address| {
-            tokio::spawn(engine::account_reconciler(
-                info.clone(),
-                address,
-                account.clone(),
-                config.network,
-            ))
-        });
-        (
-            tokio::spawn(engine.run(state.clone())),
-            reconciler,
-            account,
-            halt,
-        )
-    });
+        _ => None,
+    };
+
+    let paper = if config.mode == Mode::Simulate {
+        let instruments: BTreeMap<String, Instrument> = plan
+            .as_ref()
+            .map(|build| build.instruments.clone())
+            .unwrap_or_default();
+        let seeded = AccountView {
+            account_value: Decimal::from(100_000),
+            fees: FeeRates::PERP,
+            ..Default::default()
+        };
+        Some(PaperExec::new(
+            PaperConfig::default(),
+            seeded,
+            instruments,
+            FeeRates::PERP,
+            FeeRates::SPOT,
+        ))
+    } else {
+        None
+    };
+
+    let strategies = plan.map(|build| build.strategies).unwrap_or_default();
+    let table = AssetTable::from_selector(&registry, &selector);
+    let risk = RiskGate::from_settings(&config.risk);
+    let dispatcher_config = DispatcherConfig {
+        max_slippage_bps: Decimal::from(config.strategy.max_slippage_bps),
+    };
+    let mut dispatcher = StrategyDispatcher::new(
+        strategies,
+        registry.clone(),
+        table,
+        risk,
+        exec,
+        dispatcher_config,
+    );
+    if let Some(paper) = paper {
+        dispatcher = dispatcher.with_paper(paper);
+    }
+    let resting = dispatcher.resting_order_counter();
+    let market_drops = dispatcher.market_drop_counter();
+
+    // The loop is synchronous and owns all trading state: run it on its own
+    // thread, stopped through the crossbeam channel on shutdown.
+    let engine_handle = std::thread::Builder::new()
+        .name("mev-engine".to_string())
+        .spawn(move || {
+            let loop_config = LoopConfig {
+                spin_us: 50,
+                coin_count,
+            };
+            let engine = EngineLoop::with_dispatcher(inputs, dispatcher, loop_config, stop_rx);
+            let _ = engine.run();
+        })
+        .context("spawning the engine thread")?;
 
     let heartbeat = tokio::spawn(heartbeat());
-    let ingest = tokio::spawn(ingest(
-        state.clone(),
+    let ingest_task = tokio::spawn(ingest(
+        handles.clone(),
         subscriptions,
+        registry.clone(),
         config.network,
+        health_state.clone(),
         recorder,
+        market_drops,
     ));
-    let monitor = tokio::spawn(monitor(state, health.clone()));
-    let deadman = exchange.clone().map(|exchange| {
-        let (account, halt) = engine_task.as_ref().map_or_else(
-            || {
-                (
-                    Arc::new(RwLock::new(AccountView::default())),
-                    mev_risk::TradingHalt::new(),
-                )
-            },
-            |(_, _, account, halt)| (account.clone(), halt.clone()),
-        );
+    let monitor_task = tokio::spawn(monitor(health_state, health.clone()));
+    // SPEC-0010 §15: the H-3 stream is not wired into `hl` yet; the REST
+    // reconciler is the wired backstop and feeds the account channel.
+    let reconciler = config.account_address.clone().map(|address| {
+        tokio::spawn(engine::account_reconciler(
+            info.clone(),
+            address,
+            registry.clone(),
+            handles.clone(),
+        ))
+    });
+    let deadman_task = exchange.clone().map(|exchange| {
         tokio::spawn(deadman(
             exchange,
             info.clone(),
             config.account_address.clone(),
-            account,
-            halt,
+            resting.clone(),
+            handles.clone(),
             config.schedule_cancel_ttl_ms,
         ))
     });
@@ -392,22 +471,82 @@ async fn run(
     info!("waiting for feeds to become ready");
     serve(health, metrics, config.http_port).await?;
 
-    ingest.abort();
-    monitor.abort();
+    // Stop the engine first, then tear the I/O tasks down.
+    let _ = stop_tx.send(());
+    let _ = engine_handle.join();
+    ingest_task.abort();
+    monitor_task.abort();
     heartbeat.abort();
-    if let Some((engine, reconciler, _, _)) = engine_task {
-        engine.abort();
-        if let Some(reconciler) = reconciler {
-            reconciler.abort();
-        }
+    if let Some(reconciler) = reconciler {
+        reconciler.abort();
+    }
+    if let Some(writer) = exec_writer {
+        writer.abort();
     }
     // The dead-man task disarms `scheduleCancel` on the same shutdown signal;
     // give it a moment to submit before the process exits.
-    if let Some(deadman) = deadman {
+    if let Some(deadman) = deadman_task {
         let _ = tokio::time::timeout(Duration::from_secs(5), deadman).await;
     }
     info!("shutdown complete");
     Ok(())
+}
+
+/// Bridge the engine's synchronous exec channel to the async WS writer.
+///
+/// The engine hands [`UnsignedPost`]s to the crossbeam `Receiver` off the
+/// engine thread; a small std thread moves them onto a tokio channel, and the
+/// async task signs/sends them and pushes a [`PostResult`] back as a lossless
+/// account update (SPEC-0010 §12).
+fn spawn_exec_writer(
+    posts: crossbeam_channel::Receiver<UnsignedPost>,
+    exchange: Arc<dyn ExchangeApi>,
+    handles: InputHandles,
+) -> tokio::task::JoinHandle<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UnsignedPost>();
+    let _ = std::thread::Builder::new()
+        .name("mev-exec-bridge".to_string())
+        .spawn(move || {
+            while let Ok(post) = posts.recv() {
+                if tx.send(post).is_err() {
+                    break;
+                }
+            }
+        });
+
+    tokio::spawn(async move {
+        while let Some(post) = rx.recv().await {
+            let result = match exchange.submit(&post.action).await {
+                Ok(response) => match response.order_response() {
+                    Ok(orders) => {
+                        PostResult::Statuses(orders.statuses.iter().map(map_venue_status).collect())
+                    }
+                    // Non-order actions (cancels) carry no per-order statuses;
+                    // their outcome arrives on the account stream.
+                    Err(_) => PostResult::Statuses(SmallVec::new()),
+                },
+                Err(err) => PostResult::Error(err.to_string()),
+            };
+            let update = AccountUpdate::PostAck {
+                stamp: engine::now_stamp(),
+                req_id: post.req_id,
+                result,
+            };
+            if !handles.send_account(update) {
+                break;
+            }
+        }
+    })
+}
+
+/// Map a wire per-order status to the engine's typed status.
+fn map_venue_status(status: &OrderStatus) -> VenueOrderStatus {
+    match status {
+        OrderStatus::Resting => VenueOrderStatus::Resting,
+        OrderStatus::Filled => VenueOrderStatus::Filled,
+        OrderStatus::Rejected(_) => VenueOrderStatus::Rejected,
+        OrderStatus::Other(_) => VenueOrderStatus::Other,
+    }
 }
 
 /// Merge the watchlist feeds with any strategy-required feeds, de-duplicated.
@@ -469,19 +608,21 @@ fn live_exchange(config: &Config) -> Result<Option<Arc<dyn ExchangeApi>>> {
 /// Keep `scheduleCancel` armed while (and only while) orders rest, and fail
 /// closed on any arm/refresh error (SPEC-0002 H-4).
 ///
-/// Each cycle the task reads the live account's open-order count. The switch
-/// (a) arms when the first order rests, (b) refreshes at half the TTL, and
-/// (c) disarms when the last order leaves — so an idle bot does not spend
-/// address rate-limit budget. If arming/refreshing fails while orders rest, a
-/// sticky [`TradingHalt`] is set so the risk gate refuses new orders. The task
+/// Each cycle the task reads the engine's resting-order count (an atomic the
+/// dispatcher refreshes per iteration; reading it never blocks the order path).
+/// The switch (a) arms when the first order rests, (b) refreshes at half the
+/// TTL, and (c) disarms when the last order leaves — so an idle bot does not
+/// spend address rate-limit budget. If arming/refreshing fails while orders
+/// rest, a fail-closed `Control::KillSwitch` is sent through the engine's
+/// account channel (halting dispatch and cancelling working orders). The task
 /// also polls `userRateLimit` every 60 s and exposes the remaining address
 /// budget as a metric.
 async fn deadman(
     exchange: Arc<dyn ExchangeApi>,
     info: Arc<dyn InfoApi>,
     address: Option<String>,
-    account: Arc<RwLock<AccountView>>,
-    halt: TradingHalt,
+    resting: Arc<AtomicUsize>,
+    handles: InputHandles,
     ttl_ms: u64,
 ) {
     let mut switch = DeadMansSwitch::new(ttl_ms);
@@ -509,12 +650,11 @@ async fn deadman(
                 }
             }
             _ = tick.tick() => {
-                let resting = account
-                    .read()
-                    .map(|guard| guard.open_orders.len())
-                    .unwrap_or(0);
-                if let Some(action) = switch.update(now_ms(), resting) {
-                    let arming = resting > 0;
+                // The engine refreshes this count once per iteration; reading
+                // it never blocks the order path.
+                let resting_orders = resting.load(Ordering::Relaxed);
+                if let Some(action) = switch.update(now_ms(), resting_orders) {
+                    let arming = resting_orders > 0;
                     match exchange.submit(&action).await {
                         Ok(_) => {
                             if arming {
@@ -526,7 +666,12 @@ async fn deadman(
                         Err(err) if arming => {
                             error!(error = %err, "dead-man arm/refresh failed; halting trading");
                             metrics::counter!(mev_metrics::names::DEADMAN_FAILURES).increment(1);
-                            halt.set();
+                            // Fail closed: halt the v2 dispatcher through the
+                            // lossless account channel (it also cancels working
+                            // orders via Control::KillSwitch).
+                            if !handles.send_account(AccountUpdate::Control(Control::KillSwitch)) {
+                                break;
+                            }
                         }
                         Err(err) => {
                             // Disarm failed; the venue expires the schedule anyway.
@@ -549,44 +694,108 @@ async fn deadman(
     metrics::gauge!(mev_metrics::names::DEADMAN_ARMED).set(0.0);
 }
 
-/// Ingest market data into the shared state until the process stops.
+/// Ingest market data into the v2 engine (and a health-only snapshot).
+///
+/// Frames are decoded with the `mev-engine` typed decoders straight into
+/// `MarketUpdate`s; the same text is decoded again by `mev-hl-client` for the
+/// health snapshot and SQLite recording (off the engine thread).
 async fn ingest(
-    state: Arc<RwLock<MarketState>>,
+    handles: InputHandles,
     subscriptions: Vec<Subscription>,
+    registry: CoinRegistry,
     network: Network,
+    health_state: Arc<RwLock<MarketState>>,
     recorder: Option<engine::Recorder>,
+    market_drops: Arc<AtomicU64>,
 ) {
+    let ingester = Ingest::new(ConnId(0), registry);
+    let planned: Vec<String> = subscriptions
+        .iter()
+        .map(|sub| serde_json::to_string(sub).unwrap_or_default())
+        .collect();
+    let mut backoff = Duration::from_secs(1);
+
     loop {
-        match WsMarketStream::connect(network, &subscriptions).await {
-            Ok(mut stream) => {
-                info!(
-                    subscriptions = subscriptions.len(),
-                    "market stream connected"
-                );
+        match RawWsConn::connect(Box::new(HlProtocol::new(network)), planned.clone()).await {
+            Ok(mut conn) => {
+                info!(subscriptions = planned.len(), "market stream connected");
+                // A fresh connection closes any prior feed gap so the engine can
+                // clear stale coins once data flows again (SPEC-0010 §16).
+                let _ = handles.send_market(MarketUpdate::Gap {
+                    conn: ConnId(0),
+                    stamp: Stamp::default(),
+                    open: false,
+                });
                 loop {
-                    match stream.next().await {
-                        Ok(event) => {
-                            if let Some(recorder) = &recorder {
-                                recorder.record(
-                                    &mev_strategy::Event::Market(event.clone()),
-                                    SystemClock.now_ms(),
-                                );
+                    match conn.next().await {
+                        Ok(RawEvent::Text {
+                            t_ns,
+                            mono_ns,
+                            text,
+                        }) => {
+                            // Health + recording decode (never gates decisions).
+                            if let Ok(Some(event)) = mev_hl_client::ws::decode(&text) {
+                                if let Some(recorder) = &recorder {
+                                    recorder.record(
+                                        &mev_strategy::Event::Market(event.clone()),
+                                        SystemClock.now_ms(),
+                                    );
+                                }
+                                if let Ok(mut guard) = health_state.write() {
+                                    guard.apply(&event);
+                                }
                             }
-                            if let Ok(mut guard) = state.write() {
-                                guard.apply(&event);
+                            let stamp = Stamp {
+                                // `RawEvent::Text::t_ns` is wall-clock ms.
+                                t_recv_ns: t_ns.saturating_mul(1_000_000),
+                                mono_ns,
+                                ts_exch_ms: 0,
+                            };
+                            match ingester.decode(&text, stamp) {
+                                Ok(Some(update)) => {
+                                    if handles.send_market(update) == MarketSend::Dropped {
+                                        // Folded into `hl_engine_market_drops_total`
+                                        // by the dispatcher's next flush.
+                                        market_drops.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    tracing::debug!(error = %err, "undecodable market frame");
+                                }
                             }
                         }
+                        Ok(RawEvent::Gap { reason, detail }) => {
+                            tracing::warn!(reason, detail, "market feed gap");
+                            if reason == "shutdown" {
+                                return;
+                            }
+                            // Mark coins stale until fresh data arrives.
+                            let _ = handles.send_market(MarketUpdate::Gap {
+                                conn: ConnId(0),
+                                stamp: Stamp::default(),
+                                open: true,
+                            });
+                        }
+                        Ok(_) => {}
                         Err(err) => {
                             tracing::warn!(error = %err, "market stream ended");
-                            break;
+                            let _ = handles.send_market(MarketUpdate::Gap {
+                                conn: ConnId(0),
+                                stamp: Stamp::default(),
+                                open: true,
+                            });
+                            return;
                         }
                     }
                 }
             }
-            Err(err) => tracing::warn!(error = %err, "market stream connect failed"),
+            Err(err) => {
+                tracing::warn!(error = %err, "market stream connect failed");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
         }
-
-        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 

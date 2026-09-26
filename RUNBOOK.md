@@ -3,8 +3,9 @@
 Operational procedures for the `hl` bot. See [SPEC-0006](specs/SPEC-0006-deployment-observability-runbooks.md)
 for the full design.
 
-> Current status: platform scaffold. Some procedures reference components that
-> arrive with SPEC-0001/0002; those are marked _(pending)_.
+> Current status: the v2 event-driven engine (`EngineLoop`) is wired into `hl`.
+> Some procedures reference SPEC-0004 components that are not wired yet; those
+> are marked _(pending)_.
 
 ## Start / stop / restart
 
@@ -77,9 +78,10 @@ reuse a nonce.
   `POST /exchange` (`HttpExchange`) is the fallback. Both share the same signed
   envelope, nonce state, and SQLite high-water mark.
 - In `live`, `scheduleCancel` is armed on start with TTL
-  `HL_SCHEDULE_CANCEL_TTL_MS` (default 30s) and refreshed on a 1s heartbeat. A
-  crash, stall, or loss of connectivity therefore cancels resting orders after
-  the TTL. Graceful shutdown disarms it explicitly.
+  `HL_SCHEDULE_CANCEL_TTL_MS` (default 30s). A 1 s task checks the engine's
+  resting-order count and refreshes the switch once less than half the TTL
+  remains. A crash, stall, or loss of connectivity therefore cancels resting
+  orders after the TTL. Graceful shutdown disarms it explicitly.
 - Watch `hl_deadman_armed` (1 while armed), `hl_deadman_refreshes_total`, and
   `hl_deadman_failures_total`. Failure to refresh within the window is an alert.
 
@@ -99,7 +101,10 @@ reuse a nonce.
 
 ## Kill switch
 
-- **Manual:** send `SIGUSR1`, drop the flag file, or run `hl panic` _(pending)_.
+- **Manual _(pending)_:** the design (SPEC-0004 K-3) is `SIGUSR1`, the
+  configured flag file, or `hl panic` (which writes the file). None of these
+  are wired into `hl` yet; the `Control::KillSwitch` path the dead-man task uses
+  is the only kill trigger today.
 - **Expected action:** cancel all resting orders + halt new risk. Flattening is
   opt-in.
 - **Verify:** open orders go to zero; `/healthz` reflects halt; logs record the
@@ -124,10 +129,11 @@ The master key is never placed on the host.
 
 ## Replay a recorded session
 
-`simulate` and `live` record their inputs (market feed, account snapshots, and
-the 1 s decision tick) to the `events` table. Replay re-drives the configured
-strategies from that log with no network or clock, and prints an FNV-1a-64
-fingerprint over the emitted placements:
+`simulate` and `live` record their inputs to the `events` table. Today `hl run`
+records only market-feed frames (no `Timer`/`Account`/`Fill` rows), so a freshly
+recorded session has no decision cycles and `hl replay` yields zero intents.
+Replay re-drives the configured strategies from the recorded log with no network
+or clock, and prints an FNV-1a-64 fingerprint over the emitted placements:
 
 ```sh
 # Replay the most recent session (prints events=, intents=, fingerprint=)
@@ -139,6 +145,8 @@ cargo run -p mev-bot -- replay --session 12 --db data/hlbot.db
 
 Identical logs must yield an identical fingerprint; a change means the strategy
 is non-deterministic (a bug — see SPEC-0003 §10). Replay never dials the network.
+The v2 replay driver that records `Timer`/`Fill` so new sessions replay is
+SPEC-0010 E-7 part 2 (blocked on SPEC-0008 R-7).
 
 ## Database (SQLite)
 
@@ -151,9 +159,13 @@ is non-deterministic (a bug — see SPEC-0003 §10). Replay never dials the netw
 
 Symptom: local positions/orders differ from the exchange. Action:
 
-1. The bot resyncs automatically on reconnect/periodically.
-2. If drift persists, it halts new risk and alerts.
-3. Diagnose with the reconciliation metrics; resolve before resuming.
+1. A background REST task refreshes the account snapshot every 30 s and feeds it
+   to the engine through the account channel (SPEC-0010 §15).
+2. In `hl` today that `AccountUpdate::Reconcile` carries only
+   `account_value`/`margin_used`; position and order-state drift is not yet
+   applied until the H-3 account stream is wired (SPEC-0010 E-13 remaining).
+   Treat position/order drift as a manual intervention until it lands.
+3. Resolve drift before resuming.
 
 ## Failed deploy / rollback
 

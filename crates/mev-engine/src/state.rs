@@ -107,6 +107,21 @@ impl EngineState {
         self.dirty_any
     }
 
+    /// Mark every coin stale (a market-feed gap opened on a shared connection,
+    /// so we cannot attribute the gap to a single coin — SPEC-0010 §16).
+    pub fn mark_all_stale(&mut self) {
+        for slot in &mut self.slots {
+            slot.stale = true;
+        }
+    }
+
+    /// Clear the stale flag for a coin once fresh data arrives.
+    pub fn mark_fresh(&mut self, coin: CoinId) {
+        if let Some(slot) = self.slots.get_mut(coin.index()) {
+            slot.stale = false;
+        }
+    }
+
     /// Drain dirty coins in `CoinId` order (deterministic dispatch order).
     pub fn drain_dirty(&mut self) -> Vec<CoinId> {
         let mut out = Vec::new();

@@ -31,13 +31,13 @@ Don't pick one silently.
 | `specs/SPEC-0000…` | Platform: config, modes, observability, CI | SPEC-0000 |
 | `crates/mev-core` | Config, clock, errors, SQLite (`db.rs`, `db/writer.rs`), watchlist | 0000, 0004 |
 | `crates/mev-hl-client` | Hyperliquid REST/WS client, market state, signing, nonce, orders, transports | 0001, 0002 |
-| `crates/mev-engine` | Event-driven engine core: interned types, typed ingest, v2 sync `Strategy` trait + `FundingBasis`/`MarketMaker` (**new, M4**) | 0010 |
+| `crates/mev-engine` | Event-driven engine core: interned types, typed ingest, v2 sync `Strategy` trait + `FundingBasis`/`MarketMaker` (the `hl` run path) | 0010 |
 | `crates/mev-recorder` | Market-data recorder (**new, M3**) | 0008 |
 | `crates/mev-strategy` | Strategy building blocks: cost model, views, intents, sizing, paper executor; the v2 `Strategy` trait + implementations live in `mev-engine` | 0003, 0010, 0011 |
 | `crates/mev-risk` | Risk limit gate (kill switch and breakers pending: SPEC-0004 §16) | 0004 |
 | `crates/mev-hyperevm` | HyperEVM sources/executor (deferred) | 0005 |
 | `crates/mev-metrics` | Tracing, Prometheus metric names, health | 0000, 0006 |
-| `crates/mev-bot` | The `hl` binary (CLI + orchestration); `src/engine.rs` is the legacy tick engine (being replaced per SPEC-0010, whose core is `mev-engine`) | all, 0010 |
+| `crates/mev-bot` | The `hl` binary (CLI + orchestration); `src/engine.rs` holds config/strategy building, the SQLite `Recorder`, and replay helpers; the run loop is `mev-engine`'s `EngineLoop<StrategyDispatcher>` | all, 0010 |
 | `research/` | Python research toolkit + studies (**new, M3**) | 0008 |
 | `specs/decisions/` | ADRs (architecture/strategy decisions) | — |
 | `legacy/` | Retired Ethereum bot. Reference only; never build or import it. | — |

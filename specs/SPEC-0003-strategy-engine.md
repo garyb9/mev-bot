@@ -1,6 +1,6 @@
 # SPEC-0003 — Strategy Engine
 
-**Status:** Partially implemented. Strategies A (funding/basis) and B (market-making) exist on a v1 tick engine; the engine loop is superseded by [SPEC-0010](SPEC-0010-event-driven-engine.md) (see §16).
+**Status:** Partially implemented. Strategies A (funding/basis) and B (market-making) now run on [SPEC-0010](SPEC-0010-event-driven-engine.md)'s v2 `EngineLoop<StrategyDispatcher>`; the legacy 1 s tick engine was removed (E-13, see §16).
 **Depends on:** SPEC-0000, SPEC-0001, SPEC-0002
 **Blocks:** SPEC-0004 (risk consumes intents)
 
@@ -137,18 +137,20 @@ Per-strategy metrics: signals emitted, intents accepted/rejected (by reason), fi
 
 ## 16. Implementation status & deltas (2026-09-26)
 
-What exists in code, and where it departs from this spec. SPEC-0010 is the source of truth for the engine loop and the strategy API from here on.
+What exists in code, and where it departs from this spec. SPEC-0010 is the source of truth for the engine loop and the strategy API from here on. E-13 (2026-09-26) removed the legacy 1 s tick `Engine`; `hl` now runs `EngineLoop<StrategyDispatcher>` and `mev-bot/src/engine.rs` keeps only config/strategy building, the `Recorder`, the replay helpers, and the REST `account_reconciler`.
 
 | Area | Code | Delta vs this spec | Resolution |
 |---|---|---|---|
-| Strategy trait | `mev-strategy/src/strategy.rs` (`async_trait`, returns `Vec<Action>`) | Async; §8 said event-driven, but the engine calls it on a 1 s timer | Replaced by SPEC-0010 §8 sync API (task E-4) |
-| Actions | `mev-strategy/src/action.rs`: `Place`, `Cancel` | No `Modify`, no multi-leg group | SPEC-0010 §8 adds `Modify`; SPEC-0011 adds `PlaceGroup` |
+| Strategy trait | `mev-engine/src/strategy.rs`: sync `Strategy` returning `Vec<Action>` | §8's event-driven loop now runs in SPEC-0010's `EngineLoop` | The v1 async trait in `mev-strategy` is retired (SPEC-0010 E-4) |
+| Actions | `mev-engine/src/strategy.rs`: `Action::{Place, Cancel}` | No `Modify`, no multi-leg group | SPEC-0010 §8 adds `Modify`; SPEC-0011 adds `PlaceGroup` |
 | `OrderIntent` | `intent.rs`: adds `strategy`, `cloid`, `signal_ms`, `decision_ms` | `cloid` optional | The engine always assigns a cloid (SPEC-0010 §10, E-0) |
-| Decision loop | `mev-bot/src/engine.rs` (`interval(1s)`) | Not event-driven; §8 violated | SPEC-0010 E-3; the tick engine is deleted in E-13 |
+| Decision loop | `mev-bot/src/main.rs` runs `EngineLoop<StrategyDispatcher>` on a std thread; `engine.rs` no longer holds a loop | Event-driven; §8 satisfied | E-13 removed the 1 s tick `Engine` (2026-09-26) |
 | Cost / edge model | `cost.rs`, `size.rs` | Matches §5 | Keep; research uses the same fee table (SPEC-0008 §13.2) |
-| Strategy A: funding/basis | `funding.rs` + `paper.rs` | Legs sent as independent orders | Port to `PlaceGroup` (SPEC-0011 L-10) |
-| Strategy B: market-making | `mm.rs` (inventory skew, cancel/replace) | Built ahead of research (allowed: GOAL §2.1); cancel+place instead of modify | Port to v2 with `Modify` (SPEC-0010 E-4). **Doesn't trade live** without G1/G1.5. |
-| Paper execution | `paper.rs` | Fills only on the tick | Becomes `PaperExec` behind SPEC-0010 §14 |
+| Strategy A: funding/basis | `mev-engine/src/strategies/funding.rs` | Legs sent as independent orders | Port to `PlaceGroup` (SPEC-0011 L-10) |
+| Strategy B: market-making | `mev-engine/src/strategies/mm.rs` (inventory skew, cancel/replace) | Built ahead of research (allowed: GOAL §2.1); cancel+place instead of modify | Port to v2 with `Modify` (SPEC-0010 E-4). **Doesn't trade live** without G1/G1.5. |
+| Paper execution | `mev-engine/src/paper_exec.rs` (`PaperExec`, wired in `simulate`) | Fills against book updates after a configured latency, not on a 1 s tick | SPEC-0010 §14 |
 | Capital allocation (§9) | — | Not implemented | After SPEC-0010; needed only once ≥ 2 strategies run live |
-| Recording (§10) | `mev-bot/src/engine.rs` (`Recorder`), `mev-core/src/db.rs` | Records replay inputs (`Market`/`Account`/`Timer`), not outputs | Feed the event log to SPEC-0010's event bus; add `Fill` recording there |
-| Replay (§10) | `mev-bot/src/engine.rs` (`replay_events`, `replay`), `hl replay` | Deterministic: same log ⇒ same FNV-1a-64 intent fingerprint | Keep as the backtest spine; extend with fixtures (SPEC-0008 §13) |
+| Recording (§10) | `mev-bot/src/engine.rs` (`Recorder`), `mev-core/src/db.rs` | `hl run` records only `Event::Market` — no `Timer`/`Account`/`Fill` — so a fresh session has no decision cycles | Feed the v2 event bus; record `Timer`/`Fill` with the v2 replay driver (E-7 part 2) |
+| Replay (§10) | `mev-bot/src/engine.rs` (`replay_events`, `replay`), `hl replay` | Deterministic (same log ⇒ same FNV-1a-64 intent fingerprint), but it is a standalone driver (not `EngineLoop`) that runs decisions only on recorded `Timer` rows, which `hl run` no longer writes | Keep as the backtest spine; v2 replay driver is E-7 part 2 (blocked on SPEC-0008 R-7) |
+
+**Follow-ups recorded by E-13 (SPEC-0010 E-13 "remaining"):** the H-2 `reconcile_unknown` path (`orderStatus`-by-cloid) is not re-wired — exec errors now fail closed as `PostResult::Error`; and the H-3 account stream is not wired in `hl`, so the REST reconciler's `AccountUpdate::Reconcile` carries only `account_value`/`margin_used` (positions and order-state drift are not applied).
