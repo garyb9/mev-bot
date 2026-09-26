@@ -1,28 +1,23 @@
-//! Pluggable trading strategies and the shared cost/edge model.
+//! Pluggable trading strategies and the shared cost/edge model (SPEC-0003).
 //!
-//! See SPEC-0003. Strategies turn market/account state into [`OrderIntent`]s;
-//! risk (SPEC-0004) gates them and execution (SPEC-0002) acts on them.
+//! Strategies turn market/account [`view`]s into exchange-agnostic
+//! [`OrderIntent`]s using the shared [`CostModel`]; risk (SPEC-0004) gates the
+//! intents and execution (SPEC-0002) acts on them. The engine feeds events and
+//! timers deterministically (SPEC-0003 §8), so a recorded event log replays to
+//! identical intents.
 
-/// Which side of the book an intent is on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    /// Buy / bid.
-    Buy,
-    /// Sell / ask.
-    Sell,
-}
+pub mod cost;
+pub mod event;
+pub mod id;
+pub mod intent;
+pub mod size;
+pub mod strategy;
+pub mod view;
 
-/// A proposed order, exchange-agnostic and unsigned.
-#[derive(Debug, Clone)]
-pub struct OrderIntent {
-    /// Market symbol (e.g. `BTC`, `@107`).
-    pub coin: String,
-    /// Direction.
-    pub side: Side,
-    /// Limit price, if any (`None` = aggressive/market).
-    pub limit_px: Option<rust_decimal::Decimal>,
-    /// Size in base units.
-    pub size: rust_decimal::Decimal,
-    /// Human-readable justification, logged for audit.
-    pub rationale: String,
-}
+pub use cost::{CostModel, FeeRates};
+pub use event::{DeterministicRng, Event, FillEvent};
+pub use id::StrategyId;
+pub use intent::{OrderIntent, Side, TimeInForce};
+pub use size::Sizer;
+pub use strategy::{Strategy, StrategyContext, Trigger};
+pub use view::{AccountView, BookView, MarketView, OpenOrderView, PositionView, Walk};

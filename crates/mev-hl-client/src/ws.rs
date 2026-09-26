@@ -12,7 +12,7 @@ use mev_core::{
     error::{Error, Result},
 };
 use mev_metrics::names;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
@@ -63,7 +63,8 @@ pub enum Subscription {
 }
 
 /// A decoded market-data event.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "channel", rename_all = "camelCase")]
 pub enum StreamEvent {
     /// Mid prices for all coins.
     Mids(AllMids),

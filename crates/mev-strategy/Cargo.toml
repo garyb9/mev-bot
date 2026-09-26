@@ -9,4 +9,11 @@ repository.workspace = true
 
 [dependencies]
 mev-core.workspace = true
+mev-hl-client.workspace = true
 rust_decimal.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio.workspace = true
