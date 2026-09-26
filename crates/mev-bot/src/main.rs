@@ -182,11 +182,31 @@ async fn run(
 
     let health = Health::new();
     health.set_ready(true);
-    info!("ready; runtime loop arrives in milestone M0.7 (observe mode)");
+    info!(mode = ?config.mode, "ready");
+
+    // No-op observe loop: in `observe` there is nothing to trade yet, but the
+    // process stays alive, reports liveness via heartbeat, and shuts down
+    // cleanly. Real ingestion/wiring lands with SPEC-0001.
+    let heartbeat = tokio::spawn(heartbeat());
 
     serve(health, metrics, config.http_port).await?;
+    heartbeat.abort();
     info!("shutdown complete");
     Ok(())
+}
+
+async fn heartbeat() {
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+    loop {
+        interval.tick().await;
+        let uptime = started.elapsed().as_secs();
+        metrics::gauge!(mev_metrics::names::UPTIME_SECONDS).set(uptime as f64);
+        metrics::counter!(mev_metrics::names::HEARTBEATS).increment(1);
+        tracing::debug!(uptime_seconds = uptime, "heartbeat");
+    }
 }
 
 fn show_config() -> Result<()> {

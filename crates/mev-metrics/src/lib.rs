@@ -10,6 +10,10 @@ pub mod prometheus;
 pub mod names {
     /// Process startups.
     pub const STARTUPS: &str = "hl_startups_total";
+    /// Process uptime in seconds.
+    pub const UPTIME_SECONDS: &str = "hl_uptime_seconds";
+    /// Runtime heartbeat counter.
+    pub const HEARTBEATS: &str = "hl_heartbeats_total";
     /// WebSocket messages decoded, tagged by channel.
     pub const WS_MSGS: &str = "hl_ws_msgs_total";
     /// Market feed staleness in seconds, tagged by feed.
