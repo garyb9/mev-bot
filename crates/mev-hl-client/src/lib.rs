@@ -14,13 +14,14 @@ pub mod order;
 pub mod signing;
 pub mod types;
 pub mod ws;
+pub mod ws_exchange;
 
 pub use assets::{AssetMap, Market, MarketKind, MarketSelector};
 pub use client::{HttpInfo, InfoApi};
 pub use deadman::DeadMansSwitch;
 pub use exchange::{
     ActionResponse, ExchangeApi, ExchangeRequest, ExchangeResponse, HttpExchange, OrderResponse,
-    OrderStatus, RejectReason, WriteGate, build_request,
+    OrderStatus, Prepared, RejectReason, WriteCore, WriteGate, build_request,
 };
 pub use market::{FEED_BOOK, FEED_CTX, FeedAge, MarketState, OrderBook, Tolerance};
 pub use nonce::{NonceManager, ResetReason, now_ms};
@@ -35,6 +36,7 @@ pub use types::{
     PerpDex, Position, SpotMeta, SpotPair, SpotToken, Trade, UserFees, UserRateLimit,
 };
 pub use ws::{MarketStream, StreamEvent, Subscription, WsMarketStream};
+pub use ws_exchange::WsExchange;
 
 /// Network endpoints live in `mev-core` config; re-exported for convenience.
 pub use mev_core::config::Network;

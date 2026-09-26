@@ -2,9 +2,10 @@
 //! (SPEC-0002 §8–§9).
 //!
 //! Reads use [`InfoApi`]; writes go through [`ExchangeApi`]. Two transports sit
-//! behind the trait — REST `POST /exchange` (implemented here) and a WebSocket
-//! post (later milestone). The agent signer and nonce manager are injected and
-//! never logged.
+//! behind the trait — WebSocket `post` ([`crate::ws_exchange::WsExchange`], the
+//! default) and REST `POST /exchange` ([`HttpExchange`], the fallback). This
+//! module owns the shared signed-envelope/response types and the [`WriteCore`]
+//! (gating, signing, nonce sequencing) both transports build on.
 
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +20,7 @@ use mev_core::{
 };
 
 use crate::nonce::{NonceManager, now_ms};
-use crate::order::Action;
+use crate::order::{Action, CancelByCloidWire, CancelWire, OrderWire};
 use crate::signing::{AgentSigner, Signature};
 
 /// Hyperliquid success status string.
@@ -205,10 +206,183 @@ impl ActionResponse {
 }
 
 /// Write API for HyperCore actions (SPEC-0002 §8).
+///
+/// [`submit`](Self::submit) is the single primitive: every transport signs and
+/// sends one [`Action`]. The remaining methods are thin, typed wrappers over the
+/// action catalog so callers never hand-build wire structs.
 #[async_trait]
 pub trait ExchangeApi: Send + Sync {
     /// Submit a signed action envelope.
     async fn submit(&self, action: &Action) -> Result<ActionResponse>;
+
+    /// Place one or more orders and parse the per-order statuses.
+    async fn place(&self, orders: Vec<OrderWire>) -> Result<OrderResponse> {
+        self.submit(&Action::order(orders)).await?.order_response()
+    }
+
+    /// Cancel orders by venue order id.
+    async fn cancel(&self, cancels: Vec<CancelWire>) -> Result<ActionResponse> {
+        self.submit(&Action::Cancel { cancels }).await
+    }
+
+    /// Cancel orders by client order id.
+    async fn cancel_by_cloid(&self, cancels: Vec<CancelByCloidWire>) -> Result<ActionResponse> {
+        self.submit(&Action::CancelByCloid { cancels }).await
+    }
+
+    /// Arm (`Some(at)`) or disarm (`None`) the dead-man's switch.
+    async fn schedule_cancel(&self, at_ms: Option<u64>) -> Result<ActionResponse> {
+        self.submit(&Action::ScheduleCancel { time: at_ms }).await
+    }
+
+    /// Set cross/isolated leverage for an asset.
+    async fn update_leverage(
+        &self,
+        asset: u32,
+        is_cross: bool,
+        leverage: u32,
+    ) -> Result<ActionResponse> {
+        self.submit(&Action::UpdateLeverage {
+            asset,
+            is_cross,
+            leverage,
+        })
+        .await
+    }
+}
+
+/// A signed, prepared action: either withheld (`simulate`) or ready to send.
+#[derive(Debug, Clone)]
+pub enum Prepared {
+    /// Signed but must not be sent (`simulate` mode).
+    DryRun(Box<ExchangeRequest>),
+    /// Signed, nonce persisted, ready to send (`live` mode).
+    Send(Box<ExchangeRequest>),
+}
+
+/// Shared write path used by every transport: mode gating, EIP-712 signing,
+/// nonce sequencing, and durable high-water-mark persistence (SPEC-0002 §5).
+pub struct WriteCore {
+    signer: Option<AgentSigner>,
+    nonce: tokio::sync::Mutex<NonceManager>,
+    db: Option<Arc<Mutex<Db>>>,
+    gate: WriteGate,
+    expires_after: Option<u64>,
+    vault_address: Option<String>,
+}
+
+impl WriteCore {
+    /// Create a write core for `mode`; a signer is required unless blocked.
+    pub fn new(mode: Mode, signer: Option<AgentSigner>) -> Result<Self> {
+        let gate = WriteGate::from(mode);
+        if gate != WriteGate::Blocked && signer.is_none() {
+            return Err(Error::Config(format!(
+                "{} mode requires an agent signer",
+                match mode {
+                    Mode::Observe => "observe",
+                    Mode::Simulate => "simulate",
+                    Mode::Live => "live",
+                }
+            )));
+        }
+        Ok(Self {
+            signer,
+            nonce: tokio::sync::Mutex::new(NonceManager::new()),
+            db: None,
+            gate,
+            expires_after: None,
+            vault_address: None,
+        })
+    }
+
+    /// Attach a durable nonce store and restore the persisted high-water mark.
+    pub fn with_nonce_db(mut self, db: Arc<Mutex<Db>>) -> Result<Self> {
+        let restored = {
+            let guard = db
+                .lock()
+                .map_err(|_| Error::Config("db lock poisoned".into()))?;
+            guard.nonce_last()?
+        };
+        let mut manager = NonceManager::new();
+        if let Some(last) = restored {
+            manager = NonceManager::restore(last);
+        }
+        self.nonce = tokio::sync::Mutex::new(manager);
+        self.db = Some(db);
+        Ok(self)
+    }
+
+    /// The effective write gate.
+    pub fn gate(&self) -> WriteGate {
+        self.gate
+    }
+
+    /// Set the optional `expiresAfter` field applied to every action.
+    pub fn with_expires_after(mut self, expires_after: Option<u64>) -> Self {
+        self.expires_after = expires_after;
+        self
+    }
+
+    /// Set the optional vault address applied to every action.
+    pub fn with_vault_address(mut self, vault_address: Option<String>) -> Self {
+        self.vault_address = vault_address;
+        self
+    }
+
+    /// Restore the persisted nonce high-water mark.
+    pub async fn restore_nonce(&self, last: u64) {
+        *self.nonce.lock().await = NonceManager::restore(last);
+    }
+
+    /// The current nonce high-water mark (for persistence).
+    pub async fn last_nonce(&self) -> u64 {
+        self.nonce.lock().await.last()
+    }
+
+    /// Resync the nonce after a stale/duplicate/recent-window rejection.
+    pub async fn heal_nonce(&self) -> u64 {
+        let nonce = self.nonce.lock().await.on_reject(now_ms());
+        let _ = self.persist_nonce(nonce);
+        nonce
+    }
+
+    /// Write the nonce high-water mark to the durable store, if attached.
+    fn persist_nonce(&self, nonce: u64) -> Result<()> {
+        if let Some(db) = &self.db {
+            let guard = db
+                .lock()
+                .map_err(|_| Error::Config("db lock poisoned".into()))?;
+            guard.set_nonce_last(nonce)?;
+        }
+        Ok(())
+    }
+
+    /// Sign the next envelope for `action`, gated and persisted for `live`.
+    pub async fn prepare(&self, action: &Action) -> Result<Prepared> {
+        if self.gate == WriteGate::Blocked {
+            return Err(Error::Config(
+                "observe mode cannot sign or submit actions".into(),
+            ));
+        }
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| Error::Config("no agent signer is configured".into()))?;
+        let nonce = self.nonce.lock().await.next(now_ms());
+        let request = build_request(
+            action,
+            signer,
+            nonce,
+            self.vault_address.clone(),
+            self.expires_after,
+        )?;
+        if self.gate == WriteGate::DryRun {
+            return Ok(Prepared::DryRun(Box::new(request)));
+        }
+        // Persist before sending so a crash cannot reuse this nonce.
+        self.persist_nonce(nonce)?;
+        Ok(Prepared::Send(Box::new(request)))
+    }
 }
 
 /// A signed `/exchange` request payload.
@@ -283,13 +457,7 @@ impl From<Mode> for WriteGate {
 pub struct HttpExchange {
     client: reqwest::Client,
     base_url: String,
-    signer: Option<AgentSigner>,
-    nonce: tokio::sync::Mutex<NonceManager>,
-    /// Optional durable high-water mark (SQLite). Persisted before each send.
-    db: Option<Arc<Mutex<Db>>>,
-    gate: WriteGate,
-    expires_after: Option<u64>,
-    vault_address: Option<String>,
+    core: WriteCore,
 }
 
 impl HttpExchange {
@@ -307,114 +475,61 @@ impl HttpExchange {
         mode: Mode,
         signer: Option<AgentSigner>,
     ) -> Result<Self> {
-        let gate = WriteGate::from(mode);
-        if gate != WriteGate::Blocked && signer.is_none() {
-            return Err(Error::Config(format!(
-                "{} mode requires an agent signer",
-                match mode {
-                    Mode::Observe => "observe",
-                    Mode::Simulate => "simulate",
-                    Mode::Live => "live",
-                }
-            )));
-        }
         Ok(Self {
             client: reqwest::Client::new(),
             base_url: base_url.into(),
-            signer,
-            nonce: tokio::sync::Mutex::new(NonceManager::new()),
-            db: None,
-            gate,
-            expires_after: None,
-            vault_address: None,
+            core: WriteCore::new(mode, signer)?,
         })
     }
 
     /// Attach a durable nonce store and restore the persisted high-water mark.
     pub fn with_nonce_db(mut self, db: Arc<Mutex<Db>>) -> Result<Self> {
-        let restored = {
-            let guard = db
-                .lock()
-                .map_err(|_| Error::Config("db lock poisoned".into()))?;
-            guard.nonce_last()?
-        };
-        let mut manager = NonceManager::new();
-        if let Some(last) = restored {
-            manager = NonceManager::restore(last);
-        }
-        self.nonce = tokio::sync::Mutex::new(manager);
-        self.db = Some(db);
+        self.core = self.core.with_nonce_db(db)?;
         Ok(self)
     }
 
     /// The effective write gate.
     pub fn gate(&self) -> WriteGate {
-        self.gate
+        self.core.gate()
     }
 
     /// Set the optional `expiresAfter` field applied to every action.
     pub fn with_expires_after(mut self, expires_after: Option<u64>) -> Self {
-        self.expires_after = expires_after;
+        self.core = self.core.with_expires_after(expires_after);
         self
     }
 
     /// Set the optional vault address applied to every action.
     pub fn with_vault_address(mut self, vault_address: Option<String>) -> Self {
-        self.vault_address = vault_address;
+        self.core = self.core.with_vault_address(vault_address);
         self
     }
 
     /// Restore the persisted nonce high-water mark.
     pub async fn restore_nonce(&self, last: u64) {
-        *self.nonce.lock().await = NonceManager::restore(last);
+        self.core.restore_nonce(last).await;
     }
 
     /// The current nonce high-water mark (for persistence).
     pub async fn last_nonce(&self) -> u64 {
-        self.nonce.lock().await.last()
+        self.core.last_nonce().await
     }
 
     /// Resync the nonce after a stale/duplicate/recent-window rejection.
     pub async fn heal_nonce(&self) -> u64 {
-        let nonce = self.nonce.lock().await.on_reject(now_ms());
-        let _ = self.persist_nonce(nonce);
-        nonce
-    }
-
-    /// Write the nonce high-water mark to the durable store, if attached.
-    fn persist_nonce(&self, nonce: u64) -> Result<()> {
-        if let Some(db) = &self.db {
-            let guard = db
-                .lock()
-                .map_err(|_| Error::Config("db lock poisoned".into()))?;
-            guard.set_nonce_last(nonce)?;
-        }
-        Ok(())
+        self.core.heal_nonce().await
     }
 
     /// Build, sign, and (if allowed) POST an action.
     async fn send(&self, action: &Action) -> Result<ActionResponse> {
-        let signer = self
-            .signer
-            .as_ref()
-            .ok_or_else(|| Error::Config("observe mode cannot sign or submit actions".into()))?;
-        let nonce = self.nonce.lock().await.next(now_ms());
-        let request = build_request(
-            action,
-            signer,
-            nonce,
-            self.vault_address.clone(),
-            self.expires_after,
-        )?;
-
-        if self.gate == WriteGate::DryRun {
-            return Ok(ActionResponse {
-                value: json!({ "status": "simulated", "request": request }),
-            });
-        }
-
-        // Persist before sending so a crash cannot reuse this nonce.
-        self.persist_nonce(nonce)?;
+        let request = match self.core.prepare(action).await? {
+            Prepared::DryRun(request) => {
+                return Ok(ActionResponse {
+                    value: json!({ "status": "simulated", "request": request }),
+                });
+            }
+            Prepared::Send(request) => request,
+        };
 
         let url = format!("{}/exchange", self.base_url.trim_end_matches('/'));
         let resp = self
@@ -640,6 +755,47 @@ mod tests {
         assert_eq!(restarted.last_nonce().await, first);
         restarted.submit(&simple_action()).await.unwrap();
         assert!(restarted.last_nonce().await > first);
+    }
+
+    #[tokio::test]
+    async fn trait_wrappers_build_the_right_actions() {
+        use crate::order::{CancelWire, OrderWire};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/exchange"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"status":"ok","response":{"data":{"statuses":["resting"]}}}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let exchange =
+            HttpExchange::with_base_url(server.uri(), Mode::Live, Some(signer())).unwrap();
+        let orders = vec![OrderWire {
+            a: 0,
+            b: true,
+            p: "50000".into(),
+            s: "0.1".into(),
+            r: false,
+            t: crate::order::OrderType::limit(Tif::Gtc),
+            c: None,
+        }];
+        assert_eq!(
+            exchange.place(orders).await.unwrap().statuses,
+            vec![OrderStatus::Resting]
+        );
+        exchange
+            .cancel(vec![CancelWire { a: 0, o: 7 }])
+            .await
+            .unwrap();
+        exchange
+            .schedule_cancel(Some(1_700_000_000_000))
+            .await
+            .unwrap();
+        exchange.schedule_cancel(None).await.unwrap();
     }
 
     #[test]

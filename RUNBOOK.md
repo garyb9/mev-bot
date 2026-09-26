@@ -71,13 +71,30 @@ $10 minimum notional) are rejected locally before signing. The nonce
 high-water mark is persisted in SQLite (`meta.nonce.last`) so a restart cannot
 reuse a nonce.
 
+## Transports & dead-man's switch
+
+- Writes default to the **WebSocket `post`** transport (`WsExchange`); REST
+  `POST /exchange` (`HttpExchange`) is the fallback. Both share the same signed
+  envelope, nonce state, and SQLite high-water mark.
+- In `live`, `scheduleCancel` is armed on start with TTL
+  `HL_SCHEDULE_CANCEL_TTL_MS` (default 30s) and refreshed on a 1s heartbeat. A
+  crash, stall, or loss of connectivity therefore cancels resting orders after
+  the TTL. Graceful shutdown disarms it explicitly.
+- Watch `hl_deadman_armed` (1 while armed), `hl_deadman_refreshes_total`, and
+  `hl_deadman_failures_total`. Failure to refresh within the window is an alert.
+
+> Open item: the live testnet round-trip (place a far-from-mid ALO order,
+> confirm in `openOrders`, cancel) is wired but not yet exercised — it needs a
+> funded, agent-approved testnet account.
+
 ## Go live (checklist)
 
 1. Confirm the agent wallet is approved (Hyperliquid UI → Settings → API).
 2. Set `HL_ACCOUNT_ADDRESS` and `HL_AGENT_PRIVATE_KEY` (agent key only).
 3. Set `HL_MODE=live` and `HL_LIVE_CONFIRM=YES`.
 4. Confirm `readyz` is `200` and metrics show fresh feeds.
-5. Verify the dead-man's switch is armed in logs/metrics _(pending SPEC-0002)_.
+5. Verify the dead-man's switch is armed: log line `dead-man switch armed` and
+   `hl_deadman_armed 1`.
 6. Start with small size; watch PnL and reject metrics.
 
 ## Kill switch

@@ -6,18 +6,21 @@
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
-use mev_core::config::{Config, ConfigOverrides, Mode, Network};
+use mev_core::{
+    config::{Config, ConfigOverrides, Mode, Network},
+    db::Db,
+};
 use mev_hl_client::{
-    Action, AgentSigner, AssetMap, HttpInfo, InfoApi, Market, MarketKind, MarketSelector,
-    MarketState, MarketStream, OrderParams, StreamEvent, Subscription, Tif, Tolerance,
-    WsMarketStream, build_order_wire, build_request, now_ms,
+    Action, AgentSigner, AssetMap, DeadMansSwitch, ExchangeApi, HttpInfo, InfoApi, Market,
+    MarketKind, MarketSelector, MarketState, MarketStream, OrderParams, StreamEvent, Subscription,
+    Tif, Tolerance, WsExchange, WsMarketStream, build_order_wire, build_request, now_ms,
 };
 use mev_metrics::{health::Health, prometheus::PrometheusHandle};
 use tokio::signal;
@@ -285,6 +288,8 @@ async fn run(
     let heartbeat = tokio::spawn(heartbeat());
     let ingest = tokio::spawn(ingest(state.clone(), watchlist, config.network));
     let monitor = tokio::spawn(monitor(state, health.clone()));
+    let deadman = live_exchange(&config)?
+        .map(|exchange| tokio::spawn(deadman(exchange, config.schedule_cancel_ttl_ms)));
 
     info!("waiting for feeds to become ready");
     serve(health, metrics, config.http_port).await?;
@@ -292,8 +297,76 @@ async fn run(
     ingest.abort();
     monitor.abort();
     heartbeat.abort();
+    // The dead-man task disarms `scheduleCancel` on the same shutdown signal;
+    // give it a moment to submit before the process exits.
+    if let Some(deadman) = deadman {
+        let _ = tokio::time::timeout(Duration::from_secs(5), deadman).await;
+    }
     info!("shutdown complete");
     Ok(())
+}
+
+/// Build the live write client when running `live` with an agent key.
+///
+/// Returns `None` in `observe`/`simulate`, so no socket is opened and no key is
+/// needed. The returned client shares the SQLite nonce high-water mark.
+fn live_exchange(config: &Config) -> Result<Option<Arc<dyn ExchangeApi>>> {
+    if config.mode != Mode::Live {
+        return Ok(None);
+    }
+    let Some(key) = config.agent_key() else {
+        return Ok(None);
+    };
+    let signer = AgentSigner::from_hex(key, config.network == Network::Mainnet)?;
+    let db = Arc::new(Mutex::new(Db::open(&config.db_path)?));
+    let exchange = WsExchange::new(config.network, config.mode, Some(signer))?.with_nonce_db(db)?;
+    Ok(Some(Arc::new(exchange)))
+}
+
+/// Keep `scheduleCancel` armed for as long as the process is healthy.
+///
+/// In `live`, the switch is armed on start and refreshed on a 1s tick (the
+/// switch itself decides when a refresh is due), and explicitly disarmed on
+/// graceful shutdown. If the process dies without shutting down, the venue
+/// cancels resting orders once the TTL elapses.
+async fn deadman(exchange: Arc<dyn ExchangeApi>, ttl_ms: u64) {
+    let mut switch = DeadMansSwitch::new(ttl_ms);
+    if let Err(err) = exchange.submit(&switch.arm(now_ms())).await {
+        error!(error = %err, "dead-man switch arm failed");
+        metrics::counter!(mev_metrics::names::DEADMAN_FAILURES).increment(1);
+        return;
+    }
+    metrics::gauge!(mev_metrics::names::DEADMAN_ARMED).set(1.0);
+    info!(ttl_ms, until = ?switch.armed_until(), "dead-man switch armed");
+
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown_signal() => break,
+            _ = tick.tick() => {
+                if let Some(action) = switch.refresh_if_due(now_ms()) {
+                    match exchange.submit(&action).await {
+                        Ok(_) => {
+                            metrics::counter!(mev_metrics::names::DEADMAN_REFRESHES).increment(1);
+                        }
+                        Err(err) => {
+                            error!(error = %err, "dead-man refresh failed");
+                            metrics::counter!(mev_metrics::names::DEADMAN_FAILURES).increment(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(action) = switch.disarm() {
+        match exchange.submit(&action).await {
+            Ok(_) => info!("dead-man switch disarmed"),
+            Err(err) => error!(error = %err, "dead-man disarm failed"),
+        }
+    }
+    metrics::gauge!(mev_metrics::names::DEADMAN_ARMED).set(0.0);
 }
 
 /// Ingest market data into the shared state until the process stops.
@@ -767,5 +840,21 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_exchange_is_none_outside_live() {
+        for mode in [Mode::Observe, Mode::Simulate] {
+            let config = Config {
+                mode,
+                ..Config::default()
+            };
+            assert!(live_exchange(&config).unwrap().is_none(), "{mode:?}");
+        }
     }
 }

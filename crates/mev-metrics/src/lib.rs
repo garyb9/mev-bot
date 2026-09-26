@@ -32,6 +32,12 @@ pub mod names {
     pub const NONCE_ERRORS: &str = "hl_nonce_errors_total";
     /// Nonce self-heal resets, tagged by reason.
     pub const NONCE_RESETS: &str = "hl_nonce_resets_total";
+    /// Whether the dead-man's switch is currently armed (0/1).
+    pub const DEADMAN_ARMED: &str = "hl_deadman_armed";
+    /// Dead-man's switch arm/refresh submissions.
+    pub const DEADMAN_REFRESHES: &str = "hl_deadman_refreshes_total";
+    /// Dead-man's switch submission failures.
+    pub const DEADMAN_FAILURES: &str = "hl_deadman_failures_total";
     /// Risk breaker trips, tagged by trigger.
     pub const BREAKER_TRIPS: &str = "hl_breaker_trips_total";
 }

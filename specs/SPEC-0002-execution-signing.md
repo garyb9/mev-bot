@@ -1,6 +1,6 @@
 # SPEC-0002 — Execution, Signing & Account
 
-**Status:** Draft
+**Status:** Implemented (M2) — open item: live testnet round-trip (gated on a funded, agent-approved testnet account)
 **Depends on:** SPEC-0000, SPEC-0001
 **Blocks:** SPEC-0003 (strategy), SPEC-0004 (risk)
 
