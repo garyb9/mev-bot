@@ -54,15 +54,36 @@ preference. If you have a new idea, add it as a study there first.
 ### 2.1 Priority tiers
 
 To keep the arb core from being starved by everything else, all work is tiered.
-Agents always pick the highest tier available. Full task list:
-SPEC-0008 §14.0–14.1.
+Agents always pick the highest tier available: **T0 before everything**.
+Full task lists: the T0 list below, then SPEC-0008 §14.0–14.1.
 
 | Tier | What | Items | When |
 |---|---|---|---|
+| **T0: fix-first** | Known bugs and unsafe defaults on the real-money path, found in reviews | The §2.2 list | **Before any other work, and before any testnet or live run** |
 | **T1: arb core** (latency-first) | Recorder, research toolkit, fast dislocation / arb studies, HyperEVM MEV feasibility (desk research), execution hardening (M2.5), **event-driven engine (SPEC-0010), multi-leg execution (SPEC-0011), risk hardening (SPEC-0004 K-1…K-7), CI (SPEC-0000 C-tasks)** | Items 1, 3, 6 (in-hours + closed-hours lead-lag), 7 (spread bands); study O8 Q1–Q4 | **First, always** |
 | **T2: adjacent** | Reuses T1 data, or waits on heavier infrastructure | Items 2 (needs HyperEVM RPC / node), 4, 5; HIP-3 funding patterns | When T1 is done, blocked, or taken |
 | **T3-data** | Starting the clock on forward options data | Options-chain and Deribit recording | **Any time** (small, time-sensitive) |
 | **T3: directional family** | Signals held hours to days | Item 8; open convergence and weekend → week-ahead (item 6); single-instrument Bollinger (item 7) | After the recorder is in production **and** ≥ 3 T1 studies have preliminary reports |
+
+### 2.2 T0 fix-first list
+
+These are defects, not features. Each has a precise task in its spec (the spec
+holds the status). An agent starting work checks this list first. If any item
+is open and its dependencies are met, the agent does it before any T1 task.
+
+| # | Fix | Why it's T0 | Task |
+|---|---|---|---|
+| 1 | Every live order gets a `cloid`; parse per-order exchange statuses (no "submitted" for rejected orders); no mid-price limit for aggressive orders; count same-cycle intents toward caps | Wrong or unrecoverable orders with real money | [SPEC-0010 E-0](../specs/SPEC-0010-event-driven-engine.md) |
+| 2 | `live` refuses to start without explicit, finite risk limits (today every limit defaults to unlimited) | Risk is fail-open by default | [SPEC-0004 K-1](../specs/SPEC-0004-risk-portfolio-accounting.md) |
+| 3 | Concurrent WS `post`: stop holding the socket lock while waiting for a reply | Only one order in flight; a dead-man refresh blocks orders and cancels | [SPEC-0002 H-1](../specs/SPEC-0002-execution-signing.md) |
+| 4 | Unknown order outcomes are reconciled by `cloid` before anything is resent | A dropped socket after send leaves orders in an unknown state | [SPEC-0002 H-2](../specs/SPEC-0002-execution-signing.md) |
+| 5 | Dead-man switch: halt trading if arming/refreshing fails; arm only while orders rest; stop burning the address rate-limit budget | Live trading continues unprotected after an arm failure; the budget runs out in ~2 days | [SPEC-0002 H-4](../specs/SPEC-0002-execution-signing.md) |
+| 6 | Verify the venue's nonce and `scheduleCancel` rules | Items 4 and 5, and the nonce design, rest on unverified assumptions | [SPEC-0002 H-9](../specs/SPEC-0002-execution-signing.md) |
+| 7 | Market stream: pong/data watchdog, jittered backoff, cancellable reconnect | Silent stale feeds; reconnect storms; shutdown can hang | [SPEC-0008 R-3](../specs/SPEC-0008-recorder-and-opportunity-research.md) |
+
+Order: 6 (quick) and 1 + 2 first (small, and they touch the same files);
+then 3 → 4 → 5; 7 in parallel. New defects found in later reviews are added
+here.
 
 Strategy code for any tier waits for gate G1, or an owner-approved G1.5 pilot.
 The funding pilot (M4) is a stack-prover, not a tier. Strategy code, including
@@ -185,9 +206,9 @@ The recorder depends only on M1 (market data), so it can start immediately.
 
 Follow the tiers (§2.1):
 
-0. **Safety first: SPEC-0010 E-0** (cloid on every live order, parse order
-   statuses, no mid-as-limit, fail-closed limits, count same-cycle intents)
-   and **SPEC-0004 K-1**. This must be done before any testnet or live run.
+0. **T0 fix-first (§2.2), before anything else:** SPEC-0002 H-9, SPEC-0010
+   E-0, SPEC-0004 K-1, then SPEC-0002 H-1 → H-2 → H-4, with SPEC-0008 R-3 in
+   parallel. No testnet or live run until all of them are ✅.
 1. **T1: SPEC-0008 recorder** (V-1…V-4, V-11, V-12, R-1…R-8, R-10, R-13)
    deployed to a low-latency host, **and SPEC-0002 §17** (M2.5 hardening), in
    parallel.
@@ -207,7 +228,7 @@ Follow the tiers (§2.1):
 |---|---|---|---|
 | G1 (end of M3) | Which strategy do we build first, or none? | SPEC-0008 study reports + `RANKING.md` covering ≥ 14 days of data | ADR-0002 |
 | G1.5 (optional pilot) | Run a MARGINAL / promising-but-unproven strategy with real money to learn? | Owner prior + study report; capital ≤ pilot cap, ≤ 4 weeks, hard loss limit (SPEC-0008 §13.6); G2 passed first | ADR entry |
-| G2 (before any `live`) | Is the stack safe **and fast** with real money? | Testnet round-trip, kill-switch drill, risk property tests, pilot in `simulate`, measured tick-to-order within the §5.2 budget | SPEC-0004/0006 checklists |
+| G2 (before any `live`) | Is the stack safe **and fast** with real money? | **Every T0 fix (§2.2) ✅**, testnet round-trip, kill-switch drill, risk property tests, pilot in `simulate`, measured tick-to-order within the §5.2 budget | SPEC-0004/0006 checklists |
 | G3 (before scaling size) | Does realized edge match researched edge? | ≥ 7 days live at small size; realized vs expected within tolerance | Strategy spec |
 
 ## 10. Glossary

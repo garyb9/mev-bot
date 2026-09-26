@@ -707,7 +707,8 @@ Work is tiered so the arb core isn't starved by the directional family ([`docs/G
 
 | Tier | What | Rule |
 |---|---|---|
-| **T1: arb core** (latency-first) | Recorder, research toolkit, fast dislocation / arb studies, and the HyperEVM MEV feasibility desk research | **Always pick T1 first.** |
+| **T0: fix-first** | Known defects on the real-money path ([`docs/GOAL.md`](../docs/GOAL.md) §2.2). In this spec: **R-3** (stream watchdog, jitter, cancellable reconnect) | **Before everything else.** |
+| **T1: arb core** (latency-first) | Recorder, research toolkit, fast dislocation / arb studies, and the HyperEVM MEV feasibility desk research | **Always pick T1 first (after T0).** |
 | **T2: adjacent** | Studies that reuse T1 data (flow, carry, funding patterns) or are blocked on heavier infrastructure (HyperEVM RPC / node) | When every T1 task is done, blocked, or already taken. |
 | **T3-data: directional-family data collection** | Small tasks that start the clock on forward data (options chains, Deribit) | **Allowed any time.** They're small, and calendar time is the constraint. |
 | **T3: directional family** (signals held hours–days) | The slow-signal backtester and the O9, O10 B/E, and O11 B/C studies | Starts only when **both**: (1) R-10 is ✅ (recorder in production), and (2) ≥ 3 T1 studies have preliminary reports. |
@@ -733,7 +734,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | V-13 | Historical options data: vendors, coverage, cost; owner decides whether to buy | T3-data | S | V-9 | ☐ |
 | R-1 | `mev-recorder` crate skeleton + envelope types | T1 | S | — | ☐ |
 | R-2 | Segment writer (zstd, rotation, manifest, crash recovery, disk guard) | T1 | M | R-1 | ☐ |
-| R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | T1 | M | — | ☐ |
+| R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | **T0** | M | — | ☐ |
 | R-4 | Subscription planner + universe selectors | T1 | M | R-1 | ☐ |
 | R-5 | HL REST snapshotter with weight budget (incl. candle backfill) | T1 | M | R-1, R-2 | ☐ |
 | R-6 | `hl record` / `record plan` / `probe latency` CLI, profiles, metrics, health | T1 | M | R-2, R-3, R-4, R-5 | ☐ |

@@ -182,20 +182,20 @@ Metrics: submit latency histogram (by transport), order rejects by status, nonce
 
 ## 17. Follow-ups — M2.5 execution hardening + latency baseline
 
-Found in the post-M2 review (2026-09-26). These must land before any strategy trades (M4), and they sit on the latency hot path, so [`docs/GOAL.md`](../docs/GOAL.md) §5 applies to every one. Format and rules match SPEC-0008 §0 and §14: do the tasks in dependency order, tick the status in the same commit as the code, and write ambiguities into §18 instead of guessing.
+Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-first** ([`docs/GOAL.md`](../docs/GOAL.md) §2.2): do them before any other work. All of these must land before any strategy trades (M4), and they sit on the latency hot path, so [`docs/GOAL.md`](../docs/GOAL.md) §5 applies to every one. Format and rules match SPEC-0008 §0 and §14: do the tasks in dependency order, tick the status in the same commit as the code, and write ambiguities into §18 instead of guessing.
 
-| ID | Title | Size | Depends on | Status |
-|---|---|---|---|---|
-| H-1 | Concurrent WS `post` (reader task + pending map) | M | — | ☐ |
-| H-2 | Mandatory `cloid` + unknown-outcome reconciliation | M | H-1 | ☐ |
-| H-3 | Account stream (`orderUpdates`, `userFills`, `userEvents`) | M | SPEC-0008 R-3 | ☐ |
-| H-4 | Dead-man's switch policy (arm only when needed; fail closed) | S | H-1 | ☐ |
-| H-5 | Apply `bbo` to `MarketState` | S | — | ☐ |
-| H-6 | Nonce persistence off the hot path | S | H-9 | ☐ |
-| H-7 | Latency instrumentation + sign/submit benchmarks | M | H-1 | ☐ |
-| H-8 | `simulate` without keys (ephemeral signer) | S | — | ☐ |
-| H-9 | Verify the HL nonce and `scheduleCancel` rules | S | — | ☐ |
-| H-10 | Testnet round-trip (the open §15 item) | S | H-1, H-2, owner-provided testnet key | ☐ |
+| ID | Title | Tier | Size | Depends on | Status |
+|---|---|---|---|---|---|
+| H-1 | Concurrent WS `post` (reader task + pending map) | **T0** | M | — | ☐ |
+| H-2 | Mandatory `cloid` + unknown-outcome reconciliation | **T0** | M | H-1 | ☐ |
+| H-3 | Account stream (`orderUpdates`, `userFills`, `userEvents`) | T1 | M | SPEC-0008 R-3 | ☐ |
+| H-4 | Dead-man's switch policy (arm only when needed; fail closed) | **T0** | S | H-1 | ☐ |
+| H-5 | Apply `bbo` to `MarketState` | T1 | S | — | ☐ |
+| H-6 | Nonce persistence off the hot path | T1 | S | H-9 | ☐ |
+| H-7 | Latency instrumentation + sign/submit benchmarks | T1 | M | H-1 | ☐ |
+| H-8 | `simulate` without keys (ephemeral signer) | T1 | S | — | ☐ |
+| H-9 | Verify the HL nonce and `scheduleCancel` rules | **T0** | S | — | ☐ |
+| H-10 | Testnet round-trip (the open §15 item) | T1 | S | **all T0 fixes** (GOAL §2.2), owner-provided testnet key | ☐ |
 
 **H-1 — Concurrent WS `post`.** Today `WsExchange::post` holds the socket mutex while it waits for the reply, so only one request is ever in flight. Replace this with: one writer handle (a channel into a socket-owning task); one reader task that routes `channel:"post"` replies by `id` to a `HashMap<u64, oneshot::Sender>`; a semaphore capping in-flight posts at 100 (the venue limit); a per-request timeout (default 5 s) that returns a typed `Error::UnknownOutcome`. On socket loss, fail every pending request with `UnknownOutcome`, reconnect (reuse `RawWsConn` from SPEC-0008 R-3 once it exists), and keep the connection warm with app-level pings. *Done when:* a mock-venue test sends 50 concurrent orders with shuffled reply order and each caller gets its own reply; a dropped socket fails pending calls with `UnknownOutcome`; the dead-man refresh no longer blocks order sends.
 

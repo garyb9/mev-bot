@@ -140,7 +140,7 @@ Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path in
 
 | ID | Title | Tier | Size | Depends on | Status |
 |---|---|---|---|---|---|
-| K-1 | Fail-closed defaults: `live` refuses to start without explicit finite limits; conservative defaults for `simulate` | T1 | S | — | ☐ |
+| K-1 | Fail-closed defaults: `live` refuses to start without explicit finite limits; conservative defaults for `simulate` | **T0** | S | — | ☐ |
 | K-2 | Exposure incl. in-flight orders (worst case), and group worst-single-leg exposure (SPEC-0011 §9) | T1 | M | SPEC-0010 E-5 | ☐ |
 | K-3 | Kill switch: `SIGUSR1`, flag file, `hl panic`; cancel-all + halt; SPEC-0011 `on_kill` for residuals; sticky until cleared | T1 | M | SPEC-0010 E-3 | ☐ |
 | K-4 | Circuit breakers: daily loss, drawdown, reject-rate spike, nonce errors, stale feeds, reconciliation drift, exec backpressure | T1 | M | K-3, SPEC-0010 E-8 | ☐ |

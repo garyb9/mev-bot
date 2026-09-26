@@ -44,6 +44,9 @@ Don't pick one silently.
 
 ## 4. How to pick up and finish a task
 
+0. **Check the T0 fix-first list** in [`docs/GOAL.md`](docs/GOAL.md) §2.2.
+   If any T0 item is open and its dependencies are met, do it first, before
+   any other task, unless you were explicitly assigned something else.
 1. Find the task ID in its spec's work-breakdown table (e.g. SPEC-0008 §14,
    SPEC-0002 §17).
 2. Check that every dependency is ✅. If not, pick another task or report
@@ -66,6 +69,7 @@ verified fact, with a source link and date) and flag it in your final message.
 ### Safety (never break these)
 
 - **Never** run `hl run --mode live`, and never set `HL_LIVE_CONFIRM`.
+- No testnet order round-trip until every T0 fix (`docs/GOAL.md` §2.2) is ✅.
 - **Never** read, create, print, or commit private keys, `.env` files, or
   secrets. Testnet keys only when the owner explicitly provides one for a
   specific task.
