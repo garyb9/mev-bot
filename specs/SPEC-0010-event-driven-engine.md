@@ -314,15 +314,28 @@ Reference machine = the chosen production host type (SPEC-0008 V-4). Results are
 
 ## 18. Performance engineering checklist (E-12)
 
-| Item | Default | Decide by |
-|---|---|---|
-| Pin the engine thread to a dedicated core (`core_affinity`) | on if ≥ 4 vCPUs | bench p99 with and without; check VPS steal time |
-| Spin before blocking (`spin_us`) | 50 µs | p99 vs CPU cost |
-| Allocator (`mimalloc`) | off | bench |
-| `TCP_NODELAY` on every exec and market socket | **on** | always |
-| Warm standby exec connection (fail over without a handshake) | off | measured reconnect gap |
-| `lto = "fat"` for release | thin today | bench |
-| Fixed-point `Px`/`Sz` (E-11) | off | E-10 results |
+E-12 can decide the code/config/profile rows here; every row that needs real
+hardware is marked **deferred — needs reference host (SPEC-0008 V-4)** with the
+exact experiment to run. No host numbers are invented.
+
+| Item | Default | Decide by | E-12 decision |
+|---|---|---|---|
+| Pin the engine thread to a dedicated core (`core_affinity`) | on if ≥ 4 vCPUs | bench p99 with and without; check VPS steal time | **deferred — needs reference host (SPEC-0008 V-4).** No affinity code or `core_affinity` dependency exists yet, and E-12 does not add one. Experiment: on the production host type, build two variants (pin on / off) and bench `bbo_to_action` p99 and 24 h `simulate` `hl_tick_to_order_seconds` p99 under live load, plus `/proc/stat` steal time; keep pinning only if p99 improves. The `pin_core` config surface lands with the E-13 wiring of the v2 loop into `hl` (nothing reads it today). |
+| Spin before blocking (`spin_us`) | 50 µs | p99 vs CPU cost | **default confirmed.** `LoopConfig::default` is `spin_us: 50` (`crates/mev-engine/src/run.rs:53`) and the §19 example matches. **deferred — needs reference host (SPEC-0008 V-4).** Experiment: sweep `spin_us ∈ {0, 20, 50, 100, 250}` and record `bbo_to_action` p99 vs engine-core CPU% (and idle ratio) to pick the knee. |
+| Allocator (`mimalloc`) | off | bench | **confirmed off.** No `mimalloc` dependency is added; the zero-alloc test (`crates/mev-engine/tests/zero_alloc.rs`) passes on the system allocator. **deferred — needs reference host (SPEC-0008 V-4).** Experiment: add `mimalloc` as a temporary global allocator, bench `bbo_to_action`/`replay_throughput`/`drain_1000`; adopt only on a measured win. |
+| `TCP_NODELAY` on every exec and market socket | **on** | always | **decided and verified (E-6).** `set_tcp_nodelay` (`crates/mev-hl-client/src/raw_ws.rs:375`) is applied to the market `RawWsConn` (`raw_ws.rs:387`) and the exec `WsExchange` (`crates/mev-hl-client/src/ws_exchange.rs:167`); a loopback test asserts `nodelay()` is set (`raw_ws.rs:547`). Always on; no host decision needed. |
+| Warm standby exec connection (fail over without a handshake) | off | measured reconnect gap | **deferred — needs reference host (SPEC-0008 V-4).** Experiment: force-drop the exec socket and measure the reconnect gap (TCP + TLS + H-1 auth/handshake) over many samples; enable a warm standby only if that gap threatens the order path under the measured p99. |
+| `lto = "fat"` for release | **fat** (was `thin`) | bench | **set to `fat` in the workspace `[profile.release]`** (`Cargo.toml`): small workspace, acceptable link time, `codegen-units = 1` and `panic = "abort"` retained. **Final choice deferred — needs reference host (SPEC-0008 V-4):** bench `bbo_to_action`/`replay_throughput` thin vs fat (and note binary size / link time); revert to `thin` if the latency gain does not justify the build cost. |
+| Fixed-point `Px`/`Sz` (E-11) | off | E-10 results | **off — E-11 not triggered.** E-10 measured `bbo_to_action` p50 ~34.6 µs / p99 ~38.5 µs (quick, dev), far under the G-2 budget of 100 µs / 1 ms (§21), so the decode/eval cost does not justify fixed-point. Cross-reference §23 Q-Decode-Alloc; revisit only if a reference-host run breaches the budget. |
+
+**CI quick mode (E-12 check).** The `MEV_BENCH_QUICK=1` path is documented in the
+bench file header (`crates/mev-bot/benches/engine.rs:14-27`), so no follow-up is
+needed.
+
+**Config surface (E-12 note).** No `[engine]` section is added to
+`config/default.toml`: `mev-core::Config` has no engine fields and nothing
+consumes `spin_us`/`pin_core` yet, so a config default there would be inert. The
+surface is exposed with the E-13 wiring of the v2 loop into `hl`.
 
 ## 19. Configuration
 
@@ -356,8 +369,8 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 | E-8 | Account stream + reconciler integration; delete `account_poller` | M | E-5, SPEC-0002 H-3 | 🔄 |
 | E-9 | Hot-path risk integration (§11) with SPEC-0004 K-tasks | M | E-5, SPEC-0004 K-1, K-2, K-3 | ✅ |
 | E-10 | Latency stamps, histograms, benches incl. zero-alloc (§17) | M | E-6 | ✅ |
-| E-11 | Fixed-point `Px`/`Sz` (**only if** E-10 shows decode/eval over budget) | L | E-10 | ☐ |
-| E-12 | Performance checklist (§18), results recorded | M | E-10 | ☐ |
+| E-11 | Fixed-point `Px`/`Sz` (**only if** E-10 shows decode/eval over budget) | L | E-10 | ✅ |
+| E-12 | Performance checklist (§18), results recorded | M | E-10 | ✅ |
 | E-13 | Remove the tick engine; update SPEC-0003 status; update RUNBOOK | S | E-4, E-6, E-7, E-8 | ☐ |
 
 ### Task details
@@ -428,9 +441,40 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 
 **E-11 — Fixed-point (conditional).** `Px(i64)`/`Sz(i64)` with per-asset scale; parse from strings directly; convert to `Decimal` at the persistence/display edges. *Done when:* property tests show round-trip exactness vs `Decimal` for all assets in `AssetMap`, and benches show the gain (else revert and record why).
 
+**E-11 not triggered (2026-09-26).** The task is conditional ("**only if** E-10 shows decode/eval over budget"). E-10 measured `bbo_to_action` p50 ~34.6 µs / p99 ~38.5 µs (quick, dev) — comfortably inside the G-2 budget (≤100 µs / ≤1 ms) — so the decode/eval cost does not justify fixed-point. Decision recorded in §18 and cross-referenced by §23 Q-Decode-Alloc; revisit only if a reference-host (§21) run breaches the budget. No code changed.
+
 **E-12 — Performance checklist.** Measure each §18 item on the reference host. Keep only what helps. *Done when:* §21 has a before/after table, and the chosen defaults are in `config/default.toml`.
 
 **E-13 — Cleanup.** Remove the tick engine and its `RwLock` plumbing; update SPEC-0003 §16, `RUNBOOK.md`, and `AGENTS.md`'s repo map. *Done when:* `grep -r "interval(Duration::from_secs(1))" crates/mev-bot` finds no decision loop, and all tests pass.
+
+**E-13 blocked (2026-09-27) — do not remove any code yet.**
+
+*What E-13 requires.* Delete the legacy tick engine `crates/mev-bot/src/engine.rs` (all ~1606 lines: `Engine`/`EngineBuild`/`build`, `Engine::run`/`step`, the `interval(Duration::from_secs(1))` decision tick, the `AccountView`/`MarketView` clone-per-tick `step`, the `Recorder`/`replay` paths, and the `Arc<RwLock<MarketState>>` plumbing), move `mev-bot`'s orchestration onto the v2 `mev_engine::EngineLoop`, then update SPEC-0003 §16 / `RUNBOOK.md` / `AGENTS.md`. Its done-when is `grep -r "interval(Duration::from_secs(1))" crates/mev-bot` finds no **decision loop**, plus all tests pass.
+
+*Why it cannot be done now.* `mev-bot` still runs the legacy engine as its only trading path:
+- `crates/mev-bot/src/main.rs:14` (`mod engine;`), `:298` (`engine::build`), `:335-361` (`engine::Engine::new` + `tokio::spawn(engine.run(...))`), `:348-355` (`engine::account_reconciler`), and `:838` (`engine::replay`). `mev-bot` depends on `mev-engine` (Cargo.toml:26) only *through* `engine.rs` (`use mev_engine::{…}` at `engine.rs:13,72,95,117,120,1480`), which drives the E-4 `Strategy` v2 trait synchronously.
+- `crates/mev-bot/src/engine.rs:386` (`pub async fn run`) is the decision loop; `:391` is `tokio::time::interval(Duration::from_secs(1))`; `:400` (`async fn step`) clones `MarketView`/`AccountView` every tick under `RwLock`.
+- Deleting `engine.rs` leaves `main.rs` with no implementation of its `run`/`replay` commands and no consumer of the v2 `Strategy` trait — the binary would not compile. So the code removal is blocked until the v2 engine *replaces* it in `mev-bot`.
+
+The v2 engine cannot yet replace it:
+- **E-8 part 1 only, and not loop-driven.** `mev-engine/src/reconcile.rs` and `state.rs` are a tested library (E-8 note above), but the v2 `EngineLoop` (`mev-engine/src/run.rs:69`) does not own a `Reconciler`/`AccountStreamState` — it routes account updates through the E-3 `Dispatcher` seam (`run.rs:23-35`) and does not enforce the account-gap halt on the v2 place path. `mev-bot` is currently the *only* consumer of `Reconciler` (via `main.rs:348`).
+- **E-5's dispatch replacement is outstanding.** `EngineLoop` still uses the E-3 `Dispatcher` seam; per-strategy dispatch built from `interests()` (E-5) has not landed, so the loop has no real strategy consumer to take over from `engine.rs` (also §23 Q-Loop-Instrumentation).
+- **E-6 / E-7 are part-1 only.** E-6 keeps signing in the exec layer and drops `Action::Modify` (`batchModify` unverified, E-6 open item 2), so `MarketMaker` can still not re-quote on the new engine; E-7's recorder-segment replay half is blocked on SPEC-0008 R-7, and only the SQLite-log replay in the legacy `engine.rs` exists.
+- Consequence: E-13's dependencies E-6, E-7, E-8 are 🔄 (part 1), not ✅, so per AGENTS.md §4/§5 E-13 may not start.
+
+*Unblock checklist (ordered).*
+1. **E-5** — replace the `Dispatcher` seam in `run.rs` with per-strategy dispatch built from `interests()`, and give `EngineLoop` the `OrderManager` (already in `orders.rs`) as its consumer. This is the prerequisite for E-13.
+2. **E-8 part 2** — move the `Reconciler` + `AccountStreamState` (reconcile.rs/state.rs) under `EngineLoop`: the loop owns the H-3 account consumers, the §15 reconcile cadence, and the account-gap halt on the place path.
+3. Wire the **risk gate** (`risk.rs`, E-9) and the **exec backend** (`exec.rs` `ExecBackend`/`WsExec`; `paper_exec.rs` for `simulate`) into the loop, plus the E-10 `LatencyRecorder`/`Stamps` hooks (§23 Q-Loop-Instrumentation) — the current `main.rs` risk/halt/reconciler wiring (`main.rs:335-390`) moves here.
+4. **Build orchestration on the loop.** In `mev-bot/src/main.rs`, replace `engine::build`/`Engine::new`/`engine.run` (`main.rs:298,335-361`), the `engine`-based reconcile task (`main.rs:348-355`), and `engine::replay` (`main.rs:838`) with `mev_engine` entry points; remove `mod engine;` (`main.rs:14`).
+5. **Delete** `crates/mev-bot/src/engine.rs` and the `Arc<RwLock<MarketState>>` plumbing it exists to feed.
+6. **Docs.** Update SPEC-0003 §16, `RUNBOOK.md`, and the `AGENTS.md` §3 repo map (exact list below).
+7. Verify `grep -r "interval(Duration::from_secs(1))" crates/mev-bot` finds no **decision loop** (the `:595` monitor and `:488` dead-man intervals are not decision loops; confirm each remaining hit is not a trading decision), then run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
+
+*Doc edits E-13 will need once unblocked (not made now).*
+- **SPEC-0003 §16** (`specs/SPEC-0003-strategy-engine.md:147`): retarget "the tick engine is deleted in E-13" from `mev-bot/src/engine.rs` to `mev-engine`; also revisit `:151` (`paper.rs` "fills only on the tick" → `PaperExec`, §14), `:153` (recording moves off `engine.rs::Recorder`), `:154` (replay moves off `engine.rs::replay_events`).
+- **RUNBOOK.md**: `:80` ("refreshed on a 1s heartbeat"), `:102` (`hl panic` _(pending)_ — the CLI has no `panic` command; see `main.rs:47`), and `:125-141` ("Replay a recorded session" — "the 1 s decision tick" and the `engine.rs` SQLite `events` replay path).
+- **AGENTS.md §3**: the `crates/mev-bot` row ("`src/engine.rs` is the legacy tick engine (being replaced per SPEC-0010 …)") becomes misleading once it is deleted; drop the clause.
 
 ## 21. Measured results (filled in by E-10 / E-12)
 
@@ -444,7 +488,14 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 | `hl_submit_ack_seconds` p50 (live, testnet) | minimize | — (needs testnet) | | |
 | `drain_1000` (1000 events → 1 decision/dirty coin) | — | ~45.8 µs/drain | dev | 2026-09-26 |
 
-These are dev-host quick-mode numbers, **not** the reference production host (SPEC-0008 V-4); E-12 re-measures on the reference host and records the before/after.
+These are dev-host quick-mode numbers, **not** the reference production host
+(SPEC-0008 V-4); E-12 re-measures on the reference host and records the
+before/after. They were measured under the pre-E-12 `[profile.release]`
+(`lto = "thin"`); E-12 changed the workspace profile to `lto = "fat"`, so the
+`bbo_to_action` / `replay_throughput` / `drain_1000` rows above are **not**
+directly comparable to a `fat` build and must be re-benched on the reference
+host for both profiles (§18, §23 Q-E12-Reference-Host). The `hl_submit_ack_seconds`
+row additionally needs a testnet round-trip; no host row is fabricated here.
 
 ## 22. Acceptance criteria
 
@@ -468,3 +519,5 @@ These are dev-host quick-mode numbers, **not** the reference production host (SP
 8. **Q-Group-Risk (E-9).** SPEC-0004 K-2's group-worst-single-leg exposure rule and the SPEC-0011 `on_kill` residual path need the multi-leg group types, which do not exist yet; `RiskGate` returns `GroupUnsupported` for `Action::PlaceGroup`. Implement with SPEC-0011 L-tasks.
 9. **Q-Decode-Alloc (E-10).** The engine-side `Bbo` apply is 0 alloc/event (G-3 satisfied for the apply path), but `Ingest::decode` allocates 1×/event: `decode_market` pre-parses a borrowed channel tag, and `serde_json`'s ignored-value handling allocates once for the nested `data` shape. Fix by dispatching from one typed borrowed envelope or scanning the tag without `serde_json`. Also `replay_throughput` is ~649 k events/s (vs ≥1 M); both are E-12/E-11 inputs.
 10. **Q-Loop-Instrumentation (E-10/E-12).** `run.rs` does not yet own a `LatencyRecorder` or fill `Stamps`; the hooks exist in `instrument.rs`. Wire them when E-5's per-strategy dispatch replaces the `Dispatcher` seam (E-13).
+11. **Q-E12-Reference-Host (E-12).** No production/reference host (SPEC-0008 V-4) exists yet, so the following are decided but unmeasured here and wait on it. **§18 rows:** (a) `core_affinity` pinning — bench p99 with/without + VPS steal time; (b) `spin_us` sweep 0/20/50/100/250 µs, p99 vs CPU%; (c) `mimalloc` — bench hot-path vs system allocator; (d) warm standby exec — measure forced-drop reconnect gap; (e) thin-vs-fat LTO — bench `bbo_to_action`/`replay_throughput`. **§21 rows:** all dev-host rows (`bbo_to_action`, handoff, sign, allocations/event, replay throughput, `drain_1000`) must be re-measured on the reference host under `lto = "fat"`; `hl_submit_ack_seconds` needs a testnet round-trip. Run the same criterion benches from `crates/mev-bot/benches/engine.rs` (and `mev-engine/tests/zero_alloc.rs`) on that host and fill the before/after table.
+11. **Q-E13-Unblock (E-13).** E-13 (delete the legacy tick engine `mev-bot/src/engine.rs`, retarget `mev-bot` onto `mev-engine::EngineLoop`, update SPEC-0003 §16 / `RUNBOOK.md` / `AGENTS.md`) is **blocked** because the v2 engine cannot yet replace the legacy engine in the binary: E-8 (reconciler/account-stream) and E-6/E-7 are part-1 only, and E-5's "per-strategy dispatch replaces the `Dispatcher` seam" is outstanding. `mev-bot` remains the sole consumer of the `Reconciler` and of the v2 `Strategy` trait (through `engine.rs`). Deleting `engine.rs` now breaks the binary. Sequence E-5 → E-8 part 2 → loop risk/exec/instrument wiring before E-13; the full unblock checklist and the exact pending doc edits are in the E-13 task-detail note (§20).

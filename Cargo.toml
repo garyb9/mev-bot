@@ -59,6 +59,10 @@ metrics-exporter-prometheus = "0.16"
 axum = "0.8"
 
 [profile.release]
-lto = "thin"
+# Fat LTO: the workspace is small and its release artifact is the latency-
+# critical production binary, so the extra link time is acceptable. E-12 set
+# this (was `thin`); the final thin-vs-fat choice is gated by a reference-host
+# bench (SPEC-0010 §18/§23 Q-E12-Reference-Host).
+lto = "fat"
 codegen-units = 1
 panic = "abort"
