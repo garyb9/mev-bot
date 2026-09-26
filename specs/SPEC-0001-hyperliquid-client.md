@@ -53,6 +53,24 @@ Per IP (from official docs):
 - Respect the coin naming split: perps by name (`BTC`), HIP-3 by `dex:coin` (`xyz:XYZ100`), spot by `@index` or `PURR/USDC`.
 - Rounding of prices/sizes to tick/lot is enforced in SPEC-0002 (the order builder), using this metadata.
 
+### Market selection, watchlist & CLI
+
+- Default watchlist = a small set of bluechips: perps `BTC`, `ETH`, `SOL` (extensible). Spot legs are resolved to their L1 names at runtime (e.g. mainnet `UBTC/USDC` for BTC) — never hardcoded.
+- The watchlist is a first-class, persisted config object, overridable per run via CLI. Adding markets later is data, not code.
+- A `MarketSelector` validates each coin against `meta`/`spotMeta` (name, index, `szDecimals`) before any subscription is created; unknown/remapped coins fail fast with a clear error.
+- CLI subcommands (read commands require no keys):
+
+| Command | Purpose |
+|---|---|
+| `markets [--perp\|--spot] [--search <q>]` | list/search markets from `meta`/`spotMeta` |
+| `book <coin> [--levels N]` | live top-of-book / mid snapshot |
+| `watch <coin...>` | stream book/bbo/trades/ctx for selected coins |
+| `select <coin...>` / `select --add\|--remove` | edit and persist the watchlist |
+| `run [--mode observe\|simulate\|live] [--coins ...]` | launch the bot with the watchlist (CLI override optional) |
+| `config show` | print resolved config with secrets redacted |
+
+`run` defaults to `observe`. This delivers the "pick pairs → search → select → launch" flow.
+
 ## 7. Subscriptions & local state
 
 Streams consumed (subset per active strategy):
@@ -80,7 +98,7 @@ Streams consumed (subset per active strategy):
 
 - One supervisor owning a pool of ≤10 WS connections; subscriptions are distributed to stay within limits and to isolate critical feeds.
 - **Reconnect:** on close/error, exponential backoff with jitter; on reconnect, re-subscribe and treat the first message per channel as the authoritative snapshot. Missed data is recovered from the snapshot ack and, where required, a targeted `/info` reconciliation.
-- **Heartbeat:** send an application-level `ping` periodically (target ≤50 s) and verify behavior against a live connection; drop and reconnect if a `pong` is not observed. (Exact server idle/close window to be confirmed empirically and recorded.)
+- **Heartbeat:** send an application-level `ping` every **30 s** and expect a `pong`; a missed pong triggers reconnect. Additionally, a **data watchdog** reconnects if a subscribed feed receives nothing for its tolerance window. Confirm the server's exact idle-close window against a live connection and record it in the decision log.
 - **Backpressure:** decode on the I/O task but publish through a bounded channel; if a consumer lags, drop the oldest market-data message (never block the socket). Account/execution feeds are lossless and use a separate channel.
 - No `unwrap` on socket/parse paths; malformed frames are counted and skipped, not fatal.
 
@@ -116,7 +134,7 @@ pub trait MarketStream {
 |---|---|---|
 | A | `hyperliquid_rust_sdk` 0.6 | Official; pulls deprecated `ethers 2.x` + `tokio-tungstenite 0.20` |
 | B | `mev-hl-client` custom | Alloy + `fastwebsockets` + `rmp-serde` |
-| C | Alloy-native community SDK | e.g. `hypersdk`; included unless dropped (SPEC-0000 open question 4) |
+| C | Alloy-native community SDK | e.g. `hypersdk`; **optional, time-boxed** — only pursued if the custom path stalls |
 
 **Method (`criterion` + a WS load harness, fixed hardware, ≥3 runs)**
 
@@ -151,9 +169,11 @@ Metrics: msgs/sec per channel, decode latency histogram, book staleness seconds,
 - `/readyz` flips to not-ready when a feed goes stale, and recovers.
 - Benchmark report produced; default backend chosen and documented in the decision record.
 
-## 14. Open questions
+## 14. Resolved decisions
 
-1. Default subscription set for the funding/basis strategy (which coins, which channels).
-2. `fastAssetCtxs` vs `activeAssetCtx` as the primary mark/funding source (latency vs completeness).
-3. Confirm heartbeat/idle-close interval empirically and record it.
-4. Keep community SDK (candidate C) in the benchmark, or custom-vs-official only.
+1. **Watchlist** — start with bluechips (`BTC`, `ETH`, `SOL`) and a persisted, CLI-editable watchlist; adding markets later is data-only. CLI supports list/search/select/watch/run (`observe` default).
+2. **Mark/funding source** — `activeAssetCtx` is the primary source of truth (it carries funding); `fastAssetCtxs` is an optional latency supplement for mark/mid only, added later if measured lag justifies it.
+3. **Heartbeat** — 30 s application ping + pong check, plus a per-feed data watchdog; record the observed server idle-close window in the decision log.
+4. **Benchmark candidates** — custom vs official is the core comparison; the Alloy-native community SDK is an optional, time-boxed third candidate.
+
+Remaining to verify empirically (no open product question): exact server idle-close interval and the `fastAssetCtxs` lag delta.
