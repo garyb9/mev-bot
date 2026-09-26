@@ -1,7 +1,7 @@
 # SPEC-0008 — Market-Data Recorder & Opportunity Research
 
 **Status:** Draft
-**Milestone:** M3 (see [`docs/GOAL.md`](../docs/GOAL.md) §6). Runs in parallel with M2.5 and comes **before** the funding pilot (M4).
+**Milestone:** M3 (see [`docs/GOAL.md`](../docs/GOAL.md) §7). Runs in parallel with M2.5 and comes **before** the funding pilot (M4).
 **Depends on:** SPEC-0000, SPEC-0001 (market data client). Execution (SPEC-0002) is **not** required.
 **Blocks:** ADR-0002 (which arb to build), SPEC-0009 (first arb strategy), and the go/no-go for SPEC-0003 (B) and SPEC-0005.
 
@@ -452,7 +452,7 @@ Per episode, record:
 
 ### 13.4 Latency grid
 
-Every latency-sensitive number is reported for **L ∈ {10, 50, 100, 250, 500, 1000} ms**. `L` is the time from the first data that reveals the episode to our orders arriving at the venue. The **headline** latency is **L = 250 ms** until V-4 and M2.5 measurements replace it with measured values.
+Every latency-sensitive number is reported for **L ∈ {10, 50, 100, 250, 500, 1000} ms**. `L` is the time from the first data that reveals the episode to our orders arriving at the venue. The **headline** latency is **L = 250 ms** until measurements replace it: network RTT from V-4 plus internal tick-to-order from SPEC-0002 H-7 ([`docs/GOAL.md`](../docs/GOAL.md) §5.2). Because speed is a project priority, every report also states the **minimum latency at which the study still passes** (the "latency requirement").
 
 ### 13.5 Study metrics (same columns in every report)
 
@@ -469,6 +469,7 @@ Every latency-sensitive number is reported for **L ∈ {10, 50, 100, 250, 500, 1
 | `apr_L` | `usd_per_day_L × 365 / capital_usd` |
 | `concentration` | Share of total PnL from the single best day (robustness; > 50% is a red flag) |
 | `competition_hint` | p50 duration < 100 ms ⇒ "latency-competitive"; > 2 s ⇒ "slow / capacity-bound" |
+| `latency_requirement_ms` | Largest `L` in the grid at which the study still passes §13.6 (or "none"). Tells us how fast we must be. |
 
 ### 13.6 Scoring and the go/no-go rule
 
@@ -753,7 +754,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 
 #### D-1 — Decision
 - **Do:** Regenerate `RANKING.md`. Write `specs/decisions/0002-first-arb-strategy.md` (context, the ranking table, the decision, capital and hurdle as set by the owner, rejected alternatives with one-line reasons, consequences for M5/M6/M7). If a study passes, create a `specs/SPEC-0009-<name>.md` stub with Purpose / Goals / Legging model / Open questions filled from the report. **The owner approves ADR-0002; an agent only drafts it.**
-- **Done when:** ADR-0002 is drafted and marked "Proposed", and `docs/GOAL.md` §6 is updated to match.
+- **Done when:** ADR-0002 is drafted and marked "Proposed", and `docs/GOAL.md` §7 is updated to match.
 
 ## 15. Verified facts (filled in by V-tasks)
 

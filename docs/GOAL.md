@@ -5,9 +5,15 @@
 
 ## 1. The goal in one sentence
 
-Build an **automated arbitrage / MEV-style trading system for Hyperliquid**
-(HyperCore first, HyperEVM where it pays) where **every strategy that trades
-real money is justified by edge measured from recorded data, net of all costs**.
+Build a **fast, automated arbitrage / MEV-style trading system for
+Hyperliquid** (HyperCore first, HyperEVM where it pays). It must be **as low
+latency as we can make it**, and **every strategy that trades real money must
+be justified by edge measured from recorded data, net of all costs**.
+
+In arbitrage, speed decides who captures the edge. When two designs are
+equally correct and equally safe, **choose the faster one**. Speed never
+overrides correctness or safety (§4), but it outranks convenience, elegance,
+and dependency preferences.
 
 ## 2. What "MEV / arb on Hyperliquid" actually means
 
@@ -35,6 +41,8 @@ preference.
 |---|---|---|
 | North star | Net realized PnL after fees, funding, gas, and slippage | Positive, and above the ADR-0002 hurdle (set by the owner) |
 | Evidence | Every live strategy has a research report showing net-positive edge at a realistic latency | 100% of live strategies |
+| **Speed** | Internal tick-to-order latency (frame read → order bytes written to the socket) | p50 ≤ 100 µs, p99 ≤ 1 ms (see §5) |
+| **Speed** | Network path: order sent → venue acknowledgement | As low as the best measured host allows; tracked per release, never allowed to regress |
 | Safety | Loss-of-funds incidents caused by bugs (wrong size, stuck orders, runaway loops) | **Zero** |
 | Safety | Orders sent without passing the risk engine | **Zero** |
 | Operability | Recorder and bot uptime; feed staleness | ≥ 99% of time with fresh feeds |
@@ -57,17 +65,55 @@ recorded in `specs/decisions/0002-*.md` once SPEC-0008 finishes.
    `f64`. (Research code in `research/` may use floats.)
 6. **Record everything.** Raw market data and every decision/order/fill are
    persisted, so any result can be replayed and audited.
-7. **Measure latency; don't assume it.** Report latency-sensitive results at
-   several latency assumptions.
+7. **Latency is a feature, and it is measured.** Every hot-path change comes
+   with a benchmark or a latency metric, and a regression is treated as a
+   bug. Research reports results at several latency assumptions; production
+   reports measured latency. See §5.
 
-## 5. Non-goals
+## 5. Latency first
+
+### 5.1 Hot-path rules
+
+The **hot path** is everything between "a market-data frame arrives" and
+"order bytes are written to the socket": decode → state update → strategy →
+risk check → order build → sign → send.
+
+| Rule | Why |
+|---|---|
+| No disk I/O, database writes, or blocking calls on the hot path. Hand persistence and logging to background tasks over bounded channels (drop, never block). | A single `fsync` or lock wait costs more than the entire compute budget |
+| No `tracing` at INFO or above per event on the hot path; use counters/histograms and sampled DEBUG logs | Formatting and I/O are slow |
+| Avoid allocation per event: reuse buffers, prefer fixed-size types and pre-sized collections | The allocator causes tail latency |
+| No `Mutex` held across `.await` on the hot path; one owner per piece of state (single-threaded engine / actor) | Lock contention causes p99 spikes |
+| Keep connections persistent, warm, and pre-authenticated; no connecting on demand | A TCP/TLS handshake costs milliseconds |
+| Allow many in-flight order requests on WS `post` (never one at a time) | Serializing sends queues orders behind each other |
+| Pre-compute whatever can be pre-computed (asset ids, rounding rules, signer state) | Moves work off the critical moment |
+| Decode only what the strategy needs; skip or lazily parse the rest | Decode is the largest compute cost (ADR-0001) |
+| Deploy close to the venue (region chosen by measurement, SPEC-0008 V-4). Consider running our own node if it gives faster data. | Network distance dominates everything else |
+| The recorder and research tooling run as **separate processes** and never share the trading hot path | Research must never slow down trading |
+
+### 5.2 Latency budget (initial targets; refine by measurement)
+
+| Stage | Target p50 | Target p99 | Measured by |
+|---|---|---|---|
+| WS frame → decoded event | ≤ 20 µs | ≤ 100 µs | `decode` bench + runtime histogram |
+| State update + strategy decision | ≤ 30 µs | ≤ 200 µs | runtime histogram |
+| Risk check | ≤ 10 µs | ≤ 50 µs | unit bench + runtime histogram |
+| Order build + msgpack + EIP-712 sign | ≤ 150 µs | ≤ 500 µs | `sign` bench + runtime histogram |
+| Write to socket | ≤ 20 µs | ≤ 100 µs | runtime histogram |
+| **Total internal tick-to-order** | **≤ 100–250 µs** | **≤ 1 ms** | end-to-end span |
+| Network RTT to the venue | minimize | — | `hl probe latency`, per region |
+
+When a target is missed, either make it faster or update this table with a
+written reason (in the same commit).
+
+## 6. Non-goals
 
 - Ethereum mainnet MEV (retired; see `legacy/`).
 - Sandwiching or anything that harms retail users by front-running their orders.
 - Polymarket (parked, SPEC-0007).
 - Building a strategy because it is interesting rather than because data says it pays.
 
-## 6. Roadmap
+## 7. Roadmap
 
 Spec numbers are **stable identifiers, not an order**. This table is the order.
 
@@ -76,7 +122,7 @@ Spec numbers are **stable identifiers, not an order**. This table is the order.
 | M0 | Platform: config, modes, observability, CI | SPEC-0000 | ✅ done | — |
 | M1 | HyperCore market data client, local state, benchmark | SPEC-0001, ADR-0001 | ✅ done | M0 |
 | M2 | Execution: signing, nonce, order builder, transports, dead-man switch | SPEC-0002 | ✅ done (testnet round-trip open) | M1 |
-| M2.5 | **Execution hardening**: concurrent WS post, account stream, mandatory `cloid`, dead-man policy, stream watchdog | SPEC-0002 §17 | ⏳ next | M2 |
+| M2.5 | **Execution hardening + latency baseline**: concurrent WS post, account stream, mandatory `cloid`, dead-man policy, stream watchdog, tick-to-order instrumentation, sign/submit benchmarks | SPEC-0002 §17 | ⏳ next | M2 |
 | **M3** | **Market-data recorder + opportunity research → ADR-0002** | **SPEC-0008** | ⏳ **now** (runs in parallel with M2.5) | M1 |
 | M4 | Engine + risk + persistence; **funding-carry pilot** at small size | SPEC-0003 (A), SPEC-0004 | planned | M2.5, M3 recorder |
 | M5 | **First arb strategy**, the one chosen by ADR-0002 | SPEC-0009 (written after ADR-0002) | planned | M3 gate, M4 |
@@ -88,7 +134,7 @@ Spec numbers are **stable identifiers, not an order**. This table is the order.
 calendar time. Every day the recorder isn't running is a day of evidence lost.
 The recorder depends only on M1 (market data), so it can start immediately.
 
-## 7. What to work on right now
+## 8. What to work on right now
 
 1. **SPEC-0008 Phase V and Phase R.** Verify facts, then build the recorder
    and deploy it to a low-latency host.
@@ -96,15 +142,15 @@ The recorder depends only on M1 (market data), so it can start immediately.
 3. Then SPEC-0008 Phases P and S (research toolkit and studies), which end in
    ADR-0002.
 
-## 8. Decision gates
+## 9. Decision gates
 
 | Gate | Question | Evidence required | Recorded in |
 |---|---|---|---|
 | G1 (end of M3) | Which arb do we build first, or none? | SPEC-0008 study reports + `RANKING.md` covering ≥ 14 days of data | ADR-0002 |
-| G2 (before any `live`) | Is the stack safe with real money? | Testnet round-trip, kill-switch drill, risk property tests, pilot in `simulate` | SPEC-0004/0006 checklists |
+| G2 (before any `live`) | Is the stack safe **and fast** with real money? | Testnet round-trip, kill-switch drill, risk property tests, pilot in `simulate`, measured tick-to-order within the §5.2 budget | SPEC-0004/0006 checklists |
 | G3 (before scaling size) | Does realized edge match researched edge? | ≥ 7 days live at small size; realized vs expected within tolerance | Strategy spec |
 
-## 9. Glossary
+## 10. Glossary
 
 | Term | Meaning |
 |---|---|

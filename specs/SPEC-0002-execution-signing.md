@@ -1,6 +1,6 @@
 # SPEC-0002 — Execution, Signing & Account
 
-**Status:** Implemented (M2) — open item: live testnet round-trip (gated on a funded, agent-approved testnet account)
+**Status:** Implemented (M2) — open item: live testnet round-trip (gated on a funded, agent-approved testnet account). M2.5 hardening follow-ups: §17.
 **Depends on:** SPEC-0000, SPEC-0001
 **Blocks:** SPEC-0003 (strategy), SPEC-0004 (risk)
 
@@ -171,7 +171,7 @@ Metrics: submit latency histogram (by transport), order rejects by status, nonce
 - [ ] **OPEN** — Testnet order round-trip succeeds end-to-end; no nonce reuse observed. Blocked on a funded, agent-approved testnet account; the path is wired and mock-tested only.
 - [x] Local rounding rejects invalid orders before any network call.
 - [x] `observe` mode makes zero `/exchange` requests.
-- [ ] Sub-10 ms p50 (local) for build+sign of a single order on the reference machine (target, measured in SPEC-0001 harness).
+- [ ] Build + msgpack + sign of a single order within the [`docs/GOAL.md`](../docs/GOAL.md) §5.2 budget (p50 ≤ 150 µs, p99 ≤ 500 µs) on the reference machine (task H-7). *(Supersedes the original 10 ms target.)*
 
 ## 16. Resolved decisions
 
@@ -179,3 +179,44 @@ Metrics: submit latency histogram (by transport), order rejects by status, nonce
 2. **Agent provisioning** — enroll the agent via the Hyperliquid UI so the master key stays off-host; an optional guided one-time CLI command supports later re-approvals without persisting the master key.
 3. **Autonomy** — engine-driven by default (`HL_AUTONOMY=auto`); `confirm` mode exists for supervised runs.
 4. **Dead-man's switch** — armed by default in `live` via `scheduleCancel`, TTL `HL_SCHEDULE_CANCEL_TTL_MS` (default 30s), refreshed on heartbeat, disarmed on graceful shutdown.
+
+## 17. Follow-ups — M2.5 execution hardening + latency baseline
+
+Found in the post-M2 review (2026-09-26). These must land before any strategy trades (M4), and they sit on the latency hot path, so [`docs/GOAL.md`](../docs/GOAL.md) §5 applies to every one. Format and rules match SPEC-0008 §0 and §14: do the tasks in dependency order, tick the status in the same commit as the code, and write ambiguities into §18 instead of guessing.
+
+| ID | Title | Size | Depends on | Status |
+|---|---|---|---|---|
+| H-1 | Concurrent WS `post` (reader task + pending map) | M | — | ☐ |
+| H-2 | Mandatory `cloid` + unknown-outcome reconciliation | M | H-1 | ☐ |
+| H-3 | Account stream (`orderUpdates`, `userFills`, `userEvents`) | M | SPEC-0008 R-3 | ☐ |
+| H-4 | Dead-man's switch policy (arm only when needed; fail closed) | S | H-1 | ☐ |
+| H-5 | Apply `bbo` to `MarketState` | S | — | ☐ |
+| H-6 | Nonce persistence off the hot path | S | H-9 | ☐ |
+| H-7 | Latency instrumentation + sign/submit benchmarks | M | H-1 | ☐ |
+| H-8 | `simulate` without keys (ephemeral signer) | S | — | ☐ |
+| H-9 | Verify the HL nonce and `scheduleCancel` rules | S | — | ☐ |
+| H-10 | Testnet round-trip (the open §15 item) | S | H-1, H-2, owner-provided testnet key | ☐ |
+
+**H-1 — Concurrent WS `post`.** Today `WsExchange::post` holds the socket mutex while it waits for the reply, so only one request is ever in flight. Replace this with: one writer handle (a channel into a socket-owning task); one reader task that routes `channel:"post"` replies by `id` to a `HashMap<u64, oneshot::Sender>`; a semaphore capping in-flight posts at 100 (the venue limit); a per-request timeout (default 5 s) that returns a typed `Error::UnknownOutcome`. On socket loss, fail every pending request with `UnknownOutcome`, reconnect (reuse `RawWsConn` from SPEC-0008 R-3 once it exists), and keep the connection warm with app-level pings. *Done when:* a mock-venue test sends 50 concurrent orders with shuffled reply order and each caller gets its own reply; a dropped socket fails pending calls with `UnknownOutcome`; the dead-man refresh no longer blocks order sends.
+
+**H-2 — Mandatory `cloid` + reconciliation.** Every order gets a `cloid` (generate a 16-byte id from a per-process random prefix + counter when the caller doesn't supply one). On `UnknownOutcome`, query `orderStatus` by `cloid` (⚠ verify that `orderStatus` accepts a cloid; H-9) and resolve to resting/filled/rejected/not-found. **Never** resend an order without doing this first. *Done when:* `wiremock`/mock-WS tests cover each resolution, and there is no code path that retries an order blindly.
+
+**H-3 — Account stream.** Add `Subscription::{OrderUpdates, UserFills, UserEvents}{user}` and typed `StreamEvent` variants. Handle the `isSnapshot` first message of `userFills`. These go on a **separate, lossless** channel from market data (SPEC-0001 §8), and on reconnect the snapshot resyncs state. *Done when:* golden-fixture decode tests pass for every channel (fixtures captured from testnet or the docs), and a reconnect test shows the snapshot applied.
+
+**H-4 — Dead-man's switch policy.** (a) Arm only while at least one resting order exists, and disarm when none remain; each `scheduleCancel` spends address rate-limit budget (a 30 s TTL refreshed every 15 s is ~5.8k requests/day against a 10k + 1-per-USDC-traded budget). (b) Default TTL 120 s, refreshed at half the TTL. (c) If arming or refreshing fails, set a sticky **trading-halt** flag that the risk engine reads (fail closed); today the task logs and returns while live continues. (d) Expose remaining address budget by polling `userRateLimit` every 60 s as a metric. *Done when:* unit tests cover arm/disarm on the resting-order count and halt on failure.
+
+**H-5 — `bbo` into `MarketState`.** `MarketState::apply` currently ignores `StreamEvent::Bbo`. Store the latest BBO per coin with its receive time, and expose `best_bid/ask` that prefer the fresher of `bbo` and the `l2Book` top. Subscribe `bbo` for watchlist coins in `ingest`. *Done when:* tests show that the fresher source wins.
+
+**H-6 — Nonce persistence off the hot path.** `WriteCore::prepare` currently writes the nonce to SQLite synchronously before every send. Once H-9 confirms the nonce rule, move persistence to write-behind (via `DbWriter`, at most once per second), relying on `max(now_ms, restored + 1)` + the future-drift guard for crash safety. Document the argument in §5. *Done when:* a restart test (kill before the write-behind flush) still never produces a nonce ≤ any previously sent nonce under a monotonic clock; H-7 shows the latency drop.
+
+**H-7 — Latency instrumentation + benchmarks.** Add histograms for each [`docs/GOAL.md`](../docs/GOAL.md) §5.2 stage (`hl_decode_seconds`, `hl_sign_seconds`, `hl_submit_ack_seconds{transport}`, `hl_tick_to_order_seconds`) using a cheap monotonic clock. Add a criterion bench `benches/sign.rs` (build + msgpack + EIP-712 sign of one order and a batch of 10) and a mock-WS `post` round-trip bench. Record results in ADR-0001's "Not yet measured" section. *Done when:* the benches run in CI quick mode and the numbers are recorded.
+
+**H-8 — `simulate` without keys.** SPEC-0000 §6 says `simulate` needs no keys, but `WriteCore::new` rejects `DryRun` without a signer. In `simulate` with no key, generate an ephemeral random signer (never persisted, logged as such). *Done when:* `hl run --mode simulate` starts with no key, and a test covers it.
+
+**H-9 — Verify HL rules.** From the official docs, confirm: (1) the nonce rule (believed: the venue keeps the 100 highest nonces per signer; a new nonce must be above the smallest of them, unused, and within roughly (now − 2 days, now + 1 day)); (2) the `scheduleCancel` rules (minimum lead time; daily trigger limit; any eligibility requirement); (3) whether `orderStatus` accepts a `cloid`. Record each answer with its source in §5/§12, and fix any spec text that is wrong. *Done when:* each fact has a source link and date.
+
+**H-10 — Testnet round-trip.** Owner-run, or run by an agent only with an owner-provided **testnet** key (never a mainnet key). Place a far-from-mid ALO order, see it in `openOrders` and in `orderUpdates` (H-3), cancel it by `cloid`, and record submit→ack latency (H-7). Closes the open §15 item.
+
+## 18. Open questions (M2.5)
+
+1. H-4 default TTL (120 s) vs strategy needs; market-making may want a shorter TTL with more budget.

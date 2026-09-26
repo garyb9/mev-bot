@@ -31,9 +31,10 @@ pub use order::{
 };
 pub use signing::{AgentSigner, Signature, action_hash, recover_address, signing_hash};
 pub use types::{
-    AllMids, AssetCtx, AssetCtxUpdate, AssetMeta, AssetPosition, Bbo, ClearinghouseState, L2Book,
-    Level, Leverage, MarginSummary, Meta, MetaAndAssetCtxs, OpenOrder, OrderStatusResponse,
-    PerpDex, Position, SpotMeta, SpotPair, SpotToken, Trade, UserFees, UserRateLimit,
+    AllMids, AssetCtx, AssetCtxUpdate, AssetMeta, AssetPosition, Bbo, ClearinghouseState,
+    FundingDelta, L2Book, Level, Leverage, MarginSummary, Meta, MetaAndAssetCtxs, OpenOrder,
+    OrderStatusResponse, PerpDex, Position, SpotBalance, SpotClearinghouseState, SpotMeta,
+    SpotPair, SpotToken, Trade, UserFees, UserFill, UserFunding, UserRateLimit,
 };
 pub use ws::{MarketStream, StreamEvent, Subscription, WsMarketStream};
 pub use ws_exchange::WsExchange;

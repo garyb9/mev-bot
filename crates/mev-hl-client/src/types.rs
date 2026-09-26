@@ -378,6 +378,118 @@ pub struct DailyVolume {
     pub user_vlm: Decimal,
 }
 
+/// A single spot balance (`spotClearinghouseState.balances[]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotBalance {
+    /// Token symbol, e.g. `USDC`.
+    pub coin: String,
+    /// Token index.
+    pub token: u32,
+    /// Amount held (locked by resting orders).
+    pub hold: Decimal,
+    /// Total balance.
+    pub total: Decimal,
+    /// Entry notional.
+    #[serde(default)]
+    pub entry_ntl: Decimal,
+}
+
+/// Spot clearinghouse state (`spotClearinghouseState`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SpotClearinghouseState {
+    /// Balances, one per held token.
+    #[serde(default)]
+    pub balances: Vec<SpotBalance>,
+}
+
+impl SpotClearinghouseState {
+    /// The balance for a token symbol, if held.
+    pub fn balance(&self, coin: &str) -> Option<&SpotBalance> {
+        self.balances.iter().find(|b| b.coin == coin)
+    }
+}
+
+/// A user funding payment (`userFunding`), flattened from the nested `delta`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFunding {
+    /// Settlement time in milliseconds.
+    pub time: u64,
+    /// Transaction hash.
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// The funding delta.
+    pub delta: FundingDelta,
+}
+
+/// The `delta` block of a [`UserFunding`] entry.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FundingDelta {
+    /// Record type (`funding`).
+    #[serde(rename = "type")]
+    pub type_field: String,
+    /// Coin.
+    pub coin: String,
+    /// Signed USDC amount (negative is paid).
+    pub usdc: Decimal,
+    /// Position size at settlement.
+    pub szi: Decimal,
+    /// Funding rate applied.
+    #[serde(default)]
+    pub rate: Decimal,
+}
+
+/// A user fill (`userFills` / `userFillsByTime`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFill {
+    /// Coin.
+    pub coin: String,
+    /// Fill price.
+    pub px: Decimal,
+    /// Fill size.
+    pub sz: Decimal,
+    /// Aggressor side (`B` bid / `A` ask).
+    pub side: String,
+    /// Fill time in milliseconds.
+    pub time: u64,
+    /// Realized PnL.
+    #[serde(default)]
+    pub closed_pnl: Decimal,
+    /// Order id.
+    #[serde(default)]
+    pub oid: Option<u64>,
+    /// Whether the fill crossed the spread (taker).
+    #[serde(default)]
+    pub crossed: bool,
+    /// Fee paid.
+    #[serde(default)]
+    pub fee: Decimal,
+    /// Trade id.
+    #[serde(default)]
+    pub tid: Option<u64>,
+    /// Direction label (`Open Long`, `Close Short`, ...).
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Builder fee paid.
+    #[serde(default)]
+    pub builder_fee: Option<Decimal>,
+}
+
+impl UserFill {
+    /// Whether this fill is a buy.
+    pub fn is_buy(&self) -> bool {
+        self.side.eq_ignore_ascii_case("B")
+    }
+
+    /// Whether this fill was a maker fill.
+    pub fn is_maker(&self) -> bool {
+        !self.crossed
+    }
+}
+
 /// `userRateLimit` response.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

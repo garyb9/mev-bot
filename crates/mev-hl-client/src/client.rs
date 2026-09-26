@@ -10,7 +10,8 @@ use serde_json::json;
 
 use crate::types::{
     AllMids, AssetCtx, ClearinghouseState, L2Book, Meta, MetaAndAssetCtxs, OpenOrder,
-    OrderStatusResponse, PerpDex, SpotMeta, UserFees, UserRateLimit,
+    OrderStatusResponse, PerpDex, SpotClearinghouseState, SpotMeta, UserFees, UserFill,
+    UserFunding, UserRateLimit,
 };
 
 /// Read-only HyperCore info API.
@@ -38,6 +39,12 @@ pub trait InfoApi: Send + Sync {
     async fn open_orders(&self, user: &str) -> Result<Vec<OpenOrder>>;
     /// Status of a single order by id.
     async fn order_status(&self, user: &str, oid: u64) -> Result<OrderStatusResponse>;
+    /// Spot account state: token balances.
+    async fn spot_clearinghouse_state(&self, user: &str) -> Result<SpotClearinghouseState>;
+    /// The user's funding payment history since `start_ms`.
+    async fn user_funding(&self, user: &str, start_ms: u64) -> Result<Vec<UserFunding>>;
+    /// The user's fills since `start_ms`.
+    async fn user_fills_by_time(&self, user: &str, start_ms: u64) -> Result<Vec<UserFill>>;
     /// The user's effective fee schedule.
     async fn user_fees(&self, user: &str) -> Result<UserFees>;
     /// The user's address-based rate-limit budget.
@@ -140,6 +147,21 @@ impl InfoApi for HttpInfo {
 
     async fn order_status(&self, user: &str, oid: u64) -> Result<OrderStatusResponse> {
         self.info(json!({ "type": "orderStatus", "user": user, "oid": oid }))
+            .await
+    }
+
+    async fn spot_clearinghouse_state(&self, user: &str) -> Result<SpotClearinghouseState> {
+        self.info(json!({ "type": "spotClearinghouseState", "user": user }))
+            .await
+    }
+
+    async fn user_funding(&self, user: &str, start_ms: u64) -> Result<Vec<UserFunding>> {
+        self.info(json!({ "type": "userFunding", "user": user, "startTime": start_ms }))
+            .await
+    }
+
+    async fn user_fills_by_time(&self, user: &str, start_ms: u64) -> Result<Vec<UserFill>> {
+        self.info(json!({ "type": "userFillsByTime", "user": user, "startTime": start_ms }))
             .await
     }
 
@@ -300,5 +322,57 @@ mod tests {
             .await;
         let client = HttpInfo::with_base_url(server.uri());
         assert!(client.all_mids().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn parses_spot_clearinghouse_state() {
+        let body = r#"{"balances":[
+            {"coin":"USDC","token":0,"hold":"10","total":"1000.5","entryNtl":"0"},
+            {"coin":"UBTC","token":1,"hold":"0","total":"0.25","entryNtl":"15000"}
+        ]}"#;
+        let server = mount(body).await;
+        let client = HttpInfo::with_base_url(server.uri());
+        let state = client.spot_clearinghouse_state("0xabc").await.unwrap();
+        assert_eq!(state.balances.len(), 2);
+        assert_eq!(
+            state.balance("USDC").unwrap().total,
+            Decimal::from_str("1000.5").unwrap()
+        );
+        assert_eq!(
+            state.balance("UBTC").unwrap().total,
+            Decimal::from_str("0.25").unwrap()
+        );
+        assert!(state.balance("ETH").is_none());
+    }
+
+    #[tokio::test]
+    async fn parses_user_funding() {
+        let body = r#"[{"time":1754450974231,"hash":"0xabc","delta":{"type":"funding","coin":"ETH","usdc":"-0.5123","szi":"2","rate":"0.0000125"}}]"#;
+        let server = mount(body).await;
+        let client = HttpInfo::with_base_url(server.uri());
+        let funding = client.user_funding("0xabc", 1).await.unwrap();
+        assert_eq!(funding.len(), 1);
+        assert_eq!(funding[0].delta.coin, "ETH");
+        assert_eq!(funding[0].delta.usdc, Decimal::from_str("-0.5123").unwrap());
+        assert_eq!(
+            funding[0].delta.rate,
+            Decimal::from_str("0.0000125").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn parses_user_fills() {
+        let body = r#"[{
+            "coin":"BTC","px":"60000","sz":"0.01","side":"B","time":1754450974231,
+            "closedPnl":"0","oid":42,"crossed":true,"fee":"0.27","tid":7,"dir":"Open Long"
+        }]"#;
+        let server = mount(body).await;
+        let client = HttpInfo::with_base_url(server.uri());
+        let fills = client.user_fills_by_time("0xabc", 1).await.unwrap();
+        assert_eq!(fills.len(), 1);
+        assert!(fills[0].is_buy());
+        assert!(!fills[0].is_maker());
+        assert_eq!(fills[0].oid, Some(42));
+        assert_eq!(fills[0].fee, Decimal::from_str("0.27").unwrap());
     }
 }
