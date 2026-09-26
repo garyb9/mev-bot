@@ -269,6 +269,11 @@ impl Engine {
         self.account.clone()
     }
 
+    /// A handle to the risk gate's sticky trading-halt flag.
+    pub fn halt(&self) -> mev_risk::TradingHalt {
+        self.risk.halt()
+    }
+
     /// Run the decision loop until the task is aborted.
     pub async fn run(mut self, state: Arc<RwLock<MarketState>>) {
         info!(

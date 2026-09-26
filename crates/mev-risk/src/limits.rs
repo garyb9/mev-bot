@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 
 use mev_strategy::OrderIntent;
 
-use crate::{Decision, RiskCheck, RiskContext};
+use crate::{Decision, RiskCheck, RiskContext, TradingHalt};
 
 /// The default minimum order notional, mirroring the venue's $10 floor.
 pub const DEFAULT_MIN_NOTIONAL: Decimal = Decimal::TEN;
@@ -46,6 +46,8 @@ impl Default for Limits {
 #[derive(Debug, Clone, Default)]
 pub struct LimitRisk {
     limits: Limits,
+    /// Sticky halt flag, checked first (SPEC-0002 H-4 / SPEC-0004 K-3).
+    halt: TradingHalt,
     /// Signed base-unit size approved earlier in the current decision cycle, by
     /// coin. Reset by [`LimitRisk::begin_cycle`]; projected exposure counts it
     /// so several intents in one cycle cannot each pass and together breach a
@@ -58,8 +60,15 @@ impl LimitRisk {
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
+            halt: TradingHalt::new(),
             pending: BTreeMap::new(),
         }
+    }
+
+    /// A clone of the halt flag, for components that set it (dead-man, kill
+    /// switch).
+    pub fn halt(&self) -> TradingHalt {
+        self.halt.clone()
     }
 
     /// The configured limits.
@@ -87,6 +96,11 @@ impl RiskCheck for LimitRisk {
     fn check(&mut self, intent: &OrderIntent, ctx: &RiskContext<'_>) -> Decision {
         let limits = self.limits.clone();
 
+        // Halt first: a set halt blocks all new risk. Cancels reduce risk and
+        // are never blocked here (SPEC-0002 H-4).
+        if self.halt.is_halted() {
+            return Decision::Reject("trading halted".into());
+        }
         if intent.size <= Decimal::ZERO {
             return Decision::Reject("non-positive size".into());
         }
@@ -311,6 +325,43 @@ mod tests {
         assert_eq!(
             check(limits, &intent(Side::Buy, ds("8"), None), &account),
             Decision::Resize(ds("6"))
+        );
+    }
+
+    #[test]
+    fn halted_rejects_all_new_risk() {
+        let mut account = AccountView::default();
+        account.open_orders.push(OpenOrderView {
+            coin: "BTC".into(),
+            oid: Some(1),
+            cloid: None,
+            side: Side::Buy,
+            limit_px: ds("100"),
+            sz: ds("1"),
+            reduce_only: false,
+        });
+        let limits = Limits::default();
+        let mut risk = LimitRisk::new(limits);
+        let halt = risk.halt();
+        let market = market();
+        let ctx = RiskContext {
+            market: &market,
+            account: &account,
+            now_ms: 0,
+        };
+        assert!(
+            risk.check(&intent(Side::Buy, ds("1"), None), &ctx)
+                .is_allowed()
+        );
+        halt.set();
+        assert!(matches!(
+            risk.check(&intent(Side::Buy, ds("1"), None), &ctx),
+            Decision::Reject(_)
+        ));
+        halt.clear();
+        assert!(
+            risk.check(&intent(Side::Buy, ds("1"), None), &ctx)
+                .is_allowed()
         );
     }
 

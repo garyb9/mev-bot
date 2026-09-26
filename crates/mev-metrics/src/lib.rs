@@ -40,6 +40,8 @@ pub mod names {
     pub const DEADMAN_REFRESHES: &str = "hl_deadman_refreshes_total";
     /// Dead-man's switch submission failures.
     pub const DEADMAN_FAILURES: &str = "hl_deadman_failures_total";
+    /// Remaining address rate-limit budget, tagged by kind.
+    pub const RATE_BUDGET_REMAINING: &str = "hl_rate_budget_remaining";
     /// Risk breaker trips, tagged by trigger.
     pub const BREAKER_TRIPS: &str = "hl_breaker_trips_total";
     /// Order intents proposed by strategies, tagged by strategy.

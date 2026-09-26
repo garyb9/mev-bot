@@ -27,6 +27,8 @@ use mev_hl_client::{
     Tif, Tolerance, WsExchange, WsMarketStream, build_order_wire, build_request, now_ms,
 };
 use mev_metrics::{health::Health, prometheus::PrometheusHandle};
+use mev_risk::TradingHalt;
+use mev_strategy::AccountView;
 use tokio::signal;
 use tracing::{error, info};
 
@@ -329,26 +331,32 @@ async fn run(
         .as_ref()
         .map(|(writer, session_id)| engine::Recorder::new(writer.clone(), *session_id));
 
+    let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::new(config.network));
     let engine_task = plan.map(|plan| {
         let (writer, session_id) = session
             .clone()
             .expect("engine requires a recording session");
         let mut engine = engine::Engine::new(plan, &config, exchange.clone(), writer, session_id);
         // Live runs reconcile unknown order outcomes by cloid (SPEC-0002 H-2).
-        let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::new(config.network));
         if let Some(address) = config.account_address.clone() {
             engine = engine.with_info(info.clone(), address);
         }
         let account = engine.account();
+        let halt = engine.halt();
         let poller = config.account_address.clone().map(|address| {
             tokio::spawn(engine::account_poller(
-                info,
+                info.clone(),
                 address,
-                account,
+                account.clone(),
                 config.network,
             ))
         });
-        (tokio::spawn(engine.run(state.clone())), poller)
+        (
+            tokio::spawn(engine.run(state.clone())),
+            poller,
+            account,
+            halt,
+        )
     });
 
     let heartbeat = tokio::spawn(heartbeat());
@@ -359,9 +367,25 @@ async fn run(
         recorder,
     ));
     let monitor = tokio::spawn(monitor(state, health.clone()));
-    let deadman = exchange
-        .clone()
-        .map(|exchange| tokio::spawn(deadman(exchange, config.schedule_cancel_ttl_ms)));
+    let deadman = exchange.clone().map(|exchange| {
+        let (account, halt) = engine_task.as_ref().map_or_else(
+            || {
+                (
+                    Arc::new(RwLock::new(AccountView::default())),
+                    mev_risk::TradingHalt::new(),
+                )
+            },
+            |(_, _, account, halt)| (account.clone(), halt.clone()),
+        );
+        tokio::spawn(deadman(
+            exchange,
+            info.clone(),
+            config.account_address.clone(),
+            account,
+            halt,
+            config.schedule_cancel_ttl_ms,
+        ))
+    });
 
     info!("waiting for feeds to become ready");
     serve(health, metrics, config.http_port).await?;
@@ -369,7 +393,7 @@ async fn run(
     ingest.abort();
     monitor.abort();
     heartbeat.abort();
-    if let Some((engine, poller)) = engine_task {
+    if let Some((engine, poller, _, _)) = engine_task {
         engine.abort();
         if let Some(poller) = poller {
             poller.abort();
@@ -440,39 +464,76 @@ fn live_exchange(config: &Config) -> Result<Option<Arc<dyn ExchangeApi>>> {
     Ok(Some(Arc::new(exchange)))
 }
 
-/// Keep `scheduleCancel` armed for as long as the process is healthy.
+/// Keep `scheduleCancel` armed while (and only while) orders rest, and fail
+/// closed on any arm/refresh error (SPEC-0002 H-4).
 ///
-/// In `live`, the switch is armed on start and refreshed on a 1s tick (the
-/// switch itself decides when a refresh is due), and explicitly disarmed on
-/// graceful shutdown. If the process dies without shutting down, the venue
-/// cancels resting orders once the TTL elapses.
-async fn deadman(exchange: Arc<dyn ExchangeApi>, ttl_ms: u64) {
+/// Each cycle the task reads the live account's open-order count. The switch
+/// (a) arms when the first order rests, (b) refreshes at half the TTL, and
+/// (c) disarms when the last order leaves — so an idle bot does not spend
+/// address rate-limit budget. If arming/refreshing fails while orders rest, a
+/// sticky [`TradingHalt`] is set so the risk gate refuses new orders. The task
+/// also polls `userRateLimit` every 60 s and exposes the remaining address
+/// budget as a metric.
+async fn deadman(
+    exchange: Arc<dyn ExchangeApi>,
+    info: Arc<dyn InfoApi>,
+    address: Option<String>,
+    account: Arc<RwLock<AccountView>>,
+    halt: TradingHalt,
+    ttl_ms: u64,
+) {
     let mut switch = DeadMansSwitch::new(ttl_ms);
-    if let Err(err) = exchange.submit(&switch.arm(now_ms())).await {
-        error!(error = %err, "dead-man switch arm failed");
-        metrics::counter!(mev_metrics::names::DEADMAN_FAILURES).increment(1);
-        return;
-    }
-    metrics::gauge!(mev_metrics::names::DEADMAN_ARMED).set(1.0);
-    info!(ttl_ms, until = ?switch.armed_until(), "dead-man switch armed");
-
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.tick().await;
+    let mut rate = tokio::time::interval(Duration::from_secs(60));
+
     loop {
         tokio::select! {
             _ = shutdown_signal() => break,
-            _ = tick.tick() => {
-                if let Some(action) = switch.refresh_if_due(now_ms()) {
-                    match exchange.submit(&action).await {
-                        Ok(_) => {
-                            metrics::counter!(mev_metrics::names::DEADMAN_REFRESHES).increment(1);
+            _ = rate.tick() => {
+                if let Some(address) = &address {
+                    match info.user_rate_limit(address).await {
+                        Ok(budget) => {
+                            metrics::gauge!(
+                                mev_metrics::names::RATE_BUDGET_REMAINING,
+                                "kind" => "address",
+                            )
+                            .set(budget.remaining() as f64);
                         }
                         Err(err) => {
-                            error!(error = %err, "dead-man refresh failed");
-                            metrics::counter!(mev_metrics::names::DEADMAN_FAILURES).increment(1);
+                            tracing::debug!(error = %err, "userRateLimit poll failed");
                         }
                     }
                 }
+            }
+            _ = tick.tick() => {
+                let resting = account
+                    .read()
+                    .map(|guard| guard.open_orders.len())
+                    .unwrap_or(0);
+                if let Some(action) = switch.update(now_ms(), resting) {
+                    let arming = resting > 0;
+                    match exchange.submit(&action).await {
+                        Ok(_) => {
+                            if arming {
+                                metrics::counter!(mev_metrics::names::DEADMAN_REFRESHES).increment(1);
+                            } else {
+                                info!("dead-man switch disarmed (no resting orders)");
+                            }
+                        }
+                        Err(err) if arming => {
+                            error!(error = %err, "dead-man arm/refresh failed; halting trading");
+                            metrics::counter!(mev_metrics::names::DEADMAN_FAILURES).increment(1);
+                            halt.set();
+                        }
+                        Err(err) => {
+                            // Disarm failed; the venue expires the schedule anyway.
+                            tracing::debug!(error = %err, "dead-man disarm failed");
+                        }
+                    }
+                }
+                metrics::gauge!(mev_metrics::names::DEADMAN_ARMED)
+                    .set(if switch.is_armed() { 1.0 } else { 0.0 });
             }
         }
     }
@@ -480,7 +541,7 @@ async fn deadman(exchange: Arc<dyn ExchangeApi>, ttl_ms: u64) {
     if let Some(action) = switch.disarm() {
         match exchange.submit(&action).await {
             Ok(_) => info!("dead-man switch disarmed"),
-            Err(err) => error!(error = %err, "dead-man disarm failed"),
+            Err(err) => tracing::debug!(error = %err, "dead-man disarm failed"),
         }
     }
     metrics::gauge!(mev_metrics::names::DEADMAN_ARMED).set(0.0);

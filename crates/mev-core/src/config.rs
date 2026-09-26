@@ -267,7 +267,7 @@ impl Default for Config {
             watchlist: vec!["BTC".to_string(), "ETH".to_string(), "SOL".to_string()],
             watchlist_path: PathBuf::from(crate::watchlist::DEFAULT_PATH),
             db_path: PathBuf::from("data/hlbot.db"),
-            schedule_cancel_ttl_ms: 30_000,
+            schedule_cancel_ttl_ms: 120_000,
             http_port: 9090,
             strategy: StrategyConfig::default(),
             risk: RiskSettings::default(),

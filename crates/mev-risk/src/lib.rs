@@ -8,8 +8,10 @@
 //! by M3. The full engine (drawdown/liquidation guard, reconciliation, PnL
 //! attribution) lands with SPEC-0004.
 
+pub mod halt;
 pub mod limits;
 
+pub use halt::TradingHalt;
 pub use limits::{LimitRisk, Limits};
 
 use mev_strategy::{AccountView, MarketView, OrderIntent};

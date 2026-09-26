@@ -150,7 +150,7 @@ Orthogonal to the mode above; applies only in `live`.
 
 - In `live`, arm `scheduleCancel` with a TTL and refresh it on a heartbeat.
 - If the process stalls, loses connectivity, or crashes, the exchange auto-cancels resting orders after the TTL — a dead bot cannot leave stale orders exposed.
-- TTL is configurable (`HL_SCHEDULE_CANCEL_TTL_MS`, default 30s), refreshed with margin below the TTL, and explicitly disarmed on graceful shutdown.
+- TTL is configurable (`HL_SCHEDULE_CANCEL_TTL_MS`, default **120s**), refreshed with margin below the TTL, and explicitly disarmed on graceful shutdown. The switch is armed **only while at least one order rests** and disarmed when none do (H-4), to conserve address rate-limit budget.
 - Armed status is a metric and a `/healthz` input; failure to refresh within the window raises an alert.
 - **Verified 2026-09-26** ([Exchange endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint)): the scheduled `time` must be **at least 5 s** in the future; omitting `time` removes the schedule; the trigger count increments only when the scheduled time arrives and cancels all open orders, with a **max of 10 triggers/day**, reset at **00:00 UTC**. Refreshing before the deadline re-arms without incrementing the trigger count, so a live heartbeat is not what burns the daily limit — but every arm/refresh still spends **address rate-limit budget** (H-4 arms only while orders rest for this reason).
 
@@ -191,7 +191,7 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 | H-1 | Concurrent WS `post` (reader task + pending map) | **T0** | M | — | ✅ |
 | H-2 | Mandatory `cloid` + unknown-outcome reconciliation | **T0** | M | H-1 | ✅ |
 | H-3 | Account stream (`orderUpdates`, `userFills`, `userEvents`) | T1 | M | SPEC-0008 R-3 | ☐ |
-| H-4 | Dead-man's switch policy (arm only when needed; fail closed) | **T0** | S | H-1 | ☐ |
+| H-4 | Dead-man's switch policy (arm only when needed; fail closed) | **T0** | S | H-1 | ✅ |
 | H-5 | Apply `bbo` to `MarketState` | T1 | S | — | ☐ |
 | H-6 | Nonce persistence off the hot path | T1 | S | H-9 | ☐ |
 | H-7 | Latency instrumentation + sign/submit benchmarks | T1 | M | H-1 | ☐ |

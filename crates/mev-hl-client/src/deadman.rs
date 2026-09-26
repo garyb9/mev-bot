@@ -9,6 +9,11 @@
 
 use crate::order::Action;
 
+/// Default dead-man TTL: 120 s (SPEC-0002 H-4). The switch is refreshed at half
+/// the TTL, which keeps ~5.8k arm/refresh requests/day (well inside budget)
+/// for a TTL long enough to tolerate a stall.
+pub const DEFAULT_TTL_MS: u64 = 120_000;
+
 /// Default refresh margin: refresh once less than half the TTL remains.
 pub const DEFAULT_REFRESH_MARGIN_MS: u64 = 15_000;
 
@@ -84,6 +89,29 @@ impl DeadMansSwitch {
             None
         }
     }
+
+    /// Reconcile the switch with the number of resting orders and return the
+    /// action to submit, if any (SPEC-0002 H-4).
+    ///
+    /// The switch is armed **only** while at least one order rests, so it does
+    /// not spend address rate-limit budget when there is nothing to protect,
+    /// and disarmed as soon as the last order leaves. A missing disarm attempt
+    /// is safe: the venue expires the schedule on its own.
+    pub fn update(&mut self, now_ms: u64, resting_orders: usize) -> Option<Action> {
+        if resting_orders == 0 {
+            return self.disarm();
+        }
+        if !self.is_armed() {
+            return Some(self.arm(now_ms));
+        }
+        self.refresh_if_due(now_ms)
+    }
+
+    /// Whether a failure to arm/refresh must halt trading (SPEC-0002 H-4):
+    /// while orders are resting, an unarmed or failed switch is unsafe.
+    pub fn requires_arm(&self, resting_orders: usize) -> bool {
+        resting_orders > 0
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +156,51 @@ mod tests {
         assert_eq!(switch.disarm(), Some(Action::ScheduleCancel { time: None }));
         assert!(!switch.is_armed());
         assert_eq!(switch.disarm(), None);
+    }
+
+    #[test]
+    fn update_arms_only_while_orders_rest() {
+        let mut switch = DeadMansSwitch::new(120_000);
+        let t0 = 1_700_000_000_000u64;
+        // No resting orders: nothing to arm.
+        assert_eq!(switch.update(t0, 0), None);
+        assert!(!switch.is_armed());
+        // First resting order arms.
+        assert_eq!(
+            switch.update(t0, 1),
+            Some(Action::ScheduleCancel {
+                time: Some(t0 + 120_000)
+            })
+        );
+        assert!(switch.is_armed());
+        // Still resting, not yet due (60s left, not <= 60s margin is false;
+        // use 61s left): no action.
+        assert_eq!(switch.update(t0 + 59_000, 2), None);
+        // Last order gone: disarm.
+        assert_eq!(
+            switch.update(t0 + 60_000, 0),
+            Some(Action::ScheduleCancel { time: None })
+        );
+        assert!(!switch.is_armed());
+    }
+
+    #[test]
+    fn update_refreshes_near_expiry_while_resting() {
+        let mut switch = DeadMansSwitch::new(120_000);
+        let t0 = 1_700_000_000_000u64;
+        switch.update(t0, 1); // expires t0+120_000, margin 60_000
+        assert_eq!(switch.update(t0 + 30_000, 1), None); // 90s left
+        let refreshed = switch.update(t0 + 70_000, 1).expect("due"); // 50s left
+        assert_eq!(
+            refreshed,
+            Action::ScheduleCancel {
+                time: Some(t0 + 190_000)
+            }
+        );
+    }
+
+    #[test]
+    fn default_ttl_is_two_minutes() {
+        assert_eq!(DEFAULT_TTL_MS, 120_000);
     }
 }

@@ -9,7 +9,8 @@ autonomy = "auto"
 watchlist = ["BTC", "ETH", "SOL"]
 
 db_path = "data/hlbot.db"
-schedule_cancel_ttl_ms = 30000
+# Dead-man's switch TTL (SPEC-0002 H-4); refreshed at half this.
+schedule_cancel_ttl_ms = 120000
 http_port = 9090
 
 [strategy]

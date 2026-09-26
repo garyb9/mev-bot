@@ -586,10 +586,17 @@ pub struct UserRateLimit {
     /// Requests used so far.
     #[serde(default)]
     pub n_requests_used: u64,
-    /// Requests still available.
+    /// Total request budget.
     #[serde(default)]
     pub n_requests_cap: u64,
     /// Time (ms) until the budget resets.
     #[serde(default)]
     pub request_used: u64,
+}
+
+impl UserRateLimit {
+    /// Requests still available before the cap.
+    pub fn remaining(&self) -> u64 {
+        self.n_requests_cap.saturating_sub(self.n_requests_used)
+    }
 }
