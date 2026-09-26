@@ -140,7 +140,7 @@ Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path in
 
 | ID | Title | Tier | Size | Depends on | Status |
 |---|---|---|---|---|---|
-| K-1 | Fail-closed defaults: `live` refuses to start without explicit finite limits; conservative defaults for `simulate` | **T0** | S | — | ☐ |
+| K-1 | Fail-closed defaults: `live` refuses to start without explicit finite limits; conservative defaults for `simulate` | **T0** | S | — | ✅ |
 | K-2 | Exposure incl. in-flight orders (worst case), and group worst-single-leg exposure (SPEC-0011 §9) | T1 | M | SPEC-0010 E-5 | ☐ |
 | K-3 | Kill switch: `SIGUSR1`, flag file, `hl panic`; cancel-all + halt; SPEC-0011 `on_kill` for residuals; sticky until cleared | T1 | M | SPEC-0010 E-3 | ☐ |
 | K-4 | Circuit breakers: daily loss, drawdown, reject-rate spike, nonce errors, stale feeds, reconciliation drift, exec backpressure | T1 | M | K-3, SPEC-0010 E-8 | ☐ |
@@ -149,7 +149,7 @@ Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path in
 | K-7 | Property tests for every limit + breaker (boundary approve/resize/reject; unknown state ⇒ reject) | T1 | M | K-1…K-5 | ☐ |
 | K-8 | Directional-strategy limits: per-strategy stop-loss, volatility-scaled sizing, max holding time, overnight/weekend exposure caps for HIP-3 stock perps | T3 | M | only when a T3 study passes or a G1.5 pilot is approved | ☐ |
 
-**K-1:** `Config::validate` in `live` requires `max_order_notional_usd`, `max_position_notional_usd`, `max_open_orders`, `max_margin_utilization_bps`, `max_daily_loss_usd`, and `max_unhedged_usd` to all be set. `simulate` uses conservative defaults from `config/default.toml`. *Done when:* tests cover live-without-limits ⇒ startup error, and every default is finite.
+**K-1:** `Config::validate` in `live` requires `max_order_notional_usd`, `max_position_notional_usd`, `max_open_orders`, `max_margin_utilization_bps`, `max_daily_loss_usd`, and `max_unhedged_usd` to all be set. `simulate` uses conservative defaults. **Implemented:** the conservative values live in `RiskSettings::conservative_defaults()` (code), applied by `Config::load` only when `mode != live`, rather than in `config/default.toml`; the config file is mode-agnostic, so putting them there would let a `live` run inherit them and weaken the explicit-limits gate. Defaults: order $2.5k, position $25k, 50 open orders, 50% margin utilization, daily loss $500, unhedged $5k. *Done when:* tests cover live-without-limits ⇒ startup error, and every default is finite.
 
 **K-2:** Per-coin projected exposure = confirmed position + Σ worst-case fills of `PendingNew`/`Resting`/`PartiallyFilled`/`PendingModify`/`Unknown` orders, maintained incrementally by the order manager. Groups are checked on net **and** worst single-leg exposure. *Done when:* a property test shows no approved sequence can exceed a cap.
 

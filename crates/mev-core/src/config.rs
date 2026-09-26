@@ -174,7 +174,8 @@ impl Default for FundingSettings {
     }
 }
 
-/// Pre-trade risk limits (SPEC-0004 §5). `None` disables a limit.
+/// Pre-trade risk limits (SPEC-0004 §5). `None` disables a limit; `live` mode
+/// refuses to start unless every limit is explicitly finite (SPEC-0004 K-1).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RiskSettings {
@@ -186,6 +187,43 @@ pub struct RiskSettings {
     pub max_open_orders: Option<usize>,
     /// Maximum margin utilization (bps) before new risk is refused.
     pub max_margin_utilization_bps: Option<Decimal>,
+    /// Maximum realized+unrealized daily loss in USD before trading halts.
+    pub max_daily_loss_usd: Option<Decimal>,
+    /// Maximum unhedged (single-leg) notional in USD (SPEC-0011 §9).
+    pub max_unhedged_usd: Option<Decimal>,
+}
+
+impl RiskSettings {
+    /// Conservative finite limits applied to non-live modes, so `simulate` is
+    /// bounded by default while `live` still requires explicit values
+    /// (SPEC-0004 K-1). `None` fields are left untouched.
+    pub fn conservative_defaults() -> Self {
+        Self {
+            max_order_notional_usd: Some(Decimal::from(2_500)),
+            max_position_notional_usd: Some(Decimal::from(25_000)),
+            max_open_orders: Some(50),
+            max_margin_utilization_bps: Some(Decimal::from(5_000)),
+            max_daily_loss_usd: Some(Decimal::from(500)),
+            max_unhedged_usd: Some(Decimal::from(5_000)),
+        }
+    }
+
+    /// Fill only the unset fields from [`Self::conservative_defaults`].
+    fn fill_defaults(&mut self) {
+        let defaults = Self::conservative_defaults();
+        self.max_order_notional_usd = self
+            .max_order_notional_usd
+            .or(defaults.max_order_notional_usd);
+        self.max_position_notional_usd = self
+            .max_position_notional_usd
+            .or(defaults.max_position_notional_usd);
+        self.max_open_orders = self.max_open_orders.or(defaults.max_open_orders);
+        self.max_margin_utilization_bps = self
+            .max_margin_utilization_bps
+            .or(defaults.max_margin_utilization_bps);
+        self.max_daily_loss_usd = self.max_daily_loss_usd.or(defaults.max_daily_loss_usd);
+        self.max_unhedged_usd = self.max_unhedged_usd.or(defaults.max_unhedged_usd);
+    }
 }
 
 /// Resolved, validated configuration.
@@ -284,6 +322,12 @@ impl Config {
             config.db_path = db_path;
         }
 
+        // `simulate`/`observe` get conservative finite limits; `live` must set
+        // every cap explicitly or `validate` refuses to start (K-1).
+        if config.mode != Mode::Live {
+            config.risk.fill_defaults();
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -344,6 +388,8 @@ impl Config {
                 "max_margin_utilization_bps",
                 self.risk.max_margin_utilization_bps,
             ),
+            ("max_daily_loss_usd", self.risk.max_daily_loss_usd),
+            ("max_unhedged_usd", self.risk.max_unhedged_usd),
         ] {
             match value {
                 Some(v) if v > Decimal::ZERO => {}
@@ -472,8 +518,45 @@ mod tests {
         with_limits.risk.max_position_notional_usd = Some(Decimal::from(10_000));
         with_limits.risk.max_margin_utilization_bps = Some(Decimal::from(5_000));
         with_limits.risk.max_open_orders = Some(10);
+        with_limits.risk.max_daily_loss_usd = Some(Decimal::from(500));
+        with_limits.risk.max_unhedged_usd = Some(Decimal::from(5_000));
         assert!(with_limits.validate().is_ok());
         unsafe { std::env::remove_var("HL_LIVE_CONFIRM") };
+    }
+
+    #[test]
+    fn simulate_fills_conservative_finite_defaults() {
+        let mut config = Config {
+            mode: Mode::Simulate,
+            ..Config::default()
+        };
+        config.risk.fill_defaults();
+        for (name, set) in [
+            (
+                "max_order_notional_usd",
+                config.risk.max_order_notional_usd.is_some(),
+            ),
+            (
+                "max_position_notional_usd",
+                config.risk.max_position_notional_usd.is_some(),
+            ),
+            ("max_open_orders", config.risk.max_open_orders.is_some()),
+            (
+                "max_margin_utilization_bps",
+                config.risk.max_margin_utilization_bps.is_some(),
+            ),
+            (
+                "max_daily_loss_usd",
+                config.risk.max_daily_loss_usd.is_some(),
+            ),
+            ("max_unhedged_usd", config.risk.max_unhedged_usd.is_some()),
+        ] {
+            assert!(set, "{name} must have a conservative default");
+        }
+        // Explicit values are preserved.
+        config.risk.max_order_notional_usd = Some(Decimal::from(42));
+        config.risk.fill_defaults();
+        assert_eq!(config.risk.max_order_notional_usd, Some(Decimal::from(42)));
     }
 
     #[test]
