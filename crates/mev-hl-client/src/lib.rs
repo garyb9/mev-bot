@@ -12,6 +12,7 @@ pub mod exchange;
 pub mod market;
 pub mod nonce;
 pub mod order;
+pub mod raw_ws;
 pub mod signing;
 pub mod types;
 pub mod ws;
@@ -32,6 +33,7 @@ pub use order::{
     OrderWire, Tif, Tpsl, build_order_wire, round_price, round_price_aggressive, round_price_with,
     round_size, wire_decimal,
 };
+pub use raw_ws::{HlProtocol, Protocol, RawEvent, RawWsConn};
 pub use signing::{AgentSigner, Signature, action_hash, recover_address, signing_hash};
 pub use types::{
     AllMids, AssetCtx, AssetCtxUpdate, AssetMeta, AssetPosition, Bbo, ClearinghouseState,

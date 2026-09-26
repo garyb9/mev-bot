@@ -2,30 +2,21 @@
 //!
 //! This is the first stream backend. The [`MarketStream`] trait is the seam
 //! that the M1.4 benchmark uses to swap in the official/community SDKs.
-
-use std::time::Duration;
+//!
+//! Reconnect, heartbeat, the silence watchdog, and cancellable shutdown live in
+//! [`crate::raw_ws::RawWsConn`] (SPEC-0008 R-3); this module only plans
+//! subscriptions and decodes frames.
 
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
 use mev_core::{
     config::Network,
     error::{Error, Result},
 };
 use mev_metrics::names;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::json;
-use tokio::net::TcpStream;
-use tokio::time::Instant;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
+use crate::raw_ws::{HlProtocol, RawEvent, RawWsConn};
 use crate::types::{AllMids, AssetCtxUpdate, Bbo, L2Book, Trade};
-
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-const PING_INTERVAL: Duration = Duration::from_secs(30);
-const BACKOFF_BASE: Duration = Duration::from_millis(500);
-const BACKOFF_MAX: Duration = Duration::from_secs(30);
-const BACKOFF_MAX_SHIFT: u32 = 6;
 
 /// A Hyperliquid WS subscription request.
 #[derive(Debug, Clone, Serialize)]
@@ -91,89 +82,47 @@ pub trait MarketStream: Send {
     async fn next(&mut self) -> Result<StreamEvent>;
 }
 
-/// `tokio-tungstenite`-backed market stream with reconnect and heartbeat.
+/// `tokio-tungstenite`-backed market stream with reconnect and heartbeat,
+/// built on [`RawWsConn`].
 pub struct WsMarketStream {
     network: Network,
     subs: Vec<Subscription>,
-    socket: Socket,
-    ping: tokio::time::Interval,
-    last_data: Instant,
+    conn: RawWsConn,
 }
 
 impl WsMarketStream {
     /// Dial the network and subscribe to `subs`.
     pub async fn connect(network: Network, subs: &[Subscription]) -> Result<Self> {
-        let socket = Self::dial(network).await?;
-        let mut stream = Self {
+        let planned: Vec<String> = subs.iter().map(encode_subscription).collect();
+        let conn = RawWsConn::connect(Box::new(HlProtocol::new(network)), planned).await?;
+        Ok(Self {
             network,
-            subs: Vec::new(),
-            socket,
-            ping: tokio::time::interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL),
-            last_data: Instant::now(),
-        };
-        stream.subscribe(subs).await?;
-        Ok(stream)
+            subs: subs.to_vec(),
+            conn,
+        })
     }
 
     /// Milliseconds since the last decoded inbound frame.
     pub fn idle_ms(&self) -> u128 {
-        self.last_data.elapsed().as_millis()
+        self.conn.idle_ms()
     }
 
-    async fn dial(network: Network) -> Result<Socket> {
-        ensure_crypto_provider();
-        let (socket, _resp) = connect_async(network.ws_url())
-            .await
-            .map_err(|e| Error::Http(e.to_string()))?;
-        metrics::gauge!(names::WS_CONNECTED).set(1.0);
-        Ok(socket)
-    }
-
-    async fn send_sub(&mut self, sub: &Subscription) -> Result<()> {
-        let msg = json!({ "method": "subscribe", "subscription": sub }).to_string();
-        self.socket
-            .send(Message::Text(msg.into()))
-            .await
-            .map_err(|e| Error::Http(e.to_string()))
-    }
-
-    async fn reconnect(&mut self) -> Result<()> {
-        metrics::gauge!(names::WS_CONNECTED).set(0.0);
-        let mut attempt: u32 = 0;
-        loop {
-            attempt += 1;
-            let shift = attempt.min(BACKOFF_MAX_SHIFT) - 1;
-            let backoff = BACKOFF_BASE.saturating_mul(1 << shift).min(BACKOFF_MAX);
-            tokio::time::sleep(backoff).await;
-
-            match Self::dial(self.network).await {
-                Ok(socket) => {
-                    self.socket = socket;
-                    metrics::counter!(names::WS_RECONNECTS, "reason" => "reconnect").increment(1);
-                    tracing::info!(attempt, "websocket reconnected");
-                    let subs = self.subs.clone();
-                    for sub in &subs {
-                        self.send_sub(sub).await?;
-                    }
-                    self.last_data = Instant::now();
-                    return Ok(());
-                }
-                Err(err) => {
-                    tracing::warn!(attempt, error = %err, "websocket reconnect failed");
-                }
-            }
-        }
+    /// The network this stream is connected to.
+    pub fn network(&self) -> Network {
+        self.network
     }
 }
 
 #[async_trait]
 impl MarketStream for WsMarketStream {
     async fn subscribe(&mut self, subs: &[Subscription]) -> Result<()> {
+        // The raw connection resubscribes the planned set on reconnect; here we
+        // only need to record new plans. Sending is handled by the raw layer at
+        // (re)connect time, so no immediate send is required per subscription.
         for sub in subs {
             if self.subs.iter().any(|existing| same_sub(existing, sub)) {
                 continue;
             }
-            self.send_sub(sub).await?;
             self.subs.push(sub.clone());
         }
         Ok(())
@@ -181,40 +130,33 @@ impl MarketStream for WsMarketStream {
 
     async fn next(&mut self) -> Result<StreamEvent> {
         loop {
-            tokio::select! {
-                msg = self.socket.next() => match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        self.last_data = Instant::now();
-                        match decode(&text) {
-                            Ok(Some(event)) => return Ok(event),
-                            Ok(None) => {}
-                            Err(err) => {
-                                metrics::counter!(names::WS_PARSE_ERRORS).increment(1);
-                                tracing::debug!(error = %err, "skipping undecodable frame");
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {}
-                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => {
-                        tracing::warn!("websocket closed; reconnecting");
-                        self.reconnect().await?;
-                    }
-                    Some(Err(err)) => {
-                        tracing::warn!(error = %err, "websocket error; reconnecting");
-                        self.reconnect().await?;
+            match self.conn.next().await? {
+                RawEvent::Text { text, .. } => match decode(&text) {
+                    Ok(Some(event)) => return Ok(event),
+                    Ok(None) => {}
+                    Err(err) => {
+                        metrics::counter!(names::WS_PARSE_ERRORS).increment(1);
+                        tracing::debug!(error = %err, "skipping undecodable frame");
                     }
                 },
-                _ = self.ping.tick() => {
-                    let ping = json!({ "method": "ping" }).to_string();
-                    if let Err(err) = self.socket.send(Message::Text(ping.into())).await {
-                        tracing::warn!(error = %err, "ping failed; reconnecting");
-                        self.reconnect().await?;
+                RawEvent::Binary { .. } => {}
+                RawEvent::Opened { .. } => {
+                    metrics::gauge!(names::WS_CONNECTED).set(1.0);
+                }
+                RawEvent::Gap { reason, detail } => {
+                    metrics::gauge!(names::WS_CONNECTED).set(0.0);
+                    if reason == "shutdown" {
+                        return Err(Error::Http(format!("websocket {reason}: {detail}")));
                     }
+                    tracing::debug!(reason, detail, "market feed gap");
                 }
             }
         }
     }
+}
+
+fn encode_subscription(sub: &Subscription) -> String {
+    serde_json::to_string(sub).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Install the process-wide rustls crypto provider once (idempotent).
@@ -273,6 +215,7 @@ fn parse_mids(value: serde_json::Value) -> Result<AllMids> {
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
+    use serde_json::json;
 
     use super::*;
 

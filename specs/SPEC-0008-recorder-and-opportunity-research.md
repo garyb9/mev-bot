@@ -734,7 +734,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | V-13 | Historical options data: vendors, coverage, cost; owner decides whether to buy | T3-data | S | V-9 | ☐ |
 | R-1 | `mev-recorder` crate skeleton + envelope types | T1 | S | — | ☐ |
 | R-2 | Segment writer (zstd, rotation, manifest, crash recovery, disk guard) | T1 | M | R-1 | ☐ |
-| R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | **T0** | M | — | ☐ |
+| R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | **T0** | M | — | ✅ |
 | R-4 | Subscription planner + universe selectors | T1 | M | R-1 | ☐ |
 | R-5 | HL REST snapshotter with weight budget (incl. candle backfill) | T1 | M | R-1, R-2 | ☐ |
 | R-6 | `hl record` / `record plan` / `probe latency` CLI, profiles, metrics, health | T1 | M | R-2, R-3, R-4, R-5 | ☐ |
@@ -859,6 +859,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Do:** Implement §7.5 in `crates/mev-hl-client/src/raw_ws.rs`. Make the URL, subscribe payloads, and keepalive message pluggable via a small `Protocol` trait (HL / Binance / Bybit implementations come later; ship HL now). Rebuild `WsMarketStream` on top of `RawWsConn` (it decodes the `Text` events with the existing `decode`). Add `rand` for jitter if it's not already present.
 - **Tests (local mock WS server):** reconnect after the server closes; resubscribe order preserved; the watchdog fires when the server goes silent; a `Gap` then `Opened` is emitted; cancellation stops a reconnect loop mid-backoff; all existing `ws.rs` tests still pass.
 - **Done when:** tests pass and `hl watch BTC` still works manually.
+- **Implemented (2026-09-26):** `raw_ws.rs` ships `RawWsConn`, the `Protocol` trait (+ `HlProtocol`), and `RawEvent`; `WsMarketStream` is rebased on it. Jitter uses a std-hasher PRNG rather than adding the `rand` crate (no new dependency; spreading reconnect storms does not need cryptographic randomness). `RawEvent::Opened` is yielded after each (re)connect and `Gap` carries `watchdog`/`closed`/`error`/`shutdown`. The watchdog resets on any inbound frame including `pong`.
 
 #### R-4 — Subscription planner
 - **Do:** Implement the §7.3 selectors and the §7.4 algorithm in `crates/mev-recorder/src/planner.rs`. Input: profile + `AssetMap` + the ctx data needed for `top:N` (pass it in; the planner does no I/O). Output: a `Plan` with a pretty table `Display`.
