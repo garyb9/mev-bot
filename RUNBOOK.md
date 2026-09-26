@@ -122,6 +122,24 @@ Symptom: `live` submissions rejected with a stale/duplicate nonce. Fix:
 
 The master key is never placed on the host.
 
+## Replay a recorded session
+
+`simulate` and `live` record their inputs (market feed, account snapshots, and
+the 1 s decision tick) to the `events` table. Replay re-drives the configured
+strategies from that log with no network or clock, and prints an FNV-1a-64
+fingerprint over the emitted placements:
+
+```sh
+# Replay the most recent session (prints events=, intents=, fingerprint=)
+cargo run -p mev-bot -- replay
+
+# Replay a specific session id
+cargo run -p mev-bot -- replay --session 12 --db data/hlbot.db
+```
+
+Identical logs must yield an identical fingerprint; a change means the strategy
+is non-deterministic (a bug — see SPEC-0003 §10). Replay never dials the network.
+
 ## Database (SQLite)
 
 - Path: `HL_DB_PATH` (default `data/hlbot.db`), WAL mode.

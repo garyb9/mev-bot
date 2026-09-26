@@ -107,6 +107,15 @@ enum Command {
         #[arg(long)]
         remove: Vec<String>,
     },
+    /// Deterministically replay a recorded session (SPEC-0003 §10).
+    Replay {
+        /// Session id to replay (default: the most recent).
+        #[arg(long)]
+        session: Option<i64>,
+        /// SQLite database path override.
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -237,6 +246,7 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
         Command::Order(args) => order(network, args).await,
         Command::Account { address } => account(network, address).await,
         Command::Select { coins, add, remove } => select(network, coins, add, remove).await,
+        Command::Replay { session, db } => replay(network, session, db).await,
     }
 }
 
@@ -300,35 +310,50 @@ async fn run(
     }
 
     let exchange = live_exchange(&config)?;
-    let engine_task = match plan {
-        Some(plan) => {
-            let db = Db::open(&config.db_path)?;
-            let session_id = db.create_session(
-                &format!("{:?}", config.network),
-                &format!("{:?}", config.mode),
-                None,
-                SystemClock.now_ms(),
-            )?;
-            let writer = Arc::new(DbWriter::spawn(db, 4096));
-            let engine = engine::Engine::new(plan, &config, exchange.clone(), writer, session_id);
-            let account = engine.account();
-            let poller = config.account_address.clone().map(|address| {
-                let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::new(config.network));
-                tokio::spawn(engine::account_poller(
-                    info,
-                    address,
-                    account,
-                    config.network,
-                ))
-            });
-            info!(session_id, "recording session");
-            Some((tokio::spawn(engine.run(state.clone())), poller))
-        }
-        None => None,
+
+    // Simulate/live record their inputs to SQLite for deterministic replay.
+    let session = if config.mode == Mode::Observe {
+        None
+    } else {
+        let db = Db::open(&config.db_path)?;
+        let session_id = db.create_session(
+            &format!("{:?}", config.network),
+            &format!("{:?}", config.mode),
+            None,
+            SystemClock.now_ms(),
+        )?;
+        info!(session_id, "recording session");
+        Some((Arc::new(DbWriter::spawn(db, 4096)), session_id))
     };
+    let recorder = session
+        .as_ref()
+        .map(|(writer, session_id)| engine::Recorder::new(writer.clone(), *session_id));
+
+    let engine_task = plan.map(|plan| {
+        let (writer, session_id) = session
+            .clone()
+            .expect("engine requires a recording session");
+        let engine = engine::Engine::new(plan, &config, exchange.clone(), writer, session_id);
+        let account = engine.account();
+        let poller = config.account_address.clone().map(|address| {
+            let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::new(config.network));
+            tokio::spawn(engine::account_poller(
+                info,
+                address,
+                account,
+                config.network,
+            ))
+        });
+        (tokio::spawn(engine.run(state.clone())), poller)
+    });
 
     let heartbeat = tokio::spawn(heartbeat());
-    let ingest = tokio::spawn(ingest(state.clone(), subscriptions, config.network));
+    let ingest = tokio::spawn(ingest(
+        state.clone(),
+        subscriptions,
+        config.network,
+        recorder,
+    ));
     let monitor = tokio::spawn(monitor(state, health.clone()));
     let deadman = exchange
         .clone()
@@ -462,6 +487,7 @@ async fn ingest(
     state: Arc<RwLock<MarketState>>,
     subscriptions: Vec<Subscription>,
     network: Network,
+    recorder: Option<engine::Recorder>,
 ) {
     loop {
         match WsMarketStream::connect(network, &subscriptions).await {
@@ -473,6 +499,12 @@ async fn ingest(
                 loop {
                     match stream.next().await {
                         Ok(event) => {
+                            if let Some(recorder) = &recorder {
+                                recorder.record(
+                                    &mev_strategy::Event::Market(event.clone()),
+                                    SystemClock.now_ms(),
+                                );
+                            }
                             if let Ok(mut guard) = state.write() {
                                 guard.apply(&event);
                             }
@@ -718,6 +750,29 @@ async fn account(network: Option<NetworkArg>, address: String) -> Result<()> {
             order.oid,
         );
     }
+    Ok(())
+}
+
+/// Deterministically replay a recorded session and print its fingerprint.
+async fn replay(
+    network: Option<NetworkArg>,
+    session: Option<i64>,
+    db: Option<PathBuf>,
+) -> Result<()> {
+    let network = resolve_network(network)?;
+    let overrides = ConfigOverrides {
+        network: Some(network),
+        db_path: db,
+        ..Default::default()
+    };
+    let config = Config::load(overrides)?;
+    let selector = selector_for(config.network, &config.watchlist).await?;
+
+    let outcome = engine::replay(&config, &selector, session, &config.db_path).await?;
+    println!(
+        "replay: events={} intents={} fingerprint=0x{:016x}",
+        outcome.events, outcome.intents, outcome.fingerprint
+    );
     Ok(())
 }
 

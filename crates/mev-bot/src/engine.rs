@@ -9,16 +9,16 @@ use anyhow::{Context as _, Result};
 use mev_core::clock::{Clock, SystemClock};
 use mev_core::config::{Config, Mode, Network};
 use mev_core::db::writer::{DbWriter, WriteCmd};
-use mev_core::db::{FillRecord, OrderRecord};
+use mev_core::db::{Db, EventRow, FillRecord, OrderRecord};
 use mev_hl_client::{
     AssetMap, CancelByCloidWire, CancelWire, ExchangeApi, InfoApi, MIN_ORDER_NOTIONAL,
-    MarketSelector, MarketState, OrderParams, Subscription, build_order_wire,
+    MarketSelector, MarketState, OrderParams, Subscription, Tolerance, build_order_wire,
 };
 use mev_risk::{Decision, LimitRisk, Limits, RiskCheck, RiskContext};
 use mev_strategy::{
-    AccountView, Action, BookView, CancelIntent, CostModel, FeeRates, FillEvent, FundingBasis,
-    FundingConfig, Instrument, MarketMaker, MarketView, MmConfig, OpenOrderView, OrderIntent,
-    PaperExecutor, PositionView, Strategy, StrategyContext, StrategyId, Trigger,
+    AccountView, Action, BookView, CancelIntent, CostModel, Event, FeeRates, FillEvent,
+    FundingBasis, FundingConfig, Instrument, MarketMaker, MarketView, MmConfig, OpenOrderView,
+    OrderIntent, PaperExecutor, PositionView, Strategy, StrategyContext, StrategyId, Trigger,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -144,6 +144,55 @@ fn build_funding(
     Ok(())
 }
 
+/// Appends input events to the SQLite replay log.
+#[derive(Clone)]
+pub struct Recorder {
+    writer: Arc<DbWriter>,
+    session_id: i64,
+}
+
+impl Recorder {
+    /// Build a recorder bound to a session.
+    pub fn new(writer: Arc<DbWriter>, session_id: i64) -> Self {
+        Self { writer, session_id }
+    }
+
+    /// The underlying writer (for order/fill records).
+    pub fn writer(&self) -> &Arc<DbWriter> {
+        &self.writer
+    }
+
+    /// The session these events belong to.
+    pub fn session_id(&self) -> i64 {
+        self.session_id
+    }
+
+    /// Record one input event at `ts_ms`.
+    pub fn record(&self, event: &Event, ts_ms: u64) {
+        match serde_json::to_string(event) {
+            Ok(payload) => {
+                self.writer.try_send(WriteCmd::Event {
+                    session_id: self.session_id,
+                    ts_ms,
+                    kind: event_kind(event).to_string(),
+                    payload,
+                });
+            }
+            Err(err) => warn!(error = %err, "failed to encode event for recording"),
+        }
+    }
+}
+
+/// The replay-log tag for an event.
+pub fn event_kind(event: &Event) -> &'static str {
+    match event {
+        Event::Market(_) => "market",
+        Event::Account(_) => "account",
+        Event::Timer { .. } => "timer",
+        Event::Fill(_) => "fill",
+    }
+}
+
 /// The running strategy engine.
 pub struct Engine {
     strategies: Vec<Box<dyn Strategy>>,
@@ -154,8 +203,7 @@ pub struct Engine {
     paper: Option<PaperExecutor>,
     exchange: Option<Arc<dyn ExchangeApi>>,
     account: Arc<RwLock<AccountView>>,
-    session_id: i64,
-    writer: Arc<DbWriter>,
+    recorder: Recorder,
 }
 
 impl Engine {
@@ -196,8 +244,7 @@ impl Engine {
             paper,
             exchange,
             account: Arc::new(RwLock::new(AccountView::default())),
-            session_id,
-            writer,
+            recorder: Recorder::new(writer, session_id),
         }
     }
 
@@ -231,6 +278,10 @@ impl Engine {
             Some(paper) => paper.account().clone(),
             None => self.account.read().expect("account lock poisoned").clone(),
         };
+
+        // Record the decision-cycle inputs so the run can be replayed offline.
+        self.recorder.record(&Event::Account(account.clone()), now);
+        self.recorder.record(&Event::Timer { every_ms: 1_000 }, now);
 
         let mut proposals: Vec<Vec<Action>> = Vec::new();
         for strategy in &mut self.strategies {
@@ -287,20 +338,7 @@ impl Engine {
     }
 
     fn snapshot_market(&self, state: &MarketState) -> MarketView {
-        let mut view = MarketView::new();
-        for coin in &self.coins {
-            if let Some(book) = state.book(coin) {
-                let sz = self.sz_decimals.get(coin).copied().unwrap_or(0);
-                view.insert_book(coin.clone(), BookView::from_order_book(book, sz));
-            }
-            if let Some(ctx) = state.ctx(coin) {
-                view.insert_ctx(coin.clone(), ctx.clone());
-            }
-        }
-        if let Some(mids) = state.mids() {
-            view.set_mids(mids.clone());
-        }
-        view
+        build_market_view(state, &self.coins, &self.sz_decimals)
     }
 
     async fn gate_and_execute(
@@ -392,8 +430,8 @@ impl Engine {
             rationale: None,
             status: None,
         };
-        self.writer.try_send(WriteCmd::Order {
-            session_id: self.session_id,
+        self.recorder.writer().try_send(WriteCmd::Order {
+            session_id: self.recorder.session_id(),
             record,
         });
     }
@@ -451,8 +489,8 @@ impl Engine {
             rationale: Some(intent.rationale.clone()),
             status: status.map(str::to_string),
         };
-        self.writer.try_send(WriteCmd::Order {
-            session_id: self.session_id,
+        self.recorder.writer().try_send(WriteCmd::Order {
+            session_id: self.recorder.session_id(),
             record,
         });
     }
@@ -477,8 +515,8 @@ impl Engine {
             closed_pnl: None,
             strategy: fill.strategy.as_ref().map(StrategyId::to_string),
         };
-        self.writer.try_send(WriteCmd::Fill {
-            session_id: self.session_id,
+        self.recorder.writer().try_send(WriteCmd::Fill {
+            session_id: self.recorder.session_id(),
             record,
         });
     }
@@ -573,4 +611,232 @@ async fn load_account(info: &dyn InfoApi, address: &str, _network: Network) -> R
         margin_used: clearing.margin_summary.total_margin_used,
         withdrawable: clearing.withdrawable,
     })
+}
+
+/// Build a market snapshot from state for the given coins.
+fn build_market_view(
+    state: &MarketState,
+    coins: &[String],
+    sz_decimals: &BTreeMap<String, u32>,
+) -> MarketView {
+    let mut view = MarketView::new();
+    for coin in coins {
+        if let Some(book) = state.book(coin) {
+            let sz = sz_decimals.get(coin).copied().unwrap_or(0);
+            view.insert_book(coin.clone(), BookView::from_order_book(book, sz));
+        }
+        if let Some(ctx) = state.ctx(coin) {
+            view.insert_ctx(coin.clone(), ctx.clone());
+        }
+    }
+    if let Some(mids) = state.mids() {
+        view.set_mids(mids.clone());
+    }
+    view
+}
+
+/// Outcome of a deterministic replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayOutcome {
+    /// Events consumed.
+    pub events: usize,
+    /// Intents emitted across every timer cycle.
+    pub intents: usize,
+    /// Stable fingerprint of the emitted intents; identical inputs must match.
+    pub fingerprint: u64,
+}
+
+/// Re-drive strategies from a recorded event log with no network or clock.
+///
+/// Market events update a local [`MarketState`], account events replace the
+/// account snapshot, and timer events run one decision cycle at the recorded
+/// event time. Only placements are fingerprinted (cancels are covered by the
+/// `cloid`s they reference).
+pub async fn replay_events(
+    rows: &[EventRow],
+    strategies: &mut [Box<dyn Strategy>],
+    coins: &[String],
+    sz_decimals: &BTreeMap<String, u32>,
+) -> Result<ReplayOutcome> {
+    let mut state = MarketState::new(Tolerance::default());
+    for coin in coins {
+        state.expect_book(coin);
+    }
+
+    let mut account = AccountView::default();
+    let mut trace = String::new();
+    let mut intents = 0usize;
+
+    for row in rows {
+        let event: Event = serde_json::from_str(&row.payload)
+            .with_context(|| format!("decoding event seq {}", row.seq))?;
+        match event {
+            Event::Market(market_event) => state.apply(&market_event),
+            Event::Account(view) => account = view,
+            Event::Timer { .. } => {
+                let market = build_market_view(&state, coins, sz_decimals);
+                for strategy in strategies.iter_mut() {
+                    let ctx = StrategyContext {
+                        now_ms: row.ts_ms,
+                        trigger: Trigger::Timer,
+                        market: &market,
+                        account: &account,
+                    };
+                    for action in strategy.on_event(&ctx).await? {
+                        if let Action::Place(intent) = action {
+                            intents += 1;
+                            trace.push_str(&serde_json::to_string(&intent)?);
+                        }
+                    }
+                }
+            }
+            Event::Fill(_) => {}
+        }
+    }
+
+    Ok(ReplayOutcome {
+        events: rows.len(),
+        intents,
+        fingerprint: fingerprint(trace.as_bytes()),
+    })
+}
+
+/// FNV-1a 64-bit fingerprint.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Load a session's events and replay them with the configured strategies.
+pub async fn replay(
+    cfg: &Config,
+    selector: &MarketSelector,
+    session_id: Option<i64>,
+    db_path: &std::path::Path,
+) -> Result<ReplayOutcome> {
+    let db = Db::open(db_path)?;
+    let session_id = match session_id {
+        Some(id) => id,
+        None => db
+            .latest_session()?
+            .context("no recorded sessions; run `hl run --mode simulate` first")?,
+    };
+    let rows = db.read_events(session_id)?;
+    let mut build = build(cfg, selector)?;
+    let outcome = replay_events(
+        &rows,
+        &mut build.strategies,
+        &build.coins,
+        &build.sz_decimals,
+    )
+    .await?;
+    info!(
+        session_id,
+        events = outcome.events,
+        intents = outcome.intents,
+        "replay complete"
+    );
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+
+    use mev_hl_client::StreamEvent;
+    use mev_hl_client::types::{L2Book, Level};
+
+    use super::*;
+
+    fn ds(value: &str) -> Decimal {
+        Decimal::from_str(value).unwrap()
+    }
+
+    fn row(seq: u64, ts_ms: u64, kind: &str, event: &Event) -> EventRow {
+        EventRow {
+            seq,
+            ts_ms,
+            kind: kind.to_string(),
+            payload: serde_json::to_string(event).unwrap(),
+        }
+    }
+
+    fn book_row(seq: u64, ts_ms: u64, bid: &str, ask: &str) -> EventRow {
+        let event = StreamEvent::Book(L2Book {
+            coin: "BTC".into(),
+            time: ts_ms,
+            levels: [
+                vec![Level {
+                    px: ds(bid),
+                    sz: ds("10"),
+                    n: 1,
+                }],
+                vec![Level {
+                    px: ds(ask),
+                    sz: ds("10"),
+                    n: 1,
+                }],
+            ],
+        });
+        row(seq, ts_ms, "market", &Event::Market(event))
+    }
+
+    fn timer_row(seq: u64, ts_ms: u64) -> EventRow {
+        row(seq, ts_ms, "timer", &Event::Timer { every_ms: 1_000 })
+    }
+
+    fn account_row(seq: u64, ts_ms: u64) -> EventRow {
+        row(
+            seq,
+            ts_ms,
+            "account",
+            &Event::Account(AccountView::default()),
+        )
+    }
+
+    fn strategies() -> Vec<Box<dyn Strategy>> {
+        vec![Box::new(MarketMaker::new(MmConfig {
+            coin: "BTC".into(),
+            levels: 2,
+            half_spread_bps: ds("5"),
+            level_step_bps: ds("5"),
+            size_per_level: ds("1"),
+            max_inventory: ds("10"),
+            max_skew_bps: ds("5"),
+            vol_pull_bps: ds("50"),
+            refresh_bps: ds("2"),
+        }))]
+    }
+
+    #[tokio::test]
+    async fn replay_is_deterministic() {
+        let rows = vec![
+            book_row(0, 1, "100", "100"),
+            account_row(1, 1),
+            timer_row(2, 1),
+            book_row(3, 2, "101", "101"),
+            timer_row(4, 2),
+        ];
+        let coins = vec!["BTC".to_string()];
+        let mut sz_decimals = BTreeMap::new();
+        sz_decimals.insert("BTC".to_string(), 3u32);
+
+        let mut first = strategies();
+        let a = replay_events(&rows, &mut first, &coins, &sz_decimals)
+            .await
+            .unwrap();
+        let mut second = strategies();
+        let b = replay_events(&rows, &mut second, &coins, &sz_decimals)
+            .await
+            .unwrap();
+
+        assert_eq!(a, b, "same log must replay identically");
+        assert!(a.intents > 0, "the ladder should place quotes");
+        assert_ne!(a.fingerprint, 0);
+    }
 }

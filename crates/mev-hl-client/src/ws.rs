@@ -63,8 +63,12 @@ pub enum Subscription {
 }
 
 /// A decoded market-data event.
+///
+/// Adjacently tagged (`{"channel": …, "data": …}`) rather than internally
+/// tagged so the sequence-carrying `Trades` variant round-trips through serde;
+/// the wire decoder is manual, so this shape only affects the event log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "channel", rename_all = "camelCase")]
+#[serde(tag = "channel", content = "data", rename_all = "camelCase")]
 pub enum StreamEvent {
     /// Mid prices for all coins.
     Mids(AllMids),

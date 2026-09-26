@@ -99,7 +99,7 @@ pub struct OrderIntent {
 
 ## 10. Backtesting & replay
 
-- Record market/account events to the SQLite store (SPEC-0004) and export fixtures; replay drives strategies deterministically.
+- Record market/account events to the SQLite store (SPEC-0004) and export fixtures; replay drives strategies deterministically. **Implemented:** `Recorder` writes each `Event::{Market,Account,Timer}`; `hl replay [--session <id>]` re-drives the configured strategies offline and prints an FNV-1a-64 intent fingerprint (covered by `replay_is_deterministic`).
 - `simulate` mode fills intents against the live book (or recorded book) and reports expected-vs-realized edge.
 - Metrics from replay feed strategy tuning without live capital.
 
@@ -150,3 +150,5 @@ What exists in code, and where it departs from this spec. SPEC-0010 is the sourc
 | Strategy B: market-making | `mm.rs` (inventory skew, cancel/replace) | Built ahead of research (allowed: GOAL §2.1); cancel+place instead of modify | Port to v2 with `Modify` (SPEC-0010 E-4). **Doesn't trade live** without G1/G1.5. |
 | Paper execution | `paper.rs` | Fills only on the tick | Becomes `PaperExec` behind SPEC-0010 §14 |
 | Capital allocation (§9) | — | Not implemented | After SPEC-0010; needed only once ≥ 2 strategies run live |
+| Recording (§10) | `mev-bot/src/engine.rs` (`Recorder`), `mev-core/src/db.rs` | Records replay inputs (`Market`/`Account`/`Timer`), not outputs | Feed the event log to SPEC-0010's event bus; add `Fill` recording there |
+| Replay (§10) | `mev-bot/src/engine.rs` (`replay_events`, `replay`), `hl replay` | Deterministic: same log ⇒ same FNV-1a-64 intent fingerprint | Keep as the backtest spine; extend with fixtures (SPEC-0008 §13) |
