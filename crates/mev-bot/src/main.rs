@@ -3,13 +3,21 @@
 //! M0.x: platform (config, observability, health, shutdown).
 //! M1.1:  REST `/info` client and the `markets`/`book` commands.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
 use mev_core::config::{Config, ConfigOverrides, Mode, Network};
-use mev_hl_client::{HttpInfo, InfoApi, MarketStream, StreamEvent, Subscription, WsMarketStream};
+use mev_hl_client::{
+    HttpInfo, InfoApi, MarketState, MarketStream, StreamEvent, Subscription, Tolerance,
+    WsMarketStream,
+};
 use mev_metrics::{health::Health, prometheus::PrometheusHandle};
 use tokio::signal;
 use tracing::{error, info};
@@ -187,17 +195,87 @@ async fn run(
     );
 
     let health = Health::new();
-    health.set_ready(true);
-    info!(mode = ?config.mode, "ready");
+    let state = Arc::new(RwLock::new(MarketState::new(Tolerance::default())));
+    {
+        let mut guard = state.write().expect("market state lock poisoned");
+        for coin in &config.watchlist {
+            guard.expect_book(coin);
+            guard.expect_ctx(coin);
+        }
+    }
 
-    // No-op observe loop: the process stays alive, reports liveness via
-    // heartbeat, and shuts down cleanly. Real ingestion lands with SPEC-0001.
     let heartbeat = tokio::spawn(heartbeat());
+    let ingest = tokio::spawn(ingest(
+        state.clone(),
+        config.watchlist.clone(),
+        config.network,
+    ));
+    let monitor = tokio::spawn(monitor(state, health.clone()));
 
+    info!("waiting for feeds to become ready");
     serve(health, metrics, config.http_port).await?;
+
+    ingest.abort();
+    monitor.abort();
     heartbeat.abort();
     info!("shutdown complete");
     Ok(())
+}
+
+/// Ingest market data into the shared state until the process stops.
+async fn ingest(state: Arc<RwLock<MarketState>>, coins: Vec<String>, network: Network) {
+    loop {
+        let mut subs = Vec::with_capacity(coins.len() * 3);
+        for coin in &coins {
+            subs.push(Subscription::L2Book { coin: coin.clone() });
+            subs.push(Subscription::ActiveAssetCtx { coin: coin.clone() });
+            subs.push(Subscription::Trades { coin: coin.clone() });
+        }
+
+        match WsMarketStream::connect(network, &subs).await {
+            Ok(mut stream) => {
+                info!(coins = ?coins, "market stream connected");
+                loop {
+                    match stream.next().await {
+                        Ok(event) => {
+                            if let Ok(mut guard) = state.write() {
+                                guard.apply(&event);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "market stream ended");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "market stream connect failed"),
+        }
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Publish feed staleness and readiness while the process runs.
+async fn monitor(state: Arc<RwLock<MarketState>>, health: Health) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let now = Instant::now();
+        let (ready, ages) = {
+            let guard = state.read().expect("market state lock poisoned");
+            (guard.is_ready(now), guard.ages(now))
+        };
+        health.set_ready(ready);
+        for age in ages {
+            metrics::gauge!(
+                mev_metrics::names::FEED_STALENESS_SECONDS,
+                "feed" => age.feed,
+                "coin" => age.coin,
+            )
+            .set(age.age_secs.min(1e9));
+        }
+    }
 }
 
 async fn markets(
@@ -371,8 +449,6 @@ fn not_yet(what: &str) -> Result<()> {
 }
 
 async fn heartbeat() {
-    use std::time::{Duration, Instant};
-
     let started = Instant::now();
     let mut interval = tokio::time::interval(Duration::from_secs(15));
     loop {
