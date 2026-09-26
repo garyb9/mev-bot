@@ -54,4 +54,28 @@ pub mod names {
     pub const STRATEGY_EDGE_BPS: &str = "hl_strategy_edge_bps";
     /// Paper trading fees paid in USD.
     pub const PAPER_FEES_PAID: &str = "hl_paper_fees_paid_usd";
+    /// Engine decode span: `t_decoded − t_recv` (SPEC-0010 §17).
+    pub const ENGINE_DECODE_SECONDS: &str = "hl_engine_decode_seconds";
+    /// Engine queue span: `t_dequeued − t_decoded` (SPEC-0010 §17).
+    pub const ENGINE_QUEUE_SECONDS: &str = "hl_engine_queue_seconds";
+    /// Engine decide span: `t_decided − t_dequeued` (SPEC-0010 §17).
+    pub const ENGINE_DECIDE_SECONDS: &str = "hl_engine_decide_seconds";
+    /// Engine risk span: `t_risked − t_decided` (SPEC-0010 §17).
+    pub const ENGINE_RISK_SECONDS: &str = "hl_engine_risk_seconds";
+    /// Engine sign span: `t_signed − t_risked` (SPEC-0010 §17).
+    pub const ENGINE_SIGN_SECONDS: &str = "hl_engine_sign_seconds";
+    /// Engine handoff span: `t_written − t_signed` (SPEC-0010 §17).
+    pub const ENGINE_HANDOFF_SECONDS: &str = "hl_engine_handoff_seconds";
+    /// Headline internal latency: `t_written − t_recv` (SPEC-0010 §17, GOAL §5.2).
+    pub const TICK_TO_ORDER_SECONDS: &str = "hl_tick_to_order_seconds";
+    /// Submit-to-ack span: `t_ack − t_written` (SPEC-0010 §17).
+    pub const SUBMIT_ACK_SECONDS: &str = "hl_submit_ack_seconds";
+    /// Engine loop iteration duration in seconds (SPEC-0010 §17).
+    pub const ENGINE_ITERATION_SECONDS: &str = "hl_engine_iteration_seconds";
+    /// Market events drained per engine iteration (SPEC-0010 §17).
+    pub const ENGINE_EVENTS_PER_ITERATION: &str = "hl_engine_events_per_iteration";
+    /// Market updates dropped on a full channel, tagged by coin (SPEC-0010 §17).
+    pub const ENGINE_MARKET_DROPS_TOTAL: &str = "hl_engine_market_drops_total";
+    /// Fraction of engine iterations that drained no events (SPEC-0010 §17).
+    pub const ENGINE_IDLE_RATIO: &str = "hl_engine_idle_ratio";
 }

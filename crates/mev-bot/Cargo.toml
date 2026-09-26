@@ -31,3 +31,9 @@ mev-strategy.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+criterion.workspace = true
+crossbeam-channel.workspace = true
+
+[[bench]]
+name = "engine"
+harness = false

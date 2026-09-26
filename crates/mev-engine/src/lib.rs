@@ -16,6 +16,7 @@ pub mod builder;
 pub mod channels;
 pub mod exec;
 pub mod ingest;
+pub mod instrument;
 pub mod orders;
 pub mod paper_exec;
 pub mod reconcile;
