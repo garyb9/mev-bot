@@ -55,6 +55,7 @@ Used for account/security and fund movements (`approveAgent`, `approveBuilderFee
 ## 5. Nonce state machine
 
 - Nonce = **millisecond timestamp**, strictly increasing per agent wallet, within a recent window. The venue validates but never assigns it; nonces need only be strictly increasing, **not contiguous** (gaps are harmless).
+- **Verified 2026-09-26** ([Nonces and API wallets](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/nonces-and-api-wallets)): the venue stores the **100 highest nonces per signer** (the agent address for an API wallet). A new nonce must be (1) larger than the **smallest** nonce in that set, (2) never used before, and (3) within `(T − 2 days, T + 1 day)` of the block timestamp `T`. This supersedes the earlier vague "recent window"; the manager's default future-drift guard (60 s) is intentionally stricter than the venue's `T + 1 day`.
 - A single writer owns the nonce; the value is generated as `max(now_ms, last_nonce + 1)` and persisted before send (crash-safe). Single-writer serialization is enforced by the executor's lock.
 - **Self-healing:**
   - *Stale/duplicate/recent-window rejection* → resync to the wall clock (`last = max(last, now) + 1`) and retry; orders are idempotent via `cloid` (§7).
@@ -113,7 +114,7 @@ pub trait ExchangeApi {
 
 - Exchange responses carry a status; order results include `resting` / `filled` / `error` with per-order status strings (`badAloPxRejected`, `iocCancelRejected`, `perpMarginRejected`, `minTradeNtlRejected`, `tickRejected`, `reduceOnlyRejected`, `oracleRejected`, …). These are mapped to typed errors, never string-matched ad hoc.
 - **Never blind-retry an order** — retries are idempotent via `cloid`; a retry of the same logical order reuses the cloid or is suppressed.
-- Cancels are cheap and more rate-lenient; reconcile unknown outcomes via `orderStatus`.
+- Cancels are cheap and more rate-lenient; reconcile unknown outcomes via `orderStatus`. **Verified 2026-09-26** ([Info endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint)): `orderStatus.oid` accepts **either** a `u64` order id **or** a 16-byte hex `cloid` string, so an unknown order can be resolved by its client id without ever resending it (H-2). The response is nested — `{"status":"order","order":{"order":{…},"status":<state>,"statusTimestamp":…}}` for a hit, `{"status":"unknownOid"}` for a miss — and the inner `status` is the state (`open`/`filled`/`canceled`/rejected classes). The current `OrderStatusResponse` in `mev-hl-client/src/types.rs` models the flat shape and must be corrected for H-2 (see §18).
 - All rejects are metric-tagged by status for later analysis.
 
 ## 10. Rate & address limits
@@ -151,6 +152,7 @@ Orthogonal to the mode above; applies only in `live`.
 - If the process stalls, loses connectivity, or crashes, the exchange auto-cancels resting orders after the TTL — a dead bot cannot leave stale orders exposed.
 - TTL is configurable (`HL_SCHEDULE_CANCEL_TTL_MS`, default 30s), refreshed with margin below the TTL, and explicitly disarmed on graceful shutdown.
 - Armed status is a metric and a `/healthz` input; failure to refresh within the window raises an alert.
+- **Verified 2026-09-26** ([Exchange endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint)): the scheduled `time` must be **at least 5 s** in the future; omitting `time` removes the schedule; the trigger count increments only when the scheduled time arrives and cancels all open orders, with a **max of 10 triggers/day**, reset at **00:00 UTC**. Refreshing before the deadline re-arms without incrementing the trigger count, so a live heartbeat is not what burns the daily limit — but every arm/refresh still spends **address rate-limit budget** (H-4 arms only while orders rest for this reason).
 
 ## 13. Observability
 
@@ -194,7 +196,7 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 | H-6 | Nonce persistence off the hot path | T1 | S | H-9 | ☐ |
 | H-7 | Latency instrumentation + sign/submit benchmarks | T1 | M | H-1 | ☐ |
 | H-8 | `simulate` without keys (ephemeral signer) | T1 | S | — | ☐ |
-| H-9 | Verify the HL nonce and `scheduleCancel` rules | **T0** | S | — | ☐ |
+| H-9 | Verify the HL nonce and `scheduleCancel` rules | **T0** | S | — | ✅ |
 | H-10 | Testnet round-trip (the open §15 item) | T1 | S | **all T0 fixes** (GOAL §2.2), owner-provided testnet key | ☐ |
 
 **H-1 — Concurrent WS `post`.** Today `WsExchange::post` holds the socket mutex while it waits for the reply, so only one request is ever in flight. Replace this with: one writer handle (a channel into a socket-owning task); one reader task that routes `channel:"post"` replies by `id` to a `HashMap<u64, oneshot::Sender>`; a semaphore capping in-flight posts at 100 (the venue limit); a per-request timeout (default 5 s) that returns a typed `Error::UnknownOutcome`. On socket loss, fail every pending request with `UnknownOutcome`, reconnect (reuse `RawWsConn` from SPEC-0008 R-3 once it exists), and keep the connection warm with app-level pings. *Done when:* a mock-venue test sends 50 concurrent orders with shuffled reply order and each caller gets its own reply; a dropped socket fails pending calls with `UnknownOutcome`; the dead-man refresh no longer blocks order sends.
@@ -220,3 +222,4 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 ## 18. Open questions (M2.5)
 
 1. H-4 default TTL (120 s) vs strategy needs; market-making may want a shorter TTL with more budget.
+2. `OrderStatusResponse` (`mev-hl-client/src/types.rs`) models a flat `{"status":"order","order":{OpenOrder}}` shape, but the venue returns a nested `{"status":"order","order":{"order":{…},"status":<state>,"statusTimestamp":…}}` (verified 2026-09-26, see §9). H-2 must correct the type and its `is_filled`/resolution logic before using it for reconciliation.
