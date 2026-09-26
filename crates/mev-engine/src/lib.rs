@@ -12,7 +12,12 @@
 //! `mev-bot`; a crate above `mev-hl-client` keeps the graph acyclic
 //! (SPEC-0010 §23 Q1).
 
+pub mod channels;
 pub mod ingest;
+pub mod routes;
+pub mod run;
+pub mod state;
+pub mod timers;
 pub mod types;
 
 pub use types::{

@@ -8,6 +8,7 @@
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use crossbeam_channel as _;
 use mev_engine::ingest::Ingest;
 use mev_engine::types::{CoinRegistry, ConnId, Stamp};
 

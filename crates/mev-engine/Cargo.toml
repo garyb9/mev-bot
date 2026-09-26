@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+crossbeam-channel.workspace = true
 mev-core.workspace = true
 mev-hl-client.workspace = true
 mev-metrics.workspace = true
@@ -21,7 +22,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-crossbeam-channel.workspace = true
 
 [[bench]]
 name = "ingest"
