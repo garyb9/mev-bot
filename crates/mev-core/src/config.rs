@@ -75,6 +75,8 @@ pub struct Config {
     pub autonomy: Autonomy,
     /// Markets to trade.
     pub watchlist: Vec<String>,
+    /// Path to the persisted, CLI-editable watchlist file.
+    pub watchlist_path: PathBuf,
     /// SQLite database path.
     pub db_path: PathBuf,
     /// Dead-man's switch TTL in milliseconds.
@@ -95,6 +97,7 @@ impl Default for Config {
             mode: Mode::Observe,
             autonomy: Autonomy::Auto,
             watchlist: vec!["BTC".to_string(), "ETH".to_string(), "SOL".to_string()],
+            watchlist_path: PathBuf::from(crate::watchlist::DEFAULT_PATH),
             db_path: PathBuf::from("data/hlbot.db"),
             schedule_cancel_ttl_ms: 30_000,
             http_port: 9090,
@@ -139,6 +142,11 @@ impl Config {
         }
         if let Some(coins) = overrides.coins {
             config.watchlist = coins;
+        } else {
+            let persisted = crate::watchlist::load(&config.watchlist_path)?;
+            if !persisted.is_empty() {
+                config.watchlist = persisted;
+            }
         }
         if let Some(db_path) = overrides.db_path {
             config.db_path = db_path;
@@ -202,6 +210,7 @@ impl Config {
              mode: {mode:?}\n\
              autonomy: {autonomy:?}\n\
              watchlist: {watchlist:?}\n\
+             watchlist_path: {watchlist_path}\n\
              db_path: {db_path}\n\
              schedule_cancel_ttl_ms: {ttl}\n\
              http_port: {port}\n\
@@ -211,6 +220,7 @@ impl Config {
             mode = self.mode,
             autonomy = self.autonomy,
             watchlist = self.watchlist,
+            watchlist_path = self.watchlist_path.display(),
             db_path = self.db_path.display(),
             ttl = self.schedule_cancel_ttl_ms,
             port = self.http_port,

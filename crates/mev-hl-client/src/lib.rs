@@ -4,11 +4,13 @@
 //! backend-swappable traits. REST `/info` and the WebSocket market stream land
 //! in M1.1/M1.2; execution follows in later milestones.
 
+pub mod assets;
 pub mod client;
 pub mod market;
 pub mod types;
 pub mod ws;
 
+pub use assets::{AssetMap, Market, MarketKind, MarketSelector};
 pub use client::{HttpInfo, InfoApi};
 pub use market::{FEED_BOOK, FEED_CTX, FeedAge, MarketState, OrderBook, Tolerance};
 pub use types::{

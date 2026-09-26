@@ -6,6 +6,7 @@
 pub mod clock;
 pub mod config;
 pub mod error;
+pub mod watchlist;
 
 /// Human-readable name of the binary/product.
 pub const NAME: &str = "mev-bot";

@@ -31,6 +31,28 @@ or missing log means the runbook below applies.
 | `GET /readyz` | `200` when all required feeds are fresh; `503` otherwise |
 | `GET /metrics` | Prometheus scrape |
 
+## Markets & watchlist
+
+```sh
+# Discover markets (read-only): perps by default, HIP-3 via --dex, spot via --spot
+hl markets BTC
+hl markets --dex xyz TSLA
+hl dexs
+
+# Edit the persisted watchlist (validated against live metadata before saving)
+hl select BTC ETH SOL
+hl select --add xyz:TSLA          # HIP-3 is dex-qualified
+hl select --remove ETH
+hl select                         # print the current list
+
+# Override for a single run without persisting
+hl run --coins BTC,SOL
+```
+
+The watchlist is stored at `HL_WATCHLIST_PATH` (default `data/watchlist.txt`,
+one coin per line, `#` comments allowed). Precedence: `--coins` > persisted file
+> config/env default. Unknown or delisted coins fail fast before any subscription.
+
 ## Go live (checklist)
 
 1. Confirm the agent wallet is approved (Hyperliquid UI → Settings → API).

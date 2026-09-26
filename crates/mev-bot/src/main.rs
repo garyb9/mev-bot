@@ -15,8 +15,8 @@ use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
 use mev_core::config::{Config, ConfigOverrides, Mode, Network};
 use mev_hl_client::{
-    HttpInfo, InfoApi, MarketState, MarketStream, StreamEvent, Subscription, Tolerance,
-    WsMarketStream,
+    AssetMap, HttpInfo, InfoApi, Market, MarketKind, MarketSelector, MarketState, MarketStream,
+    StreamEvent, Subscription, Tolerance, WsMarketStream,
 };
 use mev_metrics::{health::Health, prometheus::PrometheusHandle};
 use tokio::signal;
@@ -56,6 +56,12 @@ enum Command {
     Markets {
         /// Optional filter substring.
         query: Option<String>,
+        /// Show perpetuals only.
+        #[arg(long)]
+        perp: bool,
+        /// Show spot pairs only.
+        #[arg(long)]
+        spot: bool,
         /// List a builder-deployed HIP-3 dex (e.g. `xyz`, `cash`) instead of the default.
         #[arg(long)]
         dex: Option<String>,
@@ -77,10 +83,12 @@ enum Command {
     },
     /// Edit the persisted watchlist (SPEC-0001).
     Select {
-        /// Coins to add.
+        /// Replace the watchlist with these coins.
+        coins: Vec<String>,
+        /// Add coins to the watchlist.
         #[arg(long)]
         add: Vec<String>,
-        /// Coins to remove.
+        /// Remove coins from the watchlist.
         #[arg(long)]
         remove: Vec<String>,
     },
@@ -154,11 +162,16 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
             }
             Ok(())
         }
-        Command::Markets { query, dex } => markets(network, query, dex).await,
+        Command::Markets {
+            query,
+            perp,
+            spot,
+            dex,
+        } => markets(network, query, perp, spot, dex).await,
         Command::Dexs => dexs(network).await,
         Command::Book { coin, levels } => book(network, coin, levels).await,
         Command::Watch { coins } => watch(network, coins).await,
-        Command::Select { add, remove } => not_yet(&format!("select +{add:?} -{remove:?}")),
+        Command::Select { coins, add, remove } => select(network, coins, add, remove).await,
     }
 }
 
@@ -183,6 +196,13 @@ async fn run(
     };
     let config = Config::load(overrides)?;
 
+    let selector = selector_for(config.network, &config.watchlist).await?;
+    let watchlist: Vec<String> = selector
+        .resolve_all(&config.watchlist)?
+        .iter()
+        .map(|market| market.coin.clone())
+        .collect();
+
     let metrics = mev_metrics::prometheus::install_recorder();
     metrics::counter!(mev_metrics::names::STARTUPS).increment(1);
 
@@ -190,7 +210,7 @@ async fn run(
         network = ?config.network,
         mode = ?config.mode,
         autonomy = ?config.autonomy,
-        watchlist = ?config.watchlist,
+        watchlist = ?watchlist,
         "starting"
     );
 
@@ -198,18 +218,14 @@ async fn run(
     let state = Arc::new(RwLock::new(MarketState::new(Tolerance::default())));
     {
         let mut guard = state.write().expect("market state lock poisoned");
-        for coin in &config.watchlist {
+        for coin in &watchlist {
             guard.expect_book(coin);
             guard.expect_ctx(coin);
         }
     }
 
     let heartbeat = tokio::spawn(heartbeat());
-    let ingest = tokio::spawn(ingest(
-        state.clone(),
-        config.watchlist.clone(),
-        config.network,
-    ));
+    let ingest = tokio::spawn(ingest(state.clone(), watchlist, config.network));
     let monitor = tokio::spawn(monitor(state, health.clone()));
 
     info!("waiting for feeds to become ready");
@@ -281,6 +297,8 @@ async fn monitor(state: Arc<RwLock<MarketState>>, health: Health) {
 async fn markets(
     network: Option<NetworkArg>,
     query: Option<String>,
+    perp: bool,
+    spot: bool,
     dex: Option<String>,
 ) -> Result<()> {
     let network = resolve_network(network)?;
@@ -288,6 +306,8 @@ async fn markets(
 
     let filter = query.unwrap_or_default().to_lowercase();
     let matches = |name: &str| filter.is_empty() || name.to_lowercase().contains(&filter);
+    let show_perp = perp || !spot;
+    let show_spot = spot || !perp;
 
     match dex {
         Some(dex) => {
@@ -303,34 +323,106 @@ async fn markets(
             }
         }
         None => {
-            let meta = info.meta().await?;
-            let spot = info.spot_meta().await?;
-            let dexs = info.perp_dexs().await.unwrap_or_default();
+            if show_perp {
+                let meta = info.meta().await?;
+                println!("perps ({}):", meta.universe.len());
+                for asset in &meta.universe {
+                    if matches(&asset.name) {
+                        println!(
+                            "  {:<12} szDecimals={} maxLeverage={}",
+                            asset.name, asset.sz_decimals, asset.max_leverage
+                        );
+                    }
+                }
 
-            println!("perps ({}):", meta.universe.len());
-            for asset in &meta.universe {
-                if matches(&asset.name) {
-                    println!(
-                        "  {:<12} szDecimals={} maxLeverage={}",
-                        asset.name, asset.sz_decimals, asset.max_leverage
-                    );
+                let dexs = info.perp_dexs().await.unwrap_or_default();
+                let names: Vec<&str> = dexs.iter().map(|d| d.name.as_str()).collect();
+                if !names.is_empty() {
+                    println!("hip-3 dexes: {} (use --dex <name>)", names.join(", "));
                 }
             }
 
-            println!("spot ({}):", spot.universe.len());
-            for pair in &spot.universe {
-                if matches(&pair.name) {
-                    println!("  {:<12} @{}", pair.name, pair.index);
+            if show_spot {
+                let spot = info.spot_meta().await?;
+                println!("spot ({}):", spot.universe.len());
+                for pair in &spot.universe {
+                    if matches(&pair.name) {
+                        println!("  {:<12} @{}", pair.name, pair.index);
+                    }
                 }
-            }
-
-            let names: Vec<&str> = dexs.iter().map(|d| d.name.as_str()).collect();
-            if !names.is_empty() {
-                println!("hip-3 dexes: {} (use --dex <name>)", names.join(", "));
             }
         }
     }
     Ok(())
+}
+
+/// Resolve and validate the persisted watchlist against live metadata.
+async fn select(
+    network: Option<NetworkArg>,
+    coins: Vec<String>,
+    add: Vec<String>,
+    remove: Vec<String>,
+) -> Result<()> {
+    let config = Config::load(ConfigOverrides {
+        network: network.map(Into::into),
+        ..Default::default()
+    })?;
+
+    let mut watchlist = mev_core::watchlist::load(&config.watchlist_path)?;
+    if watchlist.is_empty() {
+        watchlist = config.watchlist.clone();
+    }
+
+    if !coins.is_empty() {
+        watchlist = coins;
+    }
+    for coin in add {
+        if !watchlist.iter().any(|c| c.eq_ignore_ascii_case(&coin)) {
+            watchlist.push(coin);
+        }
+    }
+    if !remove.is_empty() {
+        watchlist.retain(|c| !remove.iter().any(|r| r.eq_ignore_ascii_case(c)));
+    }
+    if watchlist.is_empty() {
+        anyhow::bail!("refusing to persist an empty watchlist");
+    }
+
+    let selector = selector_for(config.network, &watchlist).await?;
+    let resolved = selector.resolve_all(&watchlist)?;
+    let canonical: Vec<String> = resolved.iter().map(|m| m.coin.clone()).collect();
+
+    mev_core::watchlist::save(&config.watchlist_path, &canonical)?;
+    println!(
+        "watchlist ({}): {}",
+        canonical.len(),
+        config.watchlist_path.display()
+    );
+    for market in &resolved {
+        println!("  {}", format_market(market));
+    }
+    Ok(())
+}
+
+/// Build a selector, loading HIP-3 metadata only when the list needs it.
+async fn selector_for(network: Network, coins: &[String]) -> Result<MarketSelector> {
+    let info = HttpInfo::new(network);
+    let include_hip3 = coins.iter().any(|coin| coin.contains(':'));
+    Ok(MarketSelector::new(
+        AssetMap::load(&info, include_hip3).await?,
+    ))
+}
+
+fn format_market(market: &Market) -> String {
+    let kind = match (market.kind, market.dex.as_deref()) {
+        (MarketKind::Perp, Some(dex)) => format!("perp {dex}"),
+        (MarketKind::Perp, None) => "perp".to_string(),
+        (MarketKind::Spot, _) => "spot".to_string(),
+    };
+    format!(
+        "{:<16} {:<10} index={:<4} szDecimals={}",
+        market.coin, kind, market.index, market.sz_decimals
+    )
 }
 
 async fn dexs(network: Option<NetworkArg>) -> Result<()> {
@@ -373,6 +465,12 @@ async fn watch(network: Option<NetworkArg>, coins: Vec<String>) -> Result<()> {
     if coins.is_empty() {
         anyhow::bail!("no coins to watch; pass coin names or configure a watchlist");
     }
+    let coins: Vec<String> = selector_for(network, &coins)
+        .await?
+        .resolve_all(&coins)?
+        .iter()
+        .map(|market| market.coin.clone())
+        .collect();
 
     let mut subs = vec![Subscription::AllMids];
     for coin in &coins {
@@ -440,11 +538,6 @@ fn print_event(event: StreamEvent) {
 fn show_config() -> Result<()> {
     let config = Config::load(ConfigOverrides::default())?;
     println!("{}", config.summary());
-    Ok(())
-}
-
-fn not_yet(what: &str) -> Result<()> {
-    println!("`{what}` is not implemented yet (arrives with SPEC-0001).");
     Ok(())
 }
 
