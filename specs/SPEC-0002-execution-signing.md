@@ -54,11 +54,14 @@ Used for account/security and fund movements (`approveAgent`, `approveBuilderFee
 
 ## 5. Nonce state machine
 
-- Nonce = **millisecond timestamp**, strictly increasing per agent wallet, within a recent window.
-- A single writer owns the nonce; the value is generated as `max(now_ms, last_nonce + 1)` and persisted before send (crash-safe).
-- On rejection indicating a stale/duplicate/recent-window violation: re-read time, advance past `last_nonce`, and retry the action (orders are idempotent via `cloid`, §7).
-- Clock discipline: NTP/chrony required; the machine must not run backwards. A backwards jump is detected and the nonce is advanced rather than reused.
-- Unit-tested as a state machine (monotonicity, crash/restart recovery, concurrent-send serialization).
+- Nonce = **millisecond timestamp**, strictly increasing per agent wallet, within a recent window. The venue validates but never assigns it; nonces need only be strictly increasing, **not contiguous** (gaps are harmless).
+- A single writer owns the nonce; the value is generated as `max(now_ms, last_nonce + 1)` and persisted before send (crash-safe). Single-writer serialization is enforced by the executor's lock.
+- **Self-healing:**
+  - *Stale/duplicate/recent-window rejection* → resync to the wall clock (`last = max(last, now) + 1`) and retry; orders are idempotent via `cloid` (§7).
+  - *Future drift* — if `last_nonce` has run more than a guard (default 60s, `max_future_drift`) ahead of the clock (corruption or a backwards clock step), the value cannot have been accepted by the venue, so it is **reclaimed** and reset to the wall clock. Reset reason is tagged in `hl_nonce_resets_total`.
+  - *Manual* → an operator escape hatch force-resyncs to the wall clock.
+- Clock discipline: NTP/chrony required; the machine must not run backwards. A backwards jump advances the nonce rather than reusing it.
+- Unit-tested as a state machine (monotonicity, same-millisecond bursts, restart recovery, clock regression, future-drift reclaim, reject resync).
 
 ## 6. Order model & rounding
 

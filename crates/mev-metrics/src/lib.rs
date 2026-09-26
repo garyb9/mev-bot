@@ -30,6 +30,8 @@ pub mod names {
     pub const ORDER_REJECTS: &str = "hl_order_rejects_total";
     /// Nonce errors encountered.
     pub const NONCE_ERRORS: &str = "hl_nonce_errors_total";
+    /// Nonce self-heal resets, tagged by reason.
+    pub const NONCE_RESETS: &str = "hl_nonce_resets_total";
     /// Risk breaker trips, tagged by trigger.
     pub const BREAKER_TRIPS: &str = "hl_breaker_trips_total";
 }

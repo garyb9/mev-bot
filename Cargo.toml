@@ -27,6 +27,11 @@ mev-strategy = { path = "crates/mev-strategy" }
 
 rust_decimal = { version = "1.43", features = ["serde"] }
 
+alloy-primitives = { version = "1", features = ["k256"] }
+alloy-sol-types = "1"
+k256 = "0.13"
+rmp-serde = "1"
+
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 

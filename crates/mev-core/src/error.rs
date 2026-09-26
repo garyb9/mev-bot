@@ -14,6 +14,8 @@ pub enum Error {
     Http(String),
     /// A response could not be decoded.
     Decode(String),
+    /// The exchange rejected a signed action (`status: "err"`).
+    Exchange(String),
     /// A feature or code path is not yet implemented.
     Unimplemented(&'static str),
 }
@@ -24,6 +26,7 @@ impl fmt::Display for Error {
             Error::Config(msg) => write!(f, "configuration error: {msg}"),
             Error::Http(msg) => write!(f, "http error: {msg}"),
             Error::Decode(msg) => write!(f, "decode error: {msg}"),
+            Error::Exchange(msg) => write!(f, "exchange error: {msg}"),
             Error::Unimplemented(what) => write!(f, "not implemented: {what}"),
         }
     }

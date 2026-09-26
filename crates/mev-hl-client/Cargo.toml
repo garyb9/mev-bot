@@ -12,6 +12,10 @@ mev-core.workspace = true
 mev-metrics.workspace = true
 
 async-trait.workspace = true
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+k256.workspace = true
+rmp-serde.workspace = true
 metrics.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true

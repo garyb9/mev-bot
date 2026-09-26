@@ -37,12 +37,31 @@ pub struct Market {
     pub kind: MarketKind,
     /// HIP-3 dex name, or `None` for the default perp dex / spot.
     pub dex: Option<String>,
+    /// HIP-3 dex offset (1-based) used to encode the wire asset id; `None`
+    /// for the default perp dex and spot.
+    pub dex_offset: Option<u32>,
     /// Asset index within its universe (perp) or spot pair index.
     pub index: u32,
     /// Size decimals for order sizing.
     pub sz_decimals: u32,
     /// Maximum leverage (perps only).
     pub max_leverage: Option<u32>,
+}
+
+impl Market {
+    /// The numeric asset id used on the wire for orders.
+    ///
+    /// Default perps use the universe index; spot uses `10000 + pair_index`;
+    /// HIP-3 perps use `100000 + dex_offset * 10000 + index` (SPEC-0002 §6).
+    pub fn asset_id(&self) -> u32 {
+        match self.kind {
+            MarketKind::Spot => 10_000 + self.index,
+            MarketKind::Perp => match self.dex_offset {
+                None => self.index,
+                Some(offset) => 100_000 + offset * 10_000 + self.index,
+            },
+        }
+    }
 }
 
 /// Registry of known markets, keyed by canonical coin.
@@ -61,13 +80,15 @@ impl AssetMap {
     /// Load perps (default dex), spot pairs, and optionally all HIP-3 dexes.
     pub async fn load<I: InfoApi>(info: &I, include_hip3: bool) -> Result<Self> {
         let mut map = AssetMap::new();
-        map.insert_perp_dex(None, &info.meta().await?);
+        map.insert_perp_dex(None, None, &info.meta().await?);
         map.insert_spot(&info.spot_meta().await?);
         if include_hip3 {
-            for dex in info.perp_dexs().await? {
+            // `perpDexs[0]` is the default dex (dropped during parsing); builder
+            // dexes are 1-based, matching the wire asset-id encoding.
+            for (i, dex) in info.perp_dexs().await?.into_iter().enumerate() {
                 match info.meta_for(&dex.name).await {
                     Ok(meta) => {
-                        map.insert_perp_dex(Some(&dex.name), &meta);
+                        map.insert_perp_dex(Some(&dex.name), Some(i as u32 + 1), &meta);
                     }
                     Err(err) => warn!(dex = %dex.name, error = %err, "skipping hip-3 dex metadata"),
                 }
@@ -76,8 +97,14 @@ impl AssetMap {
         Ok(map)
     }
 
-    /// Insert every non-delisted asset of a perp universe. Returns the count.
-    pub fn insert_perp_dex(&mut self, dex: Option<&str>, meta: &Meta) -> usize {
+    /// Insert every non-delisted asset of a perp universe. `dex_offset` is the
+    /// 1-based HIP-3 dex offset (`None` for the default dex). Returns the count.
+    pub fn insert_perp_dex(
+        &mut self,
+        dex: Option<&str>,
+        dex_offset: Option<u32>,
+        meta: &Meta,
+    ) -> usize {
         let mut inserted = 0;
         for (index, asset) in meta.universe.iter().enumerate() {
             if asset.is_delisted {
@@ -98,6 +125,7 @@ impl AssetMap {
                 name: asset.name.clone(),
                 kind: MarketKind::Perp,
                 dex: dex.map(str::to_owned),
+                dex_offset,
                 index: index as u32,
                 sz_decimals: asset.sz_decimals,
                 max_leverage: Some(asset.max_leverage),
@@ -123,6 +151,7 @@ impl AssetMap {
                 name: pair.name.clone(),
                 kind: MarketKind::Spot,
                 dex: None,
+                dex_offset: None,
                 index: pair.index,
                 sz_decimals,
                 max_leverage: None,
@@ -289,8 +318,8 @@ mod tests {
 
     fn map() -> AssetMap {
         let mut map = AssetMap::new();
-        map.insert_perp_dex(None, &perp_meta());
-        map.insert_perp_dex(Some("xyz"), &perp_meta());
+        map.insert_perp_dex(None, None, &perp_meta());
+        map.insert_perp_dex(Some("xyz"), Some(1), &perp_meta());
         map.insert_spot(&spot_meta());
         map
     }
@@ -301,6 +330,14 @@ mod tests {
         assert_eq!(map.get("BTC").unwrap().index, 0);
         assert_eq!(map.get("BTC").unwrap().sz_decimals, 5);
         assert!(map.get("OLD").is_none());
+    }
+
+    #[test]
+    fn wire_asset_ids_follow_conventions() {
+        let map = map();
+        assert_eq!(map.get("BTC").unwrap().asset_id(), 0);
+        assert_eq!(map.get("xyz:BTC").unwrap().asset_id(), 100_000 + 10_000);
+        assert_eq!(map.get("@1").unwrap().asset_id(), 10_001);
     }
 
     #[test]
@@ -324,7 +361,7 @@ mod tests {
             }],
         };
         let mut map = AssetMap::new();
-        map.insert_perp_dex(Some("xyz"), &meta);
+        map.insert_perp_dex(Some("xyz"), Some(1), &meta);
         let tsla = map.get("xyz:TSLA").expect("resolves once");
         assert_eq!(tsla.coin, "xyz:TSLA");
         assert_eq!(tsla.dex.as_deref(), Some("xyz"));
