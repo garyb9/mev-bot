@@ -65,8 +65,10 @@ SPEC-0008 §14.0–14.1.
 | **T3: directional family** | Signals held hours to days | Item 8; open convergence and weekend → week-ahead (item 6); single-instrument Bollinger (item 7) | After the recorder is in production **and** ≥ 3 T1 studies have preliminary reports |
 
 Strategy code for any tier waits for gate G1, or an owner-approved G1.5 pilot.
-The funding pilot (M4) is a stack-prover, not a tier. **Market-making (M6) is on
-hold** until research supports it.
+The funding pilot (M4) is a stack-prover, not a tier. Strategy code, including
+market-making (M6), **may be written ahead of research** and revised later.
+Tiers set priority, not permission. What research gates is **trading**: no
+strategy goes live without G1 or a G1.5 pilot.
 
 ## 3. How we measure success
 
