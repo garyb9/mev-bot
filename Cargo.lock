@@ -2334,6 +2334,8 @@ dependencies = [
  "mev-core",
  "mev-hl-client",
  "mev-metrics",
+ "mev-risk",
+ "mev-strategy",
  "rust_decimal",
  "serde_json",
  "tokio",
@@ -2346,6 +2348,7 @@ version = "0.1.0"
 dependencies = [
  "figment",
  "rusqlite",
+ "rust_decimal",
  "secrecy",
  "serde",
  "serde_json",

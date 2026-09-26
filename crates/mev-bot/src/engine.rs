@@ -1,0 +1,492 @@
+//! Strategy engine: builds views, drives strategies, gates intents through
+//! risk, and executes them (paper in `simulate`, `/exchange` in `live`).
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use anyhow::{Context as _, Result};
+use mev_core::clock::{Clock, SystemClock};
+use mev_core::config::{Config, Mode, Network};
+use mev_core::db::writer::{DbWriter, WriteCmd};
+use mev_core::db::{FillRecord, OrderRecord};
+use mev_hl_client::{
+    AssetMap, ExchangeApi, InfoApi, MIN_ORDER_NOTIONAL, MarketSelector, MarketState, OrderParams,
+    Subscription, build_order_wire,
+};
+use mev_risk::{Decision, LimitRisk, Limits, RiskCheck, RiskContext};
+use mev_strategy::{
+    AccountView, BookView, CostModel, FeeRates, FillEvent, FundingBasis, FundingConfig, Instrument,
+    MarketView, OpenOrderView, OrderIntent, PaperExecutor, PositionView, Strategy, StrategyContext,
+    StrategyId, Trigger,
+};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+use tracing::{info, warn};
+
+use mev_metrics::names;
+
+/// Strategies plus the market feeds they need.
+pub struct EngineBuild {
+    /// Configured strategies.
+    pub strategies: Vec<Box<dyn Strategy>>,
+    /// Extra subscriptions the engine requires beyond the watchlist.
+    pub subscriptions: Vec<Subscription>,
+    /// Every coin the engine snapshots.
+    pub coins: Vec<String>,
+    /// Size decimals per coin for building book views.
+    pub sz_decimals: BTreeMap<String, u32>,
+    /// Instruments for paper routing.
+    pub instruments: BTreeMap<String, Instrument>,
+    /// Resolved market metadata for live order building.
+    pub markets: AssetMap,
+}
+
+/// Instantiate the enabled strategies from config.
+pub fn build(cfg: &Config, selector: &MarketSelector) -> Result<EngineBuild> {
+    let cost = CostModel::new(Decimal::from(cfg.strategy.min_edge_bps));
+    let mut build = EngineBuild {
+        strategies: Vec::new(),
+        subscriptions: Vec::new(),
+        coins: Vec::new(),
+        sz_decimals: BTreeMap::new(),
+        instruments: BTreeMap::new(),
+        markets: selector.asset_map().clone(),
+    };
+
+    for id in &cfg.strategy.enabled {
+        match id.as_str() {
+            mev_strategy::funding::ID => build_funding(&mut build, cfg, selector, cost)?,
+            other => warn!(strategy = other, "unknown strategy id; ignoring"),
+        }
+    }
+    Ok(build)
+}
+
+fn build_funding(
+    build: &mut EngineBuild,
+    cfg: &Config,
+    selector: &MarketSelector,
+    cost: CostModel,
+) -> Result<()> {
+    let f = &cfg.strategy.funding;
+    let perp = selector
+        .resolve(&f.perp_coin)
+        .with_context(|| format!("resolving perp {}", f.perp_coin))?;
+    let spot = selector
+        .resolve(&f.spot_pair)
+        .with_context(|| format!("resolving spot {}", f.spot_pair))?;
+
+    build
+        .instruments
+        .insert(perp.coin.clone(), Instrument::perp());
+    build
+        .instruments
+        .insert(spot.coin.clone(), Instrument::spot(f.spot_token.clone()));
+    build
+        .sz_decimals
+        .insert(perp.coin.clone(), perp.sz_decimals);
+    build
+        .sz_decimals
+        .insert(spot.coin.clone(), spot.sz_decimals);
+
+    let config = FundingConfig {
+        perp_coin: perp.coin.clone(),
+        spot_coin: spot.coin.clone(),
+        spot_token: f.spot_token.clone(),
+        target_notional: f.target_notional_usd,
+        horizon_hours: Decimal::from(f.horizon_hours),
+        exit_threshold_bps: Decimal::from(f.exit_threshold_bps),
+        exit_after_hours: f.exit_after_hours,
+        rebalance_drift_bps: Decimal::from(f.rebalance_drift_bps),
+    };
+    let strategy = FundingBasis::new(config, cost, FeeRates::PERP, FeeRates::SPOT, f.maker);
+    build.subscriptions.extend(strategy.subscriptions());
+    build.coins.push(perp.coin);
+    build.coins.push(spot.coin);
+    build.strategies.push(Box::new(strategy));
+    Ok(())
+}
+
+/// The running strategy engine.
+pub struct Engine {
+    strategies: Vec<Box<dyn Strategy>>,
+    coins: Vec<String>,
+    sz_decimals: BTreeMap<String, u32>,
+    markets: AssetMap,
+    risk: LimitRisk,
+    paper: Option<PaperExecutor>,
+    exchange: Option<Arc<dyn ExchangeApi>>,
+    account: Arc<RwLock<AccountView>>,
+    session_id: i64,
+    writer: Arc<DbWriter>,
+}
+
+impl Engine {
+    /// Construct the engine for the given mode.
+    pub fn new(
+        build: EngineBuild,
+        cfg: &Config,
+        exchange: Option<Arc<dyn ExchangeApi>>,
+        writer: Arc<DbWriter>,
+        session_id: i64,
+    ) -> Self {
+        let paper = (cfg.mode == Mode::Simulate).then(|| {
+            let seeded = AccountView {
+                account_value: Decimal::from(100_000),
+                fees: FeeRates::PERP,
+                ..Default::default()
+            };
+            PaperExecutor::new(
+                build.instruments.clone(),
+                seeded,
+                FeeRates::PERP,
+                FeeRates::SPOT,
+            )
+        });
+        let risk = LimitRisk::new(Limits {
+            min_notional: MIN_ORDER_NOTIONAL,
+            max_order_notional: cfg.risk.max_order_notional_usd,
+            max_position_notional: cfg.risk.max_position_notional_usd,
+            max_open_orders: cfg.risk.max_open_orders,
+            max_margin_utilization_bps: cfg.risk.max_margin_utilization_bps,
+        });
+        Self {
+            strategies: build.strategies,
+            coins: build.coins,
+            sz_decimals: build.sz_decimals,
+            markets: build.markets,
+            risk,
+            paper,
+            exchange,
+            account: Arc::new(RwLock::new(AccountView::default())),
+            session_id,
+            writer,
+        }
+    }
+
+    /// The shared live-account view (updated by [`account_poller`]).
+    pub fn account(&self) -> Arc<RwLock<AccountView>> {
+        self.account.clone()
+    }
+
+    /// Run the decision loop until the task is aborted.
+    pub async fn run(mut self, state: Arc<RwLock<MarketState>>) {
+        info!(
+            strategies = self.strategies.len(),
+            "strategy engine started"
+        );
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            if let Err(err) = self.step(&state).await {
+                warn!(error = %err, "engine step failed");
+            }
+        }
+    }
+
+    async fn step(&mut self, state: &Arc<RwLock<MarketState>>) -> Result<()> {
+        let now = SystemClock.now_ms();
+        let market = {
+            let guard = state.read().expect("market state lock poisoned");
+            self.snapshot_market(&guard)
+        };
+        let account = match &self.paper {
+            Some(paper) => paper.account().clone(),
+            None => self.account.read().expect("account lock poisoned").clone(),
+        };
+
+        let mut proposals: Vec<Vec<OrderIntent>> = Vec::new();
+        for strategy in &mut self.strategies {
+            let ctx = StrategyContext {
+                now_ms: now,
+                trigger: Trigger::Timer,
+                market: &market,
+                account: &account,
+            };
+            let intents = strategy.on_event(&ctx).await?;
+            if !intents.is_empty() {
+                proposals.push(intents);
+            }
+        }
+
+        let mut fills: Vec<FillEvent> = Vec::new();
+        for intents in proposals {
+            for intent in intents {
+                if let Some(fill) = self
+                    .gate_and_execute(intent, &market, &account, now)
+                    .await?
+                {
+                    fills.push(fill);
+                }
+            }
+        }
+
+        if let Some(paper) = &mut self.paper {
+            let maker_fills = paper.on_market(&market, now);
+            fills.extend(maker_fills);
+        }
+
+        for fill in &fills {
+            self.record_fill(fill, now);
+        }
+        for fill in &fills {
+            let Some(sid) = fill.strategy.clone() else {
+                continue;
+            };
+            for strategy in &mut self.strategies {
+                if strategy.id() == sid {
+                    strategy.on_fill(fill).await?;
+                }
+            }
+        }
+
+        if let Some(paper) = &self.paper {
+            metrics::gauge!(names::PAPER_FEES_PAID).set(paper.fees_paid().to_f64().unwrap_or(0.0));
+        }
+        Ok(())
+    }
+
+    fn snapshot_market(&self, state: &MarketState) -> MarketView {
+        let mut view = MarketView::new();
+        for coin in &self.coins {
+            if let Some(book) = state.book(coin) {
+                let sz = self.sz_decimals.get(coin).copied().unwrap_or(0);
+                view.insert_book(coin.clone(), BookView::from_order_book(book, sz));
+            }
+            if let Some(ctx) = state.ctx(coin) {
+                view.insert_ctx(coin.clone(), ctx.clone());
+            }
+        }
+        if let Some(mids) = state.mids() {
+            view.set_mids(mids.clone());
+        }
+        view
+    }
+
+    async fn gate_and_execute(
+        &mut self,
+        intent: OrderIntent,
+        market: &MarketView,
+        account: &AccountView,
+        now: u64,
+    ) -> Result<Option<FillEvent>> {
+        let sid = intent.strategy.as_str().to_string();
+        metrics::counter!(names::STRATEGY_INTENTS, "strategy" => sid.clone()).increment(1);
+
+        let decision = self.risk.check(
+            &intent,
+            &RiskContext {
+                market,
+                account,
+                now_ms: now,
+            },
+        );
+        let effective = match decision {
+            Decision::Approve => {
+                metrics::counter!(names::STRATEGY_GATES, "strategy" => sid, "decision" => "approve")
+                    .increment(1);
+                intent
+            }
+            Decision::Resize(size) => {
+                metrics::counter!(names::STRATEGY_GATES, "strategy" => sid, "decision" => "resize")
+                    .increment(1);
+                OrderIntent { size, ..intent }
+            }
+            Decision::Reject(reason) => {
+                metrics::counter!(names::STRATEGY_GATES, "strategy" => sid, "decision" => "reject")
+                    .increment(1);
+                self.record_order(&intent, "reject", Some(&reason), now);
+                return Ok(None);
+            }
+        };
+
+        self.record_order(&effective, "intent", None, now);
+        match &mut self.paper {
+            Some(paper) => {
+                let fills = paper.submit(&effective, market, now);
+                Ok(fills.into_iter().next())
+            }
+            None => {
+                self.submit_live(&effective, market, now).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn submit_live(&self, intent: &OrderIntent, market: &MarketView, now: u64) -> Result<()> {
+        let Some(exchange) = &self.exchange else {
+            return Ok(());
+        };
+        let Some(market_meta) = self.markets.get(&intent.coin) else {
+            warn!(coin = %intent.coin, "no market metadata; skipping live order");
+            return Ok(());
+        };
+        let Some(limit_px) = intent.limit_px.or_else(|| market.mid(&intent.coin)) else {
+            warn!(coin = %intent.coin, "no price to build live order");
+            return Ok(());
+        };
+        let params = OrderParams {
+            is_buy: intent.is_buy(),
+            size: intent.size,
+            limit_px,
+            tif: intent.tif.into(),
+            reduce_only: intent.reduce_only,
+            cloid: None,
+        };
+        let wire = match build_order_wire(market_meta, &params) {
+            Ok(wire) => wire,
+            Err(err) => {
+                warn!(coin = %intent.coin, error = %err, "order build rejected");
+                self.record_order(intent, "reject", Some(&err.to_string()), now);
+                return Ok(());
+            }
+        };
+        match exchange.place(vec![wire]).await {
+            Ok(_) => self.record_order(intent, "submitted", None, now),
+            Err(err) => {
+                warn!(coin = %intent.coin, error = %err, "live submit failed");
+                self.record_order(intent, "reject", Some(&err.to_string()), now);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_order(&self, intent: &OrderIntent, kind: &str, status: Option<&str>, now: u64) {
+        let record = OrderRecord {
+            ts_ms: now,
+            strategy: Some(intent.strategy.to_string()),
+            coin: intent.coin.clone(),
+            side: side_str(intent.is_buy()).to_string(),
+            kind: kind.to_string(),
+            cloid: None,
+            oid: None,
+            px: intent.limit_px.map(|px| px.normalize().to_string()),
+            sz: Some(intent.size.normalize().to_string()),
+            reduce_only: Some(intent.reduce_only),
+            rationale: Some(intent.rationale.clone()),
+            status: status.map(str::to_string),
+        };
+        self.writer.try_send(WriteCmd::Order {
+            session_id: self.session_id,
+            record,
+        });
+    }
+
+    fn record_fill(&self, fill: &FillEvent, now: u64) {
+        let sid = fill
+            .strategy
+            .as_ref()
+            .map(StrategyId::to_string)
+            .unwrap_or_default();
+        metrics::counter!(names::STRATEGY_FILLS, "strategy" => sid.clone()).increment(1);
+        let record = FillRecord {
+            ts_ms: now,
+            tid: None,
+            oid: None,
+            coin: fill.coin.clone(),
+            side: side_str(fill.side.is_buy()).to_string(),
+            px: fill.px.normalize().to_string(),
+            sz: fill.sz.normalize().to_string(),
+            fee: Some(fill.fee.normalize().to_string()),
+            builder_fee: None,
+            closed_pnl: None,
+            strategy: fill.strategy.as_ref().map(StrategyId::to_string),
+        };
+        self.writer.try_send(WriteCmd::Fill {
+            session_id: self.session_id,
+            record,
+        });
+    }
+}
+
+fn side_str(is_buy: bool) -> &'static str {
+    if is_buy { "buy" } else { "sell" }
+}
+
+/// Poll `/info` for account state and publish it to the shared view.
+pub async fn account_poller(
+    info: Arc<dyn InfoApi>,
+    address: String,
+    account: Arc<RwLock<AccountView>>,
+    network: Network,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        match load_account(&*info, &address, network).await {
+            Ok(view) => {
+                if let Ok(mut guard) = account.write() {
+                    *guard = view;
+                }
+            }
+            Err(err) => warn!(error = %err, "account poll failed"),
+        }
+    }
+}
+
+async fn load_account(info: &dyn InfoApi, address: &str, _network: Network) -> Result<AccountView> {
+    let clearing = info.clearinghouse_state(address).await?;
+    let spot = info
+        .spot_clearinghouse_state(address)
+        .await
+        .unwrap_or_default();
+    let open_orders = info.open_orders(address).await.unwrap_or_default();
+    let fees = info.user_fees(address).await.ok();
+
+    let mut positions = BTreeMap::new();
+    for entry in &clearing.asset_positions {
+        let position = &entry.position;
+        positions.insert(
+            position.coin.clone(),
+            PositionView {
+                coin: position.coin.clone(),
+                szi: position.szi,
+                entry_px: position.entry_px,
+                position_value: position.position_value,
+                unrealized_pnl: position.unrealized_pnl,
+                margin_used: position.margin_used,
+            },
+        );
+    }
+
+    let mut spot_balances = BTreeMap::new();
+    for balance in &spot.balances {
+        spot_balances.insert(balance.coin.clone(), balance.total);
+    }
+
+    let open_views = open_orders
+        .iter()
+        .map(|order| OpenOrderView {
+            coin: order.coin.clone(),
+            oid: Some(order.oid),
+            cloid: order.cloid.clone(),
+            side: if order.is_buy() {
+                mev_strategy::Side::Buy
+            } else {
+                mev_strategy::Side::Sell
+            },
+            limit_px: order.limit_px,
+            sz: order.sz,
+            reduce_only: order.reduce_only,
+        })
+        .collect();
+
+    let fee_rates = match fees {
+        Some(fees) => FeeRates {
+            maker: fees.user_add_rate.unwrap_or(FeeRates::PERP.maker),
+            taker: fees.user_cross_rate.unwrap_or(FeeRates::PERP.taker),
+        },
+        None => FeeRates::PERP,
+    };
+
+    Ok(AccountView {
+        positions,
+        spot: spot_balances,
+        open_orders: open_views,
+        fees: fee_rates,
+        account_value: clearing.margin_summary.account_value,
+        margin_used: clearing.margin_summary.total_margin_used,
+        withdrawable: clearing.withdrawable,
+    })
+}

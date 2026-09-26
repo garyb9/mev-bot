@@ -11,3 +11,18 @@ watchlist = ["BTC", "ETH", "SOL"]
 db_path = "data/hlbot.db"
 schedule_cancel_ttl_ms = 30000
 http_port = 9090
+
+[strategy]
+enabled = ["funding_basis"]
+min_edge_bps = 5
+
+[strategy.funding]
+perp_coin = "BTC"
+spot_pair = "UBTC/USDC"
+spot_token = "UBTC"
+target_notional_usd = 1000
+horizon_hours = 24
+exit_threshold_bps = 0
+exit_after_hours = 3
+rebalance_drift_bps = 100
+maker = false

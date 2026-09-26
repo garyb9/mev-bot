@@ -139,12 +139,15 @@ impl AssetMap {
     pub fn insert_spot(&mut self, spot: &SpotMeta) -> usize {
         let mut inserted = 0;
         for pair in &spot.universe {
-            let sz_decimals = spot
+            let base_token = spot
                 .tokens
                 .iter()
-                .find(|token| token.index == pair.tokens[0])
-                .map(|token| token.sz_decimals)
-                .unwrap_or(0);
+                .find(|token| token.index == pair.tokens[0]);
+            let quote_token = spot
+                .tokens
+                .iter()
+                .find(|token| token.index == pair.tokens[1]);
+            let sz_decimals = base_token.map(|token| token.sz_decimals).unwrap_or(0);
             let canonical = spot_canonical(pair.index, &pair.name);
             self.insert(Market {
                 coin: canonical.clone(),
@@ -157,7 +160,13 @@ impl AssetMap {
                 max_leverage: None,
             });
             self.aliases.insert(pair.name.clone(), canonical.clone());
-            self.aliases.insert(format!("@{}", pair.index), canonical);
+            self.aliases
+                .insert(format!("@{}", pair.index), canonical.clone());
+            // Human pair name built from token symbols, e.g. `UBTC/USDC`.
+            if let (Some(base), Some(quote)) = (base_token, quote_token) {
+                self.aliases
+                    .insert(format!("{}/{}", base.name, quote.name), canonical);
+            }
             inserted += 1;
         }
         inserted
@@ -290,8 +299,10 @@ mod tests {
                     index: 0,
                     tokens: [0, 1],
                 },
+                // The live API reports the pair `name` as `@index`, not a
+                // human name; the human alias comes from the token symbols.
                 SpotPair {
-                    name: "UBTC/USDC".into(),
+                    name: "@1".into(),
                     index: 1,
                     tokens: [2, 1],
                 },
@@ -369,13 +380,21 @@ mod tests {
     }
 
     #[test]
-    fn spot_pairs_resolve_by_name_and_index() {
+    fn spot_pairs_resolve_by_human_name_and_index() {
         let map = map();
         assert_eq!(map.get("PURR/USDC").unwrap().coin, "PURR/USDC");
+        // `UBTC/USDC` is an alias built from the base/quote token symbols.
         assert_eq!(map.get("UBTC/USDC").unwrap().coin, "@1");
-        assert_eq!(map.get("@1").unwrap().name, "UBTC/USDC");
+        assert_eq!(map.get("@1").unwrap().coin, "@1");
         assert_eq!(map.get("@1").unwrap().sz_decimals, 6);
         assert_eq!(map.get("@1").unwrap().kind, MarketKind::Spot);
+    }
+
+    #[test]
+    fn selector_resolves_human_spot_pair() {
+        let selector = MarketSelector::new(map());
+        let spot = selector.resolve("ubtc/usdc").unwrap();
+        assert_eq!(spot.coin, "@1");
     }
 
     #[test]

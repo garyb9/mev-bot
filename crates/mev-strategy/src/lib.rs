@@ -8,16 +8,20 @@
 
 pub mod cost;
 pub mod event;
+pub mod funding;
 pub mod id;
 pub mod intent;
+pub mod paper;
 pub mod size;
 pub mod strategy;
 pub mod view;
 
 pub use cost::{CostModel, FeeRates};
 pub use event::{DeterministicRng, Event, FillEvent};
+pub use funding::{FundingBasis, FundingConfig};
 pub use id::StrategyId;
 pub use intent::{OrderIntent, Side, TimeInForce};
+pub use paper::{Instrument, PaperExecutor};
 pub use size::Sizer;
 pub use strategy::{Strategy, StrategyContext, Trigger};
 pub use view::{AccountView, BookView, MarketView, OpenOrderView, PositionView, Walk};

@@ -9,6 +9,7 @@ use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
+use rust_decimal::Decimal;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,82 @@ pub enum Autonomy {
     Confirm,
 }
 
+/// Strategy engine configuration (SPEC-0003).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StrategyConfig {
+    /// Enabled strategy ids (see [`crate::config::StrategyConfig::default`]).
+    pub enabled: Vec<String>,
+    /// Edge buffer in bps subtracted from every trade's gross edge.
+    pub min_edge_bps: u32,
+    /// Delta-neutral funding/basis settings.
+    pub funding: FundingSettings,
+}
+
+impl Default for StrategyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: vec!["funding_basis".to_string()],
+            min_edge_bps: 5,
+            funding: FundingSettings::default(),
+        }
+    }
+}
+
+/// Funding/basis strategy settings (SPEC-0003 §6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FundingSettings {
+    /// Perp coin to short.
+    pub perp_coin: String,
+    /// Spot pair name, resolved to a canonical coin at runtime.
+    pub spot_pair: String,
+    /// Spot token symbol used for balances and the paper account.
+    pub spot_token: String,
+    /// Target notional per leg, in USD.
+    pub target_notional_usd: Decimal,
+    /// Holding horizon used to project funding, in hours.
+    pub horizon_hours: u32,
+    /// Funding at or below (bps/hour) that counts toward the exit streak.
+    pub exit_threshold_bps: u32,
+    /// Consecutive hourly settlements below threshold before exiting.
+    pub exit_after_hours: u32,
+    /// Delta drift (bps of notional) that triggers a rebalance.
+    pub rebalance_drift_bps: u32,
+    /// Quote as maker (post-only) instead of taking.
+    pub maker: bool,
+}
+
+impl Default for FundingSettings {
+    fn default() -> Self {
+        Self {
+            perp_coin: "BTC".to_string(),
+            spot_pair: "UBTC/USDC".to_string(),
+            spot_token: "UBTC".to_string(),
+            target_notional_usd: Decimal::from(1_000),
+            horizon_hours: 24,
+            exit_threshold_bps: 0,
+            exit_after_hours: 3,
+            rebalance_drift_bps: 100,
+            maker: false,
+        }
+    }
+}
+
+/// Pre-trade risk limits (SPEC-0004 §5). `None` disables a limit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RiskSettings {
+    /// Maximum notional for one order.
+    pub max_order_notional_usd: Option<Decimal>,
+    /// Maximum absolute per-coin position notional.
+    pub max_position_notional_usd: Option<Decimal>,
+    /// Maximum resting orders per coin.
+    pub max_open_orders: Option<usize>,
+    /// Maximum margin utilization (bps) before new risk is refused.
+    pub max_margin_utilization_bps: Option<Decimal>,
+}
+
 /// Resolved, validated configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -83,6 +160,12 @@ pub struct Config {
     pub schedule_cancel_ttl_ms: u64,
     /// HTTP port for health/metrics.
     pub http_port: u16,
+    /// Strategy engine settings.
+    #[serde(default)]
+    pub strategy: StrategyConfig,
+    /// Pre-trade risk limits.
+    #[serde(default)]
+    pub risk: RiskSettings,
     /// Master account address (required for `live`).
     pub account_address: Option<String>,
     /// Agent wallet private key (required for `live`); never serialized or logged.
@@ -101,6 +184,8 @@ impl Default for Config {
             db_path: PathBuf::from("data/hlbot.db"),
             schedule_cancel_ttl_ms: 30_000,
             http_port: 9090,
+            strategy: StrategyConfig::default(),
+            risk: RiskSettings::default(),
             account_address: None,
             agent_private_key: None,
         }

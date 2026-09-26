@@ -4,18 +4,22 @@
 //! M1.1:  REST `/info` client and the `markets`/`book` commands.
 
 use std::{
+    collections::BTreeSet,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
+mod engine;
+
 use anyhow::Result;
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
 use mev_core::{
+    clock::{Clock, SystemClock},
     config::{Config, ConfigOverrides, Mode, Network},
-    db::Db,
+    db::{Db, writer::DbWriter},
 };
 use mev_hl_client::{
     Action, AgentSigner, AssetMap, DeadMansSwitch, ExchangeApi, HttpInfo, InfoApi, Market,
@@ -275,20 +279,59 @@ async fn run(
         "starting"
     );
 
+    // Strategies run in `simulate` and `live`; `observe` stays read-only.
+    let plan = if config.mode == Mode::Observe {
+        None
+    } else {
+        Some(engine::build(&config, &selector)?)
+    };
+
+    let (subscriptions, book_coins, ctx_coins) = build_subscriptions(&watchlist, plan.as_ref());
     let health = Health::new();
     let state = Arc::new(RwLock::new(MarketState::new(Tolerance::default())));
     {
         let mut guard = state.write().expect("market state lock poisoned");
-        for coin in &watchlist {
+        for coin in &book_coins {
             guard.expect_book(coin);
+        }
+        for coin in &ctx_coins {
             guard.expect_ctx(coin);
         }
     }
 
+    let exchange = live_exchange(&config)?;
+    let engine_task = match plan {
+        Some(plan) => {
+            let db = Db::open(&config.db_path)?;
+            let session_id = db.create_session(
+                &format!("{:?}", config.network),
+                &format!("{:?}", config.mode),
+                None,
+                SystemClock.now_ms(),
+            )?;
+            let writer = Arc::new(DbWriter::spawn(db, 4096));
+            let engine = engine::Engine::new(plan, &config, exchange.clone(), writer, session_id);
+            let account = engine.account();
+            let poller = config.account_address.clone().map(|address| {
+                let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::new(config.network));
+                tokio::spawn(engine::account_poller(
+                    info,
+                    address,
+                    account,
+                    config.network,
+                ))
+            });
+            info!(session_id, "recording session");
+            Some((tokio::spawn(engine.run(state.clone())), poller))
+        }
+        None => None,
+    };
+
     let heartbeat = tokio::spawn(heartbeat());
-    let ingest = tokio::spawn(ingest(state.clone(), watchlist, config.network));
+    let ingest = tokio::spawn(ingest(state.clone(), subscriptions, config.network));
     let monitor = tokio::spawn(monitor(state, health.clone()));
-    let deadman = live_exchange(&config)?
+    let deadman = exchange
+        .clone()
         .map(|exchange| tokio::spawn(deadman(exchange, config.schedule_cancel_ttl_ms)));
 
     info!("waiting for feeds to become ready");
@@ -297,6 +340,12 @@ async fn run(
     ingest.abort();
     monitor.abort();
     heartbeat.abort();
+    if let Some((engine, poller)) = engine_task {
+        engine.abort();
+        if let Some(poller) = poller {
+            poller.abort();
+        }
+    }
     // The dead-man task disarms `scheduleCancel` on the same shutdown signal;
     // give it a moment to submit before the process exits.
     if let Some(deadman) = deadman {
@@ -304,6 +353,45 @@ async fn run(
     }
     info!("shutdown complete");
     Ok(())
+}
+
+/// Merge the watchlist feeds with any strategy-required feeds, de-duplicated.
+fn build_subscriptions(
+    watchlist: &[String],
+    plan: Option<&engine::EngineBuild>,
+) -> (Vec<Subscription>, BTreeSet<String>, BTreeSet<String>) {
+    let mut book_coins = BTreeSet::new();
+    let mut ctx_coins = BTreeSet::new();
+    let mut subs = Vec::new();
+
+    for coin in watchlist {
+        book_coins.insert(coin.clone());
+        ctx_coins.insert(coin.clone());
+        subs.push(Subscription::L2Book { coin: coin.clone() });
+        subs.push(Subscription::ActiveAssetCtx { coin: coin.clone() });
+        subs.push(Subscription::Trades { coin: coin.clone() });
+    }
+    if let Some(plan) = plan {
+        for sub in &plan.subscriptions {
+            match sub {
+                Subscription::L2Book { coin } => {
+                    book_coins.insert(coin.clone());
+                }
+                Subscription::ActiveAssetCtx { coin } => {
+                    ctx_coins.insert(coin.clone());
+                }
+                _ => {}
+            }
+            subs.push(sub.clone());
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    subs.retain(|sub| {
+        let key = serde_json::to_string(sub).unwrap_or_default();
+        seen.insert(key)
+    });
+    (subs, book_coins, ctx_coins)
 }
 
 /// Build the live write client when running `live` with an agent key.
@@ -370,18 +458,18 @@ async fn deadman(exchange: Arc<dyn ExchangeApi>, ttl_ms: u64) {
 }
 
 /// Ingest market data into the shared state until the process stops.
-async fn ingest(state: Arc<RwLock<MarketState>>, coins: Vec<String>, network: Network) {
+async fn ingest(
+    state: Arc<RwLock<MarketState>>,
+    subscriptions: Vec<Subscription>,
+    network: Network,
+) {
     loop {
-        let mut subs = Vec::with_capacity(coins.len() * 3);
-        for coin in &coins {
-            subs.push(Subscription::L2Book { coin: coin.clone() });
-            subs.push(Subscription::ActiveAssetCtx { coin: coin.clone() });
-            subs.push(Subscription::Trades { coin: coin.clone() });
-        }
-
-        match WsMarketStream::connect(network, &subs).await {
+        match WsMarketStream::connect(network, &subscriptions).await {
             Ok(mut stream) => {
-                info!(coins = ?coins, "market stream connected");
+                info!(
+                    subscriptions = subscriptions.len(),
+                    "market stream connected"
+                );
                 loop {
                     match stream.next().await {
                         Ok(event) => {

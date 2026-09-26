@@ -103,6 +103,41 @@ impl BookView {
         Walk { avg_px, filled }
     }
 
+    /// Walk the book consuming `size` against `side`, but only at prices no
+    /// worse than `limit_px` (a buy pays at most `limit_px`, a sell receives at
+    /// least it). Used to price marketable orders and to simulate fills.
+    pub fn walk_bounded(&self, side: Side, size: Decimal, limit_px: Decimal) -> Walk {
+        let levels = match side {
+            Side::Buy => &self.asks,
+            Side::Sell => &self.bids,
+        };
+        let mut remaining = size;
+        let mut notional = Decimal::ZERO;
+        let mut filled = Decimal::ZERO;
+        for (px, avail) in levels {
+            if remaining <= Decimal::ZERO {
+                break;
+            }
+            let acceptable = match side {
+                Side::Buy => *px <= limit_px,
+                Side::Sell => *px >= limit_px,
+            };
+            if !acceptable {
+                break;
+            }
+            let take = remaining.min(*avail);
+            notional += *px * take;
+            filled += take;
+            remaining -= take;
+        }
+        let avg_px = if filled > Decimal::ZERO {
+            notional / filled
+        } else {
+            Decimal::ZERO
+        };
+        Walk { avg_px, filled }
+    }
+
     /// Notional resting within `bps` of the mid, per side.
     pub fn depth_notional(&self, side: Side, bps: Decimal) -> Decimal {
         let Some(mid) = self.mid() else {
@@ -333,6 +368,19 @@ mod tests {
         let w = b.walk(Side::Buy, d(1));
         assert_eq!(w.filled, Decimal::ZERO);
         assert_eq!(w.avg_px, Decimal::ZERO);
+    }
+
+    #[test]
+    fn bounded_walk_respects_limit() {
+        let b = book();
+        // Buy up to 101.5 may only take the 101 level.
+        let w = b.walk_bounded(Side::Buy, d(5), ds("101.5"));
+        assert_eq!(w.filled, d(1));
+        assert_eq!(w.avg_px, d(101));
+        // Sell down to 99.5 may only hit the 100 bid.
+        let w = b.walk_bounded(Side::Sell, d(5), ds("99.5"));
+        assert_eq!(w.filled, d(2));
+        assert_eq!(w.avg_px, d(100));
     }
 
     #[test]

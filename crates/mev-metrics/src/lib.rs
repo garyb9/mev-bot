@@ -40,4 +40,14 @@ pub mod names {
     pub const DEADMAN_FAILURES: &str = "hl_deadman_failures_total";
     /// Risk breaker trips, tagged by trigger.
     pub const BREAKER_TRIPS: &str = "hl_breaker_trips_total";
+    /// Order intents proposed by strategies, tagged by strategy.
+    pub const STRATEGY_INTENTS: &str = "hl_strategy_intents_total";
+    /// Intents gated by risk, tagged by strategy and decision/reason.
+    pub const STRATEGY_GATES: &str = "hl_strategy_gates_total";
+    /// Fills (paper or real), tagged by strategy.
+    pub const STRATEGY_FILLS: &str = "hl_strategy_fills_total";
+    /// Expected net edge in bps at decision time, tagged by strategy.
+    pub const STRATEGY_EDGE_BPS: &str = "hl_strategy_edge_bps";
+    /// Paper trading fees paid in USD.
+    pub const PAPER_FEES_PAID: &str = "hl_paper_fees_paid_usd";
 }
