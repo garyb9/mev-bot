@@ -141,10 +141,10 @@ Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path in
 | ID | Title | Tier | Size | Depends on | Status |
 |---|---|---|---|---|---|
 | K-1 | Fail-closed defaults: `live` refuses to start without explicit finite limits; conservative defaults for `simulate` | **T0** | S | — | ✅ |
-| K-2 | Exposure incl. in-flight orders (worst case), and group worst-single-leg exposure (SPEC-0011 §9) | T1 | M | SPEC-0010 E-5 | ☐ |
-| K-3 | Kill switch: `SIGUSR1`, flag file, `hl panic`; cancel-all + halt; SPEC-0011 `on_kill` for residuals; sticky until cleared | T1 | M | SPEC-0010 E-3 | ☐ |
-| K-4 | Circuit breakers: daily loss, drawdown, reject-rate spike, nonce errors, stale feeds, reconciliation drift, exec backpressure | T1 | M | K-3, SPEC-0010 E-8 | ☐ |
-| K-5 | Rate budgets as risk inputs: IP weight + address budget (`userRateLimit`); cancels always allowed above a hard floor | T1 | S | SPEC-0010 E-6 | ☐ |
+| K-2 | Exposure incl. in-flight orders (worst case), and group worst-single-leg exposure (SPEC-0011 §9) | T1 | M | SPEC-0010 E-5 | 🔄 |
+| K-3 | Kill switch: `SIGUSR1`, flag file, `hl panic`; cancel-all + halt; SPEC-0011 `on_kill` for residuals; sticky until cleared | T1 | M | SPEC-0010 E-3 | 🔄 |
+| K-4 | Circuit breakers: daily loss, drawdown, reject-rate spike, nonce errors, stale feeds, reconciliation drift, exec backpressure | T1 | M | K-3, SPEC-0010 E-8 | 🔄 |
+| K-5 | Rate budgets as risk inputs: IP weight + address budget (`userRateLimit`); cancels always allowed above a hard floor | T1 | S | SPEC-0010 E-6 | ✅ |
 | K-6 | PnL & attribution: realized (fills, fees, funding, rebates), unrealized (mark), per strategy / coin / group, written via `DbWriter` | T1 | M | SPEC-0010 E-8, SPEC-0011 L-9 | ☐ |
 | K-7 | Property tests for every limit + breaker (boundary approve/resize/reject; unknown state ⇒ reject) | T1 | M | K-1…K-5 | ☐ |
 | K-8 | Directional-strategy limits: per-strategy stop-loss, volatility-scaled sizing, max holding time, overnight/weekend exposure caps for HIP-3 stock perps | T3 | M | only when a T3 study passes or a G1.5 pilot is approved | ☐ |
@@ -153,11 +153,19 @@ Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path in
 
 **K-2:** Per-coin projected exposure = confirmed position + Σ worst-case fills of `PendingNew`/`Resting`/`PartiallyFilled`/`PendingModify`/`Unknown` orders, maintained incrementally by the order manager. Groups are checked on net **and** worst single-leg exposure. *Done when:* a property test shows no approved sequence can exceed a cap.
 
+**K-2 implemented, part 1 (2026-09-26, via SPEC-0010 E-9).** The per-coin rule is live: `mev_engine::risk::RiskGate` checks projected = `AccountState::projected_notional` (confirmed) + `OrderManager::pending_notional` (worst-case in-flight), resizing to the cap; `mev-risk`'s `LimitRisk` also counts resting in-flight gross toward the same cap. A fixed-seed randomized property test shows no approved sequence exceeds the cap. **Remaining:** the group net / worst-single-leg rule needs the SPEC-0011 group types (`RiskGate` returns `GroupUnsupported` for `Action::PlaceGroup`); build it with the SPEC-0011 L-tasks (SPEC-0010 §23 Q-Group-Risk).
+
 **K-3:** The kill flag lives in engine state and is checked first in every risk check. Triggers: `SIGUSR1`, the existence of `HL_KILL_FILE` (default `data/KILL`, polled every 250 ms by a control task), and `hl panic` (writes the file). Action: cancel every working order, then `on_kill` policy (SPEC-0011 §9), then halt. Clearing needs `hl resume` **and** deleting the file. *Done when:* an end-to-end test in `simulate` shows all orders cancelled and no new places within one iteration of each trigger.
+
+**K-3 implemented, part 1 (2026-09-26, via SPEC-0010 E-9).** `mev-risk/src/kill.rs` ships the sticky `KillSwitch` (set/clear/is_active), the `check_flag_file(path)` helper (so a control task can poll `HL_KILL_FILE` off the hot path), and `cancel_all_cloids(&OrderManager)`; `RiskGate` checks the kill flag first and refuses all new places in one iteration. **Remaining:** the `SIGUSR1` handler and `hl panic`/`hl resume` CLI wiring, the 250 ms control-task file poll, and the `simulate` end-to-end test — schedule with E-13's `mev-bot` cleanup (the trigger surface is legacy-engine code).
 
 **K-4:** Each breaker has a threshold in config, a metric (`hl_breaker_trips_total{breaker}`), and a sticky state shown on `/healthz`. Default action: halt new places (cancels allowed). *Done when:* each breaker has a test that trips it.
 
+**K-4 partial (2026-09-26).** The engine-side `RiskGate` has a sticky `Breakers` latch that is checked after the kill switch and halts new places (cancels allowed), and the reconciler's 3-in-10-min drift breaker (SPEC-0010 §15) feeds it. The remaining breaker classes (daily loss, drawdown, reject-rate spike, nonce errors, stale feeds, exec backpressure) and the `hl_breaker_trips_total` metric/`/healthz` surface are still open.
+
 **K-5:** Implement SPEC-0010 §12's budgets as a risk check. *Done when:* tests show places rejected below `rate_budget_min` while cancels pass.
+
+**K-5 implemented (2026-09-26, via SPEC-0010 E-9).** `mev_engine::risk::RateBudget` (IP-weight + address token buckets, caller-supplied time refill) rejects places below `rate_budget_min`/`*_min` and allows cancels above the hard floor; `RiskBudgetSettings` in `mev-core` config; tests cover consume/guard/refill and cancel-pass behaviour. The `hl_rate_budget_remaining{kind}` metric export and the live `userRateLimit` poll (reconciler) are still to be wired (SPEC-0010 E-10/E-12/E-13).
 
 **K-6:** Tables per §9 (extend the existing `fills`/`funding`/`positions_snapshot`; add `groups`). Daily PnL rollup query. *Done when:* a `simulate` day reconciles computed realized PnL against the paper executor's ledger to the cent.
 

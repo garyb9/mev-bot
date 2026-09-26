@@ -151,14 +151,28 @@ impl RiskCheck for LimitRisk {
         }
 
         // Projected position notional cap (skip for reduce-only and reductions).
-        // Count exposure approved earlier in this cycle as if already position.
+        // Count, as if already position: (a) exposure approved earlier in this
+        // cycle, and (b) resting in-flight orders from the account snapshot that
+        // have not yet shown up as position. This matches the engine's
+        // "confirmed + worst-case in-flight" exposure (SPEC-0010 §11, SPEC-0004
+        // K-2); gross (both sides) in-flight is intentionally conservative.
         if let Some(cap) = limits.max_position_notional
             && !intent.reduce_only
         {
-            let current = ctx.account.position_szi(&intent.coin) + self.pending_size(&intent.coin);
+            let pending = self.pending_size(&intent.coin);
+            let in_flight: Decimal = ctx
+                .account
+                .open_orders
+                .iter()
+                .filter(|order| order.coin == intent.coin && !order.reduce_only)
+                .map(|order| order.sz.abs())
+                .sum();
+            let current = ctx.account.position_szi(&intent.coin) + pending;
             let signed = if intent.is_buy() { size } else { -size };
-            let projected = (current + signed).abs();
-            let current_abs = current.abs();
+            // Gross worst case: the confirmed/pending net plus every working
+            // order filling, on both sides.
+            let projected = (current + signed).abs() + in_flight;
+            let current_abs = current.abs() + in_flight;
             if projected > current_abs {
                 let max_size = cap / reference_px;
                 if current_abs >= max_size {
@@ -398,6 +412,36 @@ mod tests {
         assert_eq!(risk.pending_size("BTC"), Decimal::ZERO);
         assert_eq!(
             risk.check(&intent(Side::Buy, ds("6"), None), &ctx),
+            Decision::Approve
+        );
+    }
+
+    #[test]
+    fn counts_in_flight_open_orders_toward_position_cap() {
+        // Cap $1000 at mid 100 => 10 BTC max. A resting 8 BTC buy is in flight,
+        // so only 2 BTC of room remain even though the position is flat.
+        let mut account = AccountView::default();
+        account.open_orders.push(OpenOrderView {
+            coin: "BTC".into(),
+            oid: Some(1),
+            cloid: None,
+            side: Side::Buy,
+            limit_px: ds("100"),
+            sz: ds("8"),
+            reduce_only: false,
+        });
+        let limits = Limits {
+            max_position_notional: Some(ds("1000")),
+            ..Default::default()
+        };
+        assert_eq!(
+            check(limits.clone(), &intent(Side::Buy, ds("4"), None), &account),
+            Decision::Resize(ds("2"))
+        );
+        // A reduce-only resting order cannot increase exposure and is ignored.
+        account.open_orders[0].reduce_only = true;
+        assert_eq!(
+            check(limits, &intent(Side::Buy, ds("4"), None), &account),
             Decision::Approve
         );
     }

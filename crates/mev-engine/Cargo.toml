@@ -12,6 +12,7 @@ crossbeam-channel.workspace = true
 mev-core.workspace = true
 mev-hl-client.workspace = true
 mev-metrics.workspace = true
+mev-risk.workspace = true
 mev-strategy.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true

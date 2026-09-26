@@ -174,6 +174,42 @@ impl Default for FundingSettings {
     }
 }
 
+/// Engine-side rate-budget settings (SPEC-0010 §12, SPEC-0004 K-5).
+///
+/// Hyperliquid's IP weight is shared across every client on the host, so the
+/// engine uses only its configured `engine_ip_share`. Values are finite by
+/// default; they are safety bounds rather than money limits, so `live` does not
+/// require them to be set explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RateBudgetSettings {
+    /// Total IP weight per minute the account may spend (venue limit).
+    pub ip_weight_per_min: u32,
+    /// The engine's share of that weight (its token-bucket capacity).
+    pub engine_ip_share: u32,
+    /// Address order capacity/refill per minute (from `userRateLimit`).
+    pub address_per_min: u32,
+    /// Minimum IP weight below which new places are rejected.
+    pub ip_weight_min: u32,
+    /// Minimum address budget below which new places are rejected.
+    pub address_min: u32,
+    /// Below this, even cancels are rejected (the hard floor).
+    pub hard_floor: u32,
+}
+
+impl Default for RateBudgetSettings {
+    fn default() -> Self {
+        Self {
+            ip_weight_per_min: 1_200,
+            engine_ip_share: 1_200,
+            address_per_min: 1_200,
+            ip_weight_min: 100,
+            address_min: 500,
+            hard_floor: 1,
+        }
+    }
+}
+
 /// Pre-trade risk limits (SPEC-0004 §5). `None` disables a limit; `live` mode
 /// refuses to start unless every limit is explicitly finite (SPEC-0004 K-1).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -191,6 +227,8 @@ pub struct RiskSettings {
     pub max_daily_loss_usd: Option<Decimal>,
     /// Maximum unhedged (single-leg) notional in USD (SPEC-0011 §9).
     pub max_unhedged_usd: Option<Decimal>,
+    /// Engine-side rate-budget settings (SPEC-0010 §12 / SPEC-0004 K-5).
+    pub rate_budget: RateBudgetSettings,
 }
 
 impl RiskSettings {
@@ -205,6 +243,7 @@ impl RiskSettings {
             max_margin_utilization_bps: Some(Decimal::from(5_000)),
             max_daily_loss_usd: Some(Decimal::from(500)),
             max_unhedged_usd: Some(Decimal::from(5_000)),
+            rate_budget: RateBudgetSettings::default(),
         }
     }
 
@@ -565,5 +604,17 @@ mod tests {
         assert!(config.risk.max_order_notional_usd.is_none());
         assert!(config.risk.max_open_orders.is_none());
         assert_eq!(config.strategy.max_slippage_bps, 10);
+    }
+
+    #[test]
+    fn rate_budget_defaults_are_finite_and_ordered() {
+        let budget = RateBudgetSettings::default();
+        assert!(budget.engine_ip_share > 0);
+        assert!(budget.engine_ip_share <= budget.ip_weight_per_min);
+        assert!(budget.ip_weight_min < budget.engine_ip_share);
+        assert!(budget.address_min < budget.address_per_min);
+        assert!(budget.hard_floor <= budget.ip_weight_min);
+        // The engine share defaults to the full account weight and is settable.
+        assert_eq!(Config::default().risk.rate_budget, budget);
     }
 }
