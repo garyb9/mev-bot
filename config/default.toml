@@ -1,0 +1,13 @@
+# Default configuration (SPEC-0000 §7).
+# Precedence: defaults here < config/{HL_ENV}.toml < HL_* env vars < CLI flags.
+
+network = "mainnet"
+mode = "observe"
+autonomy = "auto"
+
+# Bluechip watchlist; extend via CLI (`hl select --add ...`) or `--coins`.
+watchlist = ["BTC", "ETH", "SOL"]
+
+db_path = "data/hlbot.db"
+schedule_cancel_ttl_ms = 30000
+http_port = 9090

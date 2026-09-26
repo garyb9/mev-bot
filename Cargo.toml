@@ -27,6 +27,12 @@ mev-strategy = { path = "crates/mev-strategy" }
 
 rust_decimal = "1.43"
 
+serde = { version = "1", features = ["derive"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+secrecy = { version = "0.10", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

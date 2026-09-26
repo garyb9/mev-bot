@@ -12,6 +12,7 @@ name = "hl"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 mev-core.workspace = true
 mev-hl-client.workspace = true
 mev-hyperevm.workspace = true

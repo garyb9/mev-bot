@@ -4,6 +4,7 @@
 //! crate. It owns shared types, errors, the clock abstraction, and config.
 
 pub mod clock;
+pub mod config;
 pub mod error;
 
 /// Human-readable name of the binary/product.
