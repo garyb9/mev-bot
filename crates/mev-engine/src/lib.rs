@@ -18,6 +18,7 @@ pub mod exec;
 pub mod ingest;
 pub mod orders;
 pub mod paper_exec;
+pub mod reconcile;
 pub mod risk;
 pub mod routes;
 pub mod run;

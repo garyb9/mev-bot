@@ -353,9 +353,9 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 | E-5 | Order manager + state machine (§10), cloid assignment, in-flight exposure | M | E-3 | ✅ |
 | E-6 | Build/batch/sign on the engine thread + `WsExec` backend (§12) incl. `TCP_NODELAY`, aggressive-price rule, rate budgets | M | E-5, SPEC-0002 H-1, H-2 | 🔄 |
 | E-7 | `PaperExec` backend + `hl replay` over recorder segments; determinism test | M | E-5, SPEC-0008 R-7 | 🔄 |
-| E-8 | Account stream + reconciler integration; delete `account_poller` | M | E-5, SPEC-0002 H-3 | ☐ |
-| E-9 | Hot-path risk integration (§11) with SPEC-0004 K-tasks | M | E-5, SPEC-0004 K-1, K-2, K-3 | ☐ |
-| E-10 | Latency stamps, histograms, benches incl. zero-alloc (§17) | M | E-6 | ☐ |
+| E-8 | Account stream + reconciler integration; delete `account_poller` | M | E-5, SPEC-0002 H-3 | 🔄 |
+| E-9 | Hot-path risk integration (§11) with SPEC-0004 K-tasks | M | E-5, SPEC-0004 K-1, K-2, K-3 | ✅ |
+| E-10 | Latency stamps, histograms, benches incl. zero-alloc (§17) | M | E-6 | ✅ |
 | E-11 | Fixed-point `Px`/`Sz` (**only if** E-10 shows decode/eval over budget) | L | E-10 | ☐ |
 | E-12 | Performance checklist (§18), results recorded | M | E-10 | ☐ |
 | E-13 | Remove the tick engine; update SPEC-0003 status; update RUNBOOK | S | E-4, E-6, E-7, E-8 | ☐ |
@@ -410,9 +410,21 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 
 **E-8 — Account stream + reconciler.** Wire H-3 and the §15 reconciler. Delete `account_poller`. *Done when:* tests cover drift detection and correction, the account-gap halt/resume, and `Unknown` resolution through a mocked `orderStatus`.
 
+**E-8 implemented, part 1 (2026-09-26) — reconciler library + poller removal.**
+- `mev-engine/src/reconcile.rs`: `Reconciler` (`build_snapshot` maps `ClearinghouseState`/`OpenOrder` → `VenueSnapshot`; `diff` → `SmallVec<[Drift; 16]>` for order-missing-on-venue / missing-locally / size+state mismatch / position / account-value; `apply_drift` corrects local state; `record_drift`/`should_trip` = the §15 3-in-10-min per-`DriftKind` breaker), and `resolve_unknown` (applies a passed-in `OrderStatusResponse` through the `OrderManager` transition guard). Pure: no I/O, no clock reads.
+- `mev-engine/src/state.rs`: `AccountStreamState` implements the §15/§16 gap semantics — `on_gap` halts places + requests reconcile; reconnect alone does not resume; `on_clean_reconcile(has_unknown, drift_remaining)` resumes only when both clear.
+- `mev-bot`: the 5 s `account_poller` is **deleted** and replaced by `account_reconciler` on the §15 30 s cadence (REST backstop, never on the order path).
+- Tests: drift detection/correction (both sides, size/status/position), correction idempotence and per-kind isolation, the 3-in-10-min breaker (and non-trip when spread out), the account-gap halt/resume matrix, and `Unknown` → filled/cancelled/resting/not-found/not-tracked via a mocked `orderStatus`.
+
+**E-8 remaining (recorded, not done).** The `Reconciler`/`AccountStreamState` are a tested library but are **not yet driven by the v2 `EngineLoop`** (`run.rs`) — the loop still routes account events through the E-3 `Dispatcher` seam, and the account-gap halt is not yet enforced on the v2 place path (risk reads `RiskGate`/`AccountStreamState` but the loop does not own one yet). This is the same integration gap as the pending E-5 "per-strategy dispatch replaces `Dispatcher`" item; E-13 deletes the legacy engine that currently consumes the reconciler. `AccountUpdate` has no `Gap` variant, so the gap entry point is the explicit `AccountStreamState::on_gap()` (the market side keeps `MarketUpdate::Gap`).
+
 **E-9 — Risk integration.** Implement §11 against SPEC-0004's K-tasks. *Done when:* property tests show that no sequence of approved actions can push projected exposure over a cap, and the kill switch stops all new places within one iteration.
 
+**E-9 implemented (2026-09-26).** `mev-engine/src/risk.rs`: `RiskGate` (`check`/`evaluate` + `RiskReason`), `RiskLimits`, `RiskCtx` (borrows the order manager, account state, slot, meta, rate budget and `now_ms`), `Breakers`, and `RateBudget`/`RateKind`/`RateBudgetConfig`. The §11 check order is exact: kill → breaker → stale → unknown-on-coin → rate budget → per-order notional (resize) → per-coin projected exposure = confirmed (`AccountState::projected_notional`) + worst-case in-flight (`OrderManager::pending_notional`), resize → margin utilization → min-notional/tick validity. Reduce-only bypasses stale/unknown/exposure; cancels bypass everything except the rate hard floor. **SPEC-0004 K-2** (in-flight/gross exposure toward the cap) landed in `LimitRisk` and the engine gate; the SPEC-0011 group-worst-single-leg rule is left a documented `GroupUnsupported` stub (group types do not exist yet — see §23 Q8). **SPEC-0004 K-3** landed as `mev-risk/src/kill.rs` (`KillSwitch` sticky flag, `check_flag_file` helper, `cancel_all_cloids`); the engine-gate kill check uses it. `RiskSettings.rate_budget` (`RateBudgetSettings`) added in `mev-core`. Tests: the rejection-order table, reduce-only, resize at both caps, kill-stops-all/sticky/cancel-all, rate-budget consume/guard/refill, config mapping, and a fixed-seed 5,000-iteration randomized property test asserting exposure never exceeds the cap. Approvals allocate nothing; only a rejection builds its reason string.
+
 **E-10 — Latency instrumentation.** §17 stamps, histograms, and benches. *Done when:* the benches run in CI quick mode (warn-only thresholds), the zero-alloc test passes, and §21 has the first numbers.
+
+**E-10 implemented (2026-09-26).** `mev-engine/src/instrument.rs`: `Stamps` (the §17 t_recv…t_ack chain with derived decode/queue/decide/risk/sign/handoff/`tick_to_order`/`submit_ack` spans), a fixed-bucket integer histogram + `LatencyRecorder` (`record`/`flush`, per-thread `&mut`, no lock on the hot path), and loop-health counters (iteration, events/iteration, market drops, idle ratio). `hdrhistogram` is **not** a workspace dependency, so a local ~4.4%-resolution histogram is used (switching to `hdrhistogram` recorded as a follow-up). The 12 §17 names were added to `mev-metrics` `names`. Benches in `crates/mev-bot/benches/engine.rs` (`bbo_to_action`, `drain_1000`, `replay_throughput`) with a `MEV_BENCH_QUICK=1` CI quick mode. `mev-engine/tests/zero_alloc.rs` is a counting-allocator test binary. First numbers recorded in §21. **Findings (honest, not hidden):** engine-side `Bbo` apply is 0 alloc/event, but the full `Ingest::decode` path allocates **1×/event** (a borrowed tag pre-parse in `decode_market`) — recorded as §23 Q9; `replay_throughput` measured ~649 k events/s vs the ≥1 M target (large `l2Book` frames dominate) — deferred to E-12. `run.rs` is not yet wired to the recorder (hooks are exposed; wiring is E-12/E-13).
 
 **E-11 — Fixed-point (conditional).** `Px(i64)`/`Sz(i64)` with per-asset scale; parse from strings directly; convert to `Decimal` at the persistence/display edges. *Done when:* property tests show round-trip exactness vs `Decimal` for all assets in `AssetMap`, and benches show the gain (else revert and record why).
 
@@ -424,12 +436,15 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 
 | Metric | Target | Measured | Host | Date |
 |---|---|---|---|---|
-| `bbo_to_action` p50 / p99 | ≤ 100 µs / ≤ 1 ms | | | |
-| Handoff ingest → engine p99 | ≤ 10 µs | | | |
-| Sign (single order) p50 / p99 | ≤ 150 / 500 µs | | | |
-| Allocations per `Bbo` event | 0 | | | |
-| Replay throughput | ≥ 1M events/s | | | |
-| `hl_submit_ack_seconds` p50 (live, testnet) | minimize | | | |
+| `bbo_to_action` p50 / p99 | ≤ 100 µs / ≤ 1 ms | ~34.6 µs / ~38.5 µs (quick) | dev (non-reference) | 2026-09-26 |
+| Handoff ingest → engine p99 | ≤ 10 µs | ~211 ns p50 (E-2) | dev | 2026-09-26 |
+| Sign (single order) p50 / p99 | ≤ 150 / 500 µs | included in `bbo_to_action` (not isolated) | dev | 2026-09-26 |
+| Allocations per `Bbo` event | 0 | apply 0; **full decode 1** (§23 Q9) | dev | 2026-09-26 |
+| Replay throughput | ≥ 1M events/s | ~649 k events/s (below target) | dev | 2026-09-26 |
+| `hl_submit_ack_seconds` p50 (live, testnet) | minimize | — (needs testnet) | | |
+| `drain_1000` (1000 events → 1 decision/dirty coin) | — | ~45.8 µs/drain | dev | 2026-09-26 |
+
+These are dev-host quick-mode numbers, **not** the reference production host (SPEC-0008 V-4); E-12 re-measures on the reference host and records the before/after.
 
 ## 22. Acceptance criteria
 
@@ -450,3 +465,6 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 5. **Q-Sign-Placement (E-6).** Does signing happen on the engine thread (§12, engine-owned `NonceManager`, agent signer inside `mev-engine`) or in the exec layer (part 1, keeps the key out of the engine crate)? Decision inputs: the sign budget (p50 ≤ 150 µs, §17), the AGENTS rule that only SPEC-0002 code holds the signer, and §23 Q3 (a second pinned signing thread). Decide in E-10 once sign latency is measured.
 6. **Q-BatchModify (E-6).** Exact `batchModify` wire fields need a source; until then `Action::Modify` is dropped by the builder (E-6 open item 2) and MM cannot re-quote on the new engine.
 7. **Q-Replay-Gap (E-7).** E-7's recorder-segment replay needs SPEC-0008 R-7 (blocked on R-1/R-2, crate absent). Sequence the recorder tasks before E-7 part 2, or accept the interim SQLite-log replay.
+8. **Q-Group-Risk (E-9).** SPEC-0004 K-2's group-worst-single-leg exposure rule and the SPEC-0011 `on_kill` residual path need the multi-leg group types, which do not exist yet; `RiskGate` returns `GroupUnsupported` for `Action::PlaceGroup`. Implement with SPEC-0011 L-tasks.
+9. **Q-Decode-Alloc (E-10).** The engine-side `Bbo` apply is 0 alloc/event (G-3 satisfied for the apply path), but `Ingest::decode` allocates 1×/event: `decode_market` pre-parses a borrowed channel tag, and `serde_json`'s ignored-value handling allocates once for the nested `data` shape. Fix by dispatching from one typed borrowed envelope or scanning the tag without `serde_json`. Also `replay_throughput` is ~649 k events/s (vs ≥1 M); both are E-12/E-11 inputs.
+10. **Q-Loop-Instrumentation (E-10/E-12).** `run.rs` does not yet own a `LatencyRecorder` or fill `Stamps`; the hooks exist in `instrument.rs`. Wire them when E-5's per-strategy dispatch replaces the `Dispatcher` seam (E-13).

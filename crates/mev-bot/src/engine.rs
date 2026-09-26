@@ -372,7 +372,7 @@ impl Engine {
         self
     }
 
-    /// The shared live-account view (updated by [`account_poller`]).
+    /// The shared live-account view (updated by [`account_reconciler`]).
     pub fn account(&self) -> Arc<RwLock<AccountView>> {
         self.account.clone()
     }
@@ -917,14 +917,19 @@ fn order_status_fields(status: &OrderStatus) -> (&'static str, String) {
     }
 }
 
-/// Poll `/info` for account state and publish it to the shared view.
-pub async fn account_poller(
+/// Refresh the shared account view on the reconciler cadence.
+///
+/// SPEC-0010 §15: the H-3 stream is the source of truth for own orders and
+/// fills; the REST reconciler is the backstop and runs every 30 s (and after a
+/// reconnect). This replaces the former 5 s `account_poller`. It is a background
+/// task, never on the order path.
+pub async fn account_reconciler(
     info: Arc<dyn InfoApi>,
     address: String,
     account: Arc<RwLock<AccountView>>,
     network: Network,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
     loop {
         interval.tick().await;
         match load_account(&*info, &address, network).await {
@@ -933,7 +938,7 @@ pub async fn account_poller(
                     *guard = view;
                 }
             }
-            Err(err) => warn!(error = %err, "account poll failed"),
+            Err(err) => warn!(error = %err, "account reconcile failed"),
         }
     }
 }

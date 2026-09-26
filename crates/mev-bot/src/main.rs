@@ -343,8 +343,10 @@ async fn run(
         }
         let account = engine.account();
         let halt = engine.halt();
-        let poller = config.account_address.clone().map(|address| {
-            tokio::spawn(engine::account_poller(
+        // SPEC-0010 §15: the H-3 stream is the source of truth; this is the
+        // REST reconciler backstop, not the order path.
+        let reconciler = config.account_address.clone().map(|address| {
+            tokio::spawn(engine::account_reconciler(
                 info.clone(),
                 address,
                 account.clone(),
@@ -353,7 +355,7 @@ async fn run(
         });
         (
             tokio::spawn(engine.run(state.clone())),
-            poller,
+            reconciler,
             account,
             halt,
         )
@@ -393,10 +395,10 @@ async fn run(
     ingest.abort();
     monitor.abort();
     heartbeat.abort();
-    if let Some((engine, poller, _, _)) = engine_task {
+    if let Some((engine, reconciler, _, _)) = engine_task {
         engine.abort();
-        if let Some(poller) = poller {
-            poller.abort();
+        if let Some(reconciler) = reconciler {
+            reconciler.abort();
         }
     }
     // The dead-man task disarms `scheduleCancel` on the same shutdown signal;

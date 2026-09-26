@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-use crate::types::{AssetCtxLite, BookSnapshot, CoinId, Level, Px, Stamp};
+use crate::types::{AccountUpdate, AssetCtxLite, BookSnapshot, CoinId, Level, Px, Stamp};
 
 /// Per-coin market state, indexed by `CoinId`.
 #[derive(Debug, Clone, Default)]
@@ -180,6 +180,84 @@ impl AccountState {
     }
 }
 
+/// Health and halt latches for the H-3 account stream (SPEC-0010 §15, §16).
+///
+/// The stream is the source of truth; a gap halts new places account-wide and
+/// requests an immediate reconcile. Places resume only after a clean reconcile
+/// with no `Unknown` orders and no remaining drift. All state is a handful of
+/// booleans, so the steady path allocates nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountStreamState {
+    healthy: bool,
+    places_halted: bool,
+    needs_reconcile: bool,
+}
+
+impl AccountStreamState {
+    /// A fresh, healthy stream that is not halted (startup reconciles before
+    /// trading; E-10 wires the initial reconcile).
+    pub fn new() -> Self {
+        Self {
+            healthy: true,
+            places_halted: false,
+            needs_reconcile: false,
+        }
+    }
+
+    /// Whether the account stream is delivering updates.
+    pub fn is_healthy(&self) -> bool {
+        self.healthy
+    }
+
+    /// Whether new (non-reduce-only) places are halted account-wide.
+    pub fn places_halted(&self) -> bool {
+        self.places_halted
+    }
+
+    /// Whether an immediate reconcile is outstanding.
+    pub fn needs_reconcile(&self) -> bool {
+        self.needs_reconcile
+    }
+
+    /// Record an account-stream gap: unhealthy, halt places, request reconcile.
+    pub fn on_gap(&mut self) {
+        self.healthy = false;
+        self.places_halted = true;
+        self.needs_reconcile = true;
+    }
+
+    /// Record that the stream reconnected. Places stay halted until a clean
+    /// reconcile clears the halt.
+    pub fn on_stream_resumed(&mut self) {
+        self.healthy = true;
+    }
+
+    /// Apply an account update to stream health.
+    ///
+    /// Any update proves the stream is live. A `Reconcile` snapshot satisfies
+    /// the outstanding reconcile request; whether places resume is decided by
+    /// [`Self::on_clean_reconcile`] once the engine has checked for unknown
+    /// orders and remaining drift.
+    pub fn on_account_update(&mut self, update: &AccountUpdate) {
+        self.healthy = true;
+        if matches!(update, AccountUpdate::Reconcile { .. }) {
+            self.needs_reconcile = false;
+        }
+    }
+
+    /// Apply the outcome of a reconcile pass.
+    ///
+    /// Places resume only when there are no `Unknown` orders and no remaining
+    /// drift. Returns whether places are now resumed.
+    pub fn on_clean_reconcile(&mut self, has_unknown: bool, drift_remaining: bool) -> bool {
+        self.needs_reconcile = false;
+        if !has_unknown && !drift_remaining {
+            self.places_halted = false;
+        }
+        !self.places_halted
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +337,51 @@ mod tests {
         account.spot.insert("UBTC".into(), Decimal::from(2));
         assert_eq!(account.spot_balance("UBTC"), Decimal::from(2));
         assert_eq!(account.spot_balance("NOPE"), Decimal::ZERO);
+    }
+
+    #[test]
+    fn account_gap_halts_until_a_clean_reconcile() {
+        let mut stream = AccountStreamState::new();
+        assert!(stream.is_healthy());
+        assert!(!stream.places_halted());
+        assert!(!stream.needs_reconcile());
+
+        stream.on_gap();
+        assert!(!stream.is_healthy());
+        assert!(stream.places_halted());
+        assert!(stream.needs_reconcile());
+
+        // Reconnect alone does not resume places.
+        stream.on_stream_resumed();
+        assert!(stream.is_healthy());
+        assert!(stream.places_halted());
+
+        // A reconcile with unknowns pending keeps the halt.
+        assert!(!stream.on_clean_reconcile(true, false));
+        assert!(stream.places_halted());
+        assert!(!stream.needs_reconcile());
+
+        // Drift remaining keeps the halt.
+        assert!(!stream.on_clean_reconcile(false, true));
+        assert!(stream.places_halted());
+
+        // No unknowns, no drift: resume.
+        assert!(stream.on_clean_reconcile(false, false));
+        assert!(!stream.places_halted());
+    }
+
+    #[test]
+    fn account_updates_mark_stream_healthy_and_satisfy_reconcile() {
+        let mut stream = AccountStreamState::new();
+        stream.on_gap();
+        let update = AccountUpdate::Reconcile {
+            stamp: Stamp::default(),
+            snapshot: crate::types::AccountSnapshot::default(),
+        };
+        stream.on_account_update(&update);
+        assert!(stream.is_healthy());
+        assert!(!stream.needs_reconcile());
+        // The halt is cleared only by the explicit clean-reconcile outcome.
+        assert!(stream.places_halted());
     }
 }
