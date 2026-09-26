@@ -40,8 +40,9 @@ So in this project, "MEV/arb" means, in rough order of expected fit:
 3. **Cross-venue latency.** Binance/Bybit move first and HyperCore quotes lag.
 4. **Flow events.** Liquidation cascades, oracle-update timing, funding settlement.
 5. **Carry.** Funding/basis. This is not arb; it is a low-risk **pilot** used to prove the stack end to end.
-6. **HIP-3 tokenized stocks vs the real stock.** Stock perps trade 24/7 while the stock and its options trade only in US hours. That gives market-hours dislocations vs the live stock price, and convergence at the US open (SPEC-0008 O10).
-7. **Options-informed direction** (the second family). Options positioning (put/call imbalance, skew, open-interest walls; IV for crypto) as a signal for HIP-3 stock perps and BTC/ETH (SPEC-0008 O9). It is directional, so it carries market risk and needs its own risk limits before it can go live.
+6. **HIP-3 tokenized stocks vs the real stock.** Stock perps trade 24/7 while the stock and its options trade only in US hours. That gives market-hours dislocations vs the live stock price, lead-lag vs BTC/index perps while US markets are closed, and weekend/overnight information that may carry into the next session or week (SPEC-0008 O10).
+7. **Mean reversion, arb-style.** Bollinger bands (finsnap's best historical strategy) applied to the *spread* between related instruments (market-neutral stat-arb) and to single HL perps on short timeframes (SPEC-0008 O11).
+8. **Options-informed direction** (the second family). Options positioning (put/call imbalance, skew, open-interest walls; IV for crypto) as a signal for HIP-3 stock perps and BTC/ETH (SPEC-0008 O9). It is directional, so it carries market risk and needs its own risk limits before it can go live.
 
 Which of these we actually build is **decided by data** (SPEC-0008), not by
 preference. If you have a new idea, add it as a study there first.
@@ -74,6 +75,8 @@ The final choice of what to build is recorded in ADR-0002
 
 1. **Evidence before strategy.** No strategy code goes live without a
    SPEC-0008 study showing net-positive edge. "It should work" is not evidence.
+   The one exception is an owner-approved **pilot** (gate G1.5): small,
+   capped, time-boxed, with a hard loss limit.
 2. **Safe by default.** The default mode is `observe`. `live` requires explicit
    configuration plus `HL_LIVE_CONFIRM=YES`. Agents **never** run `live` and
    never handle mainnet keys.
@@ -171,6 +174,7 @@ The recorder depends only on M1 (market data), so it can start immediately.
 | Gate | Question | Evidence required | Recorded in |
 |---|---|---|---|
 | G1 (end of M3) | Which strategy do we build first, or none? | SPEC-0008 study reports + `RANKING.md` covering ≥ 14 days of data | ADR-0002 |
+| G1.5 (optional pilot) | Run a MARGINAL / promising-but-unproven strategy with real money to learn? | Owner prior + study report; capital ≤ pilot cap, ≤ 4 weeks, hard loss limit (SPEC-0008 §13.6); G2 passed first | ADR entry |
 | G2 (before any `live`) | Is the stack safe **and fast** with real money? | Testnet round-trip, kill-switch drill, risk property tests, pilot in `simulate`, measured tick-to-order within the §5.2 budget | SPEC-0004/0006 checklists |
 | G3 (before scaling size) | Does realized edge match researched edge? | ≥ 7 days live at small size; realized vs expected within tolerance | Strategy spec |
 
