@@ -59,7 +59,7 @@ SPEC-0008 §14.0–14.1.
 
 | Tier | What | Items | When |
 |---|---|---|---|
-| **T1: arb core** (latency-first) | Recorder, research toolkit, fast dislocation / arb studies, HyperEVM MEV feasibility (desk research), execution hardening (M2.5) | Items 1, 3, 6 (in-hours + closed-hours lead-lag), 7 (spread bands); study O8 Q1–Q4 | **First, always** |
+| **T1: arb core** (latency-first) | Recorder, research toolkit, fast dislocation / arb studies, HyperEVM MEV feasibility (desk research), execution hardening (M2.5), **event-driven engine (SPEC-0010), multi-leg execution (SPEC-0011), risk hardening (SPEC-0004 K-1…K-7), CI (SPEC-0000 C-tasks)** | Items 1, 3, 6 (in-hours + closed-hours lead-lag), 7 (spread bands); study O8 Q1–Q4 | **First, always** |
 | **T2: adjacent** | Reuses T1 data, or waits on heavier infrastructure | Items 2 (needs HyperEVM RPC / node), 4, 5; HIP-3 funding patterns | When T1 is done, blocked, or taken |
 | **T3-data** | Starting the clock on forward options data | Options-chain and Deribit recording | **Any time** (small, time-sensitive) |
 | **T3: directional family** | Signals held hours to days | Item 8; open convergence and weekend → week-ahead (item 6); single-instrument Bollinger (item 7) | After the recorder is in production **and** ≥ 3 T1 studies have preliminary reports |
@@ -170,7 +170,7 @@ Spec numbers are **stable identifiers, not an order**. This table is the order.
 | M2 | Execution: signing, nonce, order builder, transports, dead-man switch | SPEC-0002 | ✅ done (testnet round-trip open) | M1 |
 | M2.5 | **Execution hardening + latency baseline**: concurrent WS post, account stream, mandatory `cloid`, dead-man policy, stream watchdog, tick-to-order instrumentation, sign/submit benchmarks | SPEC-0002 §17 | ⏳ next | M2 |
 | **M3** | **Market-data recorder + opportunity research → ADR-0002** | **SPEC-0008** | ⏳ **now** (runs in parallel with M2.5) | M1 |
-| M4 | Engine + risk + persistence; **funding-carry pilot** at small size | SPEC-0003 (A), SPEC-0004 | planned | M2.5, M3 recorder |
+| M4 | **Event-driven engine** + risk hardening + multi-leg execution; **funding-carry pilot** at small size | SPEC-0010, SPEC-0004 §16, SPEC-0011, SPEC-0003 (A) | 🔄 v1 tick engine exists; SPEC-0010 replaces it | M2.5, M3 recorder (for replay) |
 | M3.5 | **Own non-validator node in Tokyo**: fastest data, local EVM RPC, richer data (fills, order statuses, L4 book) | SPEC-0009 | later (starts when its §2 triggers fire) | M3 recorder in production |
 | M5 | **First strategy**, the one chosen by ADR-0002 (arb, or the options-informed family if it ranks higher) | new spec, next free number (SPEC-0010+), written after ADR-0002 | planned | M3 gate, M4 |
 | M6 | Market-making | SPEC-0003 (B) | only if research supports it | M4 |
@@ -185,14 +185,20 @@ The recorder depends only on M1 (market data), so it can start immediately.
 
 Follow the tiers (§2.1):
 
+0. **Safety first: SPEC-0010 E-0** (cloid on every live order, parse order
+   statuses, no mid-as-limit, fail-closed limits, count same-cycle intents)
+   and **SPEC-0004 K-1**. This must be done before any testnet or live run.
 1. **T1: SPEC-0008 recorder** (V-1…V-4, V-11, V-12, R-1…R-8, R-10, R-13)
    deployed to a low-latency host, **and SPEC-0002 §17** (M2.5 hardening), in
    parallel.
 2. **T3-data, small and early:** V-9, V-10, V-13, R-11, R-12. Options
    history needs calendar time, so start its clock now.
-3. **T1 research:** P-1…P-5, then studies O1, O2, O3, O5, O8 (desk), O10
+3. **T1 engine:** SPEC-0010 E-1…E-10 (after H-1/H-2/H-3 and SPEC-0008 R-3),
+   then SPEC-0011 L-tasks and SPEC-0004 K-tasks. SPEC-0000 C-tasks are
+   small and can run any time.
+4. **T1 research:** P-1…P-5, then studies O1, O2, O3, O5, O8 (desk), O10
    A+D, O11 A.
-4. **T2** studies, then **T3** research once its gate opens. Everything ends
+5. **T2** studies, then **T3** research once its gate opens. Everything ends
    in ADR-0002.
 
 ## 9. Decision gates

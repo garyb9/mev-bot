@@ -35,6 +35,8 @@ build order is the roadmap in [`docs/GOAL.md`](docs/GOAL.md). See [`specs/`](spe
 | [SPEC-0007](specs/SPEC-0007-polymarket-parked.md) | Polymarket (parked) |
 | [SPEC-0008](specs/SPEC-0008-recorder-and-opportunity-research.md) | Market-data recorder & opportunity research (M3) |
 | [SPEC-0009](specs/SPEC-0009-own-node.md) | Own Hyperliquid non-validator node (M3.5, later) |
+| [SPEC-0010](specs/SPEC-0010-event-driven-engine.md) | Event-driven engine & hot path (latency-first) |
+| [SPEC-0011](specs/SPEC-0011-multi-leg-execution.md) | Multi-leg execution & hedging |
 
 ## Workspace
 
