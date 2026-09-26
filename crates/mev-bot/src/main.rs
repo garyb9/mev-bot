@@ -9,7 +9,7 @@ use anyhow::Result;
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
 use mev_core::config::{Config, ConfigOverrides, Mode, Network};
-use mev_hl_client::{HttpInfo, InfoApi};
+use mev_hl_client::{HttpInfo, InfoApi, MarketStream, StreamEvent, Subscription, WsMarketStream};
 use mev_metrics::{health::Health, prometheus::PrometheusHandle};
 use tokio::signal;
 use tracing::{error, info};
@@ -143,7 +143,7 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
         }
         Command::Markets { query } => markets(network, query).await,
         Command::Book { coin, levels } => book(network, coin, levels).await,
-        Command::Watch { coins } => not_yet(&format!("watch {}", coins.join(","))),
+        Command::Watch { coins } => watch(network, coins).await,
         Command::Select { add, remove } => not_yet(&format!("select +{add:?} -{remove:?}")),
     }
 }
@@ -237,6 +237,80 @@ async fn book(network: Option<NetworkArg>, coin: String, levels: usize) -> Resul
         println!("    {:<16} {}", level.px, level.sz);
     }
     Ok(())
+}
+
+async fn watch(network: Option<NetworkArg>, coins: Vec<String>) -> Result<()> {
+    let network = resolve_network(network)?;
+    let coins = if coins.is_empty() {
+        Config::load(ConfigOverrides::default())?.watchlist
+    } else {
+        coins
+    };
+    if coins.is_empty() {
+        anyhow::bail!("no coins to watch; pass coin names or configure a watchlist");
+    }
+
+    let mut subs = vec![Subscription::AllMids];
+    for coin in &coins {
+        subs.push(Subscription::L2Book { coin: coin.clone() });
+        subs.push(Subscription::Trades { coin: coin.clone() });
+        subs.push(Subscription::ActiveAssetCtx { coin: coin.clone() });
+    }
+
+    let mut stream = WsMarketStream::connect(network, &subs).await?;
+    println!(
+        "watching {} on {:?} (ctrl-c to stop)",
+        coins.join(", "),
+        network
+    );
+
+    loop {
+        tokio::select! {
+            _ = shutdown_signal() => break,
+            event = stream.next() => match event {
+                Ok(event) => print_event(event),
+                Err(err) => {
+                    error!(error = %err, "stream error");
+                    break;
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+fn print_event(event: StreamEvent) {
+    match event {
+        StreamEvent::Mids(mids) => {
+            let btc = mids.get("BTC").copied().unwrap_or_default();
+            println!("mids      {} coins (BTC={})", mids.len(), btc);
+        }
+        StreamEvent::Book(book) => println!(
+            "book      {:<12} bid={:?} ask={:?} mid={:?}",
+            book.coin,
+            book.best_bid().map(|l| l.px),
+            book.best_ask().map(|l| l.px),
+            book.mid(),
+        ),
+        StreamEvent::Bbo(bbo) => println!(
+            "bbo       {:<12} bid={:?} ask={:?}",
+            bbo.coin,
+            bbo.bid().map(|l| l.px),
+            bbo.ask().map(|l| l.px),
+        ),
+        StreamEvent::Trades(trades) => {
+            if let Some(trade) = trades.last() {
+                println!(
+                    "trade     {:<12} {} {} @ {}",
+                    trade.coin, trade.side, trade.sz, trade.px
+                );
+            }
+        }
+        StreamEvent::AssetCtx(update) => println!(
+            "ctx       {:<12} mark={} oracle={} funding={}",
+            update.coin, update.ctx.mark_px, update.ctx.oracle_px, update.ctx.funding,
+        ),
+    }
 }
 
 fn show_config() -> Result<()> {

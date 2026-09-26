@@ -131,6 +131,60 @@ pub struct AssetCtx {
     pub mid_px: Option<Decimal>,
 }
 
+/// Best bid/offer snapshot (`bbo`). Either side may be absent.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Bbo {
+    /// Coin.
+    pub coin: String,
+    /// Server timestamp in milliseconds.
+    pub time: u64,
+    /// `[bid, ask]`, each optionally absent.
+    pub bbo: [Option<Level>; 2],
+}
+
+impl Bbo {
+    /// Best bid, if present.
+    pub fn bid(&self) -> Option<&Level> {
+        self.bbo[0].as_ref()
+    }
+
+    /// Best ask, if present.
+    pub fn ask(&self) -> Option<&Level> {
+        self.bbo[1].as_ref()
+    }
+}
+
+/// A public trade print.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Trade {
+    /// Coin.
+    pub coin: String,
+    /// Aggressor side (`B` or `A`).
+    pub side: String,
+    /// Price.
+    pub px: Decimal,
+    /// Size.
+    pub sz: Decimal,
+    /// Server timestamp in milliseconds.
+    pub time: u64,
+    /// Transaction hash.
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// Trade id.
+    #[serde(default)]
+    pub tid: Option<u64>,
+}
+
+/// `activeAssetCtx` payload: coin plus its context.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AssetCtxUpdate {
+    /// Coin.
+    pub coin: String,
+    /// Asset context.
+    pub ctx: AssetCtx,
+}
+
 /// `metaAndAssetCtxs` response: metadata plus per-asset contexts.
 #[derive(Debug, Clone)]
 pub struct MetaAndAssetCtxs {

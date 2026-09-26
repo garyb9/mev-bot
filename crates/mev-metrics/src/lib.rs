@@ -20,6 +20,10 @@ pub mod names {
     pub const FEED_STALENESS_SECONDS: &str = "hl_feed_staleness_seconds";
     /// WebSocket reconnect counter, tagged by reason.
     pub const WS_RECONNECTS: &str = "hl_ws_reconnects_total";
+    /// WebSocket frames that failed to decode.
+    pub const WS_PARSE_ERRORS: &str = "hl_ws_parse_errors_total";
+    /// Currently connected WebSocket sockets.
+    pub const WS_CONNECTED: &str = "hl_ws_connected";
     /// Order submission latency histogram, tagged by transport.
     pub const ORDER_SUBMIT_SECONDS: &str = "hl_order_submit_seconds";
     /// Order rejects, tagged by exchange status.
