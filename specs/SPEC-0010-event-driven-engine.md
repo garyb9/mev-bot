@@ -346,7 +346,7 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 | ID | Title | Size | Depends on | Status |
 |---|---|---|---|---|
 | E-0 | **T0: Safety fixes on the current engine** (before any other work or testnet run) | S | — | ✅ |
-| E-1 | Core types: `CoinId` interning, `Stamp`, `MarketUpdate`, `AccountUpdate`, `Level`, `BookSnapshot`, `Cloid` | S | — | ☐ |
+| E-1 | Core types: `CoinId` interning, `Stamp`, `MarketUpdate`, `AccountUpdate`, `Level`, `BookSnapshot`, `Cloid` | S | — | ✅ |
 | E-2 | Typed ingest decoders (no `serde_json::Value`) + market/account channels; handoff bench | M | E-1, SPEC-0008 R-3 | ☐ |
 | E-3 | Engine thread + loop (§9), timers, routes, spin/park | M | E-1 | ☐ |
 | E-4 | Strategy API v2 (sync) + port `FundingBasis` and `MarketMaker` | M | E-3 | ☐ |
@@ -365,6 +365,8 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 **E-0 — Safety fixes on the current engine.** In `crates/mev-bot/src/engine.rs`, `mev-risk`, and `mev-core/src/config.rs`: (1) assign a `cloid` to every live order when the intent has none; (2) parse the `place` response's per-order statuses and record `resting` / `filled` / `rejected:<reason>` instead of "submitted"; (3) for `limit_px: None`, use the §12 aggressive-price rule instead of the mid; (4) `Config::validate` rejects `live` unless all four risk limits are set; (5) `LimitRisk` counts the notional of intents already approved **in the same cycle** toward the position cap. *Done when:* a unit test covers each of the five, and existing tests pass.
 
 **E-1 — Core types.** New module `crates/mev-bot/src/engine/types.rs` (or a new `mev-engine` crate, if the dependency graph needs it: decide in the task and note why). `CoinId` is built from `AssetMap` at startup with a bidirectional map. *Done when:* types compile with docs, and a unit test round-trips `CoinId` ↔ coin name for perps, spot, and HIP-3.
+
+**E-1 implemented (2026-09-26).** `crates/mev-bot/src/engine/types.rs` (a module, not a new crate: only the engine consumes these types today; a crate would force `mev-strategy`/`mev-risk` re-dependencies for no benefit — revisit only if E-7 benches need the types without the binary). Ships `CoinId`/`CoinRegistry` (dense ids from the configured universe, `from_asset_map` helper), `ConnId`, `Cloid([u8;16])`, `Level`/`BookSnapshot` (fixed `[Level; 20]`, `BOOK_DEPTH`), `Stamp`, `Px`/`Sz` = `Decimal`, `AssetCtxLite`/`AssetMetaLite`, `Side`, `VenueOrderStatus`, `PostResult`, `Control`, `AccountSnapshot`, and the §6 `MarketUpdate`/`AccountUpdate` enums. `AccountSnapshot`/`PostResult`/`Control`/`VenueOrderStatus` are minimal payload stubs to be fleshed out by E-5/E-8/E-9. Adds `smallvec` (workspace) for `Trades`; `MarketUpdate` keeps its `Book` inline (`#[allow(clippy::large_enum_variant)]`) because boxing would allocate per event.
 
 **E-2 — Typed ingest.** Decoders for `bbo`, `l2Book`, `trades`, `activeAssetCtx`, and the H-3 account channels deserialize straight into §6 types (serde with borrowed `&str` → parse). Ingest tasks stamp `t_recv` right after the read, then `try_send`. *Done when:* golden-fixture tests pass (reuse `benches/fixtures`), decode bench ≤ ADR-0001 numbers, and the handoff bench (async `try_send` → engine thread receive) is recorded, p99 target ≤ 10 µs.
 

@@ -2339,6 +2339,7 @@ dependencies = [
  "mev-strategy",
  "rust_decimal",
  "serde_json",
+ "smallvec",
  "tokio",
  "tracing",
 ]
