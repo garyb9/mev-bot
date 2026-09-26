@@ -16,6 +16,10 @@ pub enum Error {
     Decode(String),
     /// The exchange rejected a signed action (`status: "err"`).
     Exchange(String),
+    /// An action was sent but no definitive reply was received (socket loss or
+    /// timeout). The order's state is unknown and must be reconciled — never
+    /// resent blindly (SPEC-0002 H-1/H-2).
+    UnknownOutcome(String),
     /// A feature or code path is not yet implemented.
     Unimplemented(&'static str),
 }
@@ -27,6 +31,7 @@ impl fmt::Display for Error {
             Error::Http(msg) => write!(f, "http error: {msg}"),
             Error::Decode(msg) => write!(f, "decode error: {msg}"),
             Error::Exchange(msg) => write!(f, "exchange error: {msg}"),
+            Error::UnknownOutcome(msg) => write!(f, "unknown outcome: {msg}"),
             Error::Unimplemented(what) => write!(f, "not implemented: {what}"),
         }
     }

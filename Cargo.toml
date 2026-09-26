@@ -47,7 +47,7 @@ anyhow = "1"
 figment = { version = "0.10", features = ["toml", "env"] }
 secrecy = { version = "0.10", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"

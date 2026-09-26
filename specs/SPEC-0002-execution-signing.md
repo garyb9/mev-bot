@@ -188,7 +188,7 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 
 | ID | Title | Tier | Size | Depends on | Status |
 |---|---|---|---|---|---|
-| H-1 | Concurrent WS `post` (reader task + pending map) | **T0** | M | — | ☐ |
+| H-1 | Concurrent WS `post` (reader task + pending map) | **T0** | M | — | ✅ |
 | H-2 | Mandatory `cloid` + unknown-outcome reconciliation | **T0** | M | H-1 | ☐ |
 | H-3 | Account stream (`orderUpdates`, `userFills`, `userEvents`) | T1 | M | SPEC-0008 R-3 | ☐ |
 | H-4 | Dead-man's switch policy (arm only when needed; fail closed) | **T0** | S | H-1 | ☐ |

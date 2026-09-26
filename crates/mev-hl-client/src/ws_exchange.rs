@@ -3,13 +3,19 @@
 //! Anything postable over HTTP is postable here: the signed envelope travels as
 //! `{"method":"post","id":N,"request":{"type":"action","payload":{...}}}` and
 //! the venue replies on `{"channel":"post","data":{"id":N,"response":{...}}}`.
-//! Posts are serialized on a single socket and correlated by `id`, so a late
-//! reply for an earlier post is skipped rather than misattributed.
+//!
+//! Posts are **concurrent** (SPEC-0002 H-1): one task owns the socket and
+//! drains an outbound channel; a reader task correlates each reply by its `id`
+//! into a pending map of one-shot channels, so many orders can be in flight at
+//! once and a slow reply never serializes the others. In-flight posts are
+//! capped at [`MAX_IN_FLIGHT`] and each request has a timeout that resolves to
+//! [`Error::UnknownOutcome`]; a dropped socket also fails every pending request
+//! with `UnknownOutcome` so the caller reconciles instead of resending.
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -21,6 +27,8 @@ use mev_core::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::exchange::{
@@ -30,6 +38,13 @@ use crate::order::Action;
 use crate::ws::ensure_crypto_provider;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Venue limit on simultaneous in-flight WS posts (SPEC-0002 §10).
+pub const MAX_IN_FLIGHT: usize = 100;
+/// Default per-request reply timeout (SPEC-0002 H-1).
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Application keepalive ping interval.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Outgoing `post` frame. `payload` is a typed [`ExchangeRequest`] (not a
 /// `Value`) so the action's JSON field order matches its msgpack hash.
@@ -47,12 +62,30 @@ struct PostBody<'a> {
     payload: &'a ExchangeRequest,
 }
 
+/// A reply routed back from the reader task; `None` means the socket was lost.
+type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Option<Value>>>>>;
+
 /// WebSocket `post` transport implementing [`ExchangeApi`].
 pub struct WsExchange {
     url: String,
     core: WriteCore,
-    socket: tokio::sync::Mutex<Option<Socket>>,
+    connection: tokio::sync::Mutex<Option<Connection>>,
     next_id: AtomicU64,
+    in_flight: Arc<Semaphore>,
+    request_timeout: Duration,
+}
+
+/// One live socket: the writer task, the reader task, and the pending map.
+struct Connection {
+    tx: mpsc::Sender<Message>,
+    pending: PendingMap,
+    task: JoinHandle<()>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl WsExchange {
@@ -74,9 +107,17 @@ impl WsExchange {
         Ok(Self {
             url: url.into(),
             core: WriteCore::new(mode, signer)?,
-            socket: tokio::sync::Mutex::new(None),
+            connection: tokio::sync::Mutex::new(None),
             next_id: AtomicU64::new(1),
+            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
+    }
+
+    /// Override the per-request timeout (default 5 s).
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     /// Attach a durable nonce store and restore the persisted high-water mark.
@@ -138,69 +179,139 @@ impl WsExchange {
         })
         .map_err(|e| Error::Decode(e.to_string()))?;
 
-        let mut guard = self.socket.lock().await;
-        if guard.is_none() {
-            *guard = Some(Self::dial(&self.url).await?);
+        // Cap simultaneous posts at the venue limit.
+        let _permit = self
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Http("websocket closed before send".into()))?;
+
+        let (tx, rx) = oneshot::channel();
+        let send_tx = self.register_pending(id, tx).await?;
+        if send_tx.send(Message::Text(frame.into())).await.is_err() {
+            self.remove_pending(id);
+            return Err(Error::UnknownOutcome("websocket send failed".into()));
         }
 
-        let sent = guard
-            .as_mut()
-            .expect("socket present")
-            .send(Message::Text(frame.clone().into()))
-            .await;
-        if sent.is_err() {
-            // The socket died between posts; redial once and resend the same
-            // signed envelope (identical nonce, so at worst the venue reports a
-            // duplicate, which the nonce manager heals).
-            *guard = Some(Self::dial(&self.url).await?);
-            guard
-                .as_mut()
-                .expect("socket present")
-                .send(Message::Text(frame.into()))
-                .await
-                .map_err(|e| Error::Http(e.to_string()))?;
+        match tokio::time::timeout(self.request_timeout, rx).await {
+            Ok(Ok(Some(response))) => Ok(response),
+            // The reader resolved this id with `None` (socket lost).
+            Ok(Ok(None)) => Err(Error::UnknownOutcome(
+                "websocket dropped before reply".into(),
+            )),
+            Ok(Err(_)) => Err(Error::UnknownOutcome(
+                "websocket reply channel closed".into(),
+            )),
+            Err(_) => {
+                self.remove_pending(id);
+                Err(Error::UnknownOutcome(format!(
+                    "no reply within {:?}",
+                    self.request_timeout
+                )))
+            }
         }
-
-        let socket = guard.as_mut().expect("socket present");
-        Self::await_reply(socket, id).await
     }
 
-    /// Read frames until the `post` reply for `id` arrives, answering pings.
-    async fn await_reply(socket: &mut Socket, id: u64) -> Result<Value> {
+    /// Register the waiter for `id`, dialing lazily if there is no connection.
+    async fn register_pending(
+        &self,
+        id: u64,
+        tx: oneshot::Sender<Option<Value>>,
+    ) -> Result<mpsc::Sender<Message>> {
+        let mut guard = self.connection.lock().await;
+        if guard.is_none() {
+            let socket = Self::dial(&self.url).await?;
+            let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+            let (send_tx, rx) = mpsc::channel::<Message>(MAX_IN_FLIGHT);
+            let task = tokio::spawn(Self::connection_task(socket, rx, pending.clone()));
+            *guard = Some(Connection {
+                tx: send_tx,
+                pending,
+                task,
+            });
+        }
+        let conn = guard.as_ref().expect("connection present");
+        conn.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, tx);
+        Ok(conn.tx.clone())
+    }
+
+    /// Drop a waiter we no longer care about (e.g. after a timeout).
+    fn remove_pending(&self, id: u64) {
+        if let Ok(guard) = self.connection.try_lock()
+            && let Some(conn) = guard.as_ref()
+        {
+            conn.pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&id);
+        }
+    }
+
+    /// Own the socket: write outbound frames, read replies, answer pings, and
+    /// on socket loss fail every pending request with `None` (UnknownOutcome).
+    async fn connection_task(
+        mut socket: Socket,
+        mut rx: mpsc::Receiver<Message>,
+        pending: PendingMap,
+    ) {
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        ping.tick().await;
         loop {
-            let message = socket
-                .next()
-                .await
-                .ok_or_else(|| Error::Http("websocket closed before reply".into()))?
-                .map_err(|e| Error::Http(e.to_string()))?;
-            match message {
-                Message::Text(text) => {
-                    let frame: Value =
-                        serde_json::from_str(&text).map_err(|e| Error::Decode(e.to_string()))?;
-                    match frame.get("channel").and_then(Value::as_str) {
-                        Some("post") => {
-                            let data = &frame["data"];
-                            if data.get("id").and_then(Value::as_u64) == Some(id) {
-                                return Ok(data.get("response").cloned().unwrap_or(Value::Null));
-                            }
-                        }
-                        Some("error") => {
-                            return Err(Error::Http(format!("websocket error: {frame}")));
-                        }
-                        _ => {}
+            tokio::select! {
+                outbound = rx.recv() => {
+                    let Some(message) = outbound else { break };
+                    if socket.send(message).await.is_err() {
+                        break;
                     }
                 }
-                Message::Ping(payload) => {
-                    socket
-                        .send(Message::Pong(payload))
-                        .await
-                        .map_err(|e| Error::Http(e.to_string()))?;
+                _ = ping.tick() => {
+                    if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        break;
+                    }
                 }
-                Message::Close(_) => {
-                    return Err(Error::Http("websocket closed before reply".into()));
+                inbound = socket.next() => {
+                    let Some(Ok(message)) = inbound else { break };
+                    match message {
+                        Message::Text(text) => {
+                            let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
+                            if frame.get("channel").and_then(Value::as_str) != Some("post") {
+                                continue;
+                            }
+                            let data = &frame["data"];
+                            let Some(id) = data.get("id").and_then(Value::as_u64) else { continue };
+                            let response = data.get("response").cloned().unwrap_or(Value::Null);
+                            let sender = pending
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .remove(&id);
+                            if let Some(sender) = sender {
+                                let _ = sender.send(Some(response));
+                            }
+                        }
+                        Message::Ping(payload) => {
+                            if socket.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Close(_) => break,
+                        Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+                    }
                 }
-                Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
             }
+        }
+        // Socket gone: fail every waiter.
+        let waiters: Vec<_> = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, sender)| sender)
+            .collect();
+        for sender in waiters {
+            let _ = sender.send(None);
         }
     }
 
@@ -309,6 +420,75 @@ mod tests {
         format!("ws://{addr}")
     }
 
+    /// A mock venue that holds every post until its client socket is dropped,
+    /// then drops the socket without replying. Replies are shuffled: the `id`
+    /// echoed back is a marker so the caller can prove each response is routed
+    /// to the right request.
+    async fn black_hole_venue() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Read and discard; hold the socket until the peer closes.
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        format!("ws://{addr}")
+    }
+
+    /// A mock venue that answers each request with the request's own `id`
+    /// echoed back, after a per-request delay, and shuffles the order.
+    async fn echo_venue(delay_ms: u64) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let mut pending: Vec<(u64, u64)> = Vec::new(); // (id, reply_at_ms)
+            let start = std::time::Instant::now();
+            loop {
+                let next_reply = pending.iter().map(|(_, at)| *at).min().unwrap_or(u64::MAX);
+                let now = start.elapsed().as_millis() as u64;
+                let wait = next_reply.saturating_sub(now);
+                tokio::select! {
+                    message = ws.next() => {
+                        let Some(Ok(Message::Text(text))) = message else { break };
+                        let request: Value = serde_json::from_str(&text).unwrap();
+                        let id = request["id"].as_u64().unwrap();
+                        pending.push((id, now + delay_ms));
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(wait.clamp(1, 50))), if !pending.is_empty() => {
+                        let now = start.elapsed().as_millis() as u64;
+                        let due: Vec<u64> = pending
+                            .iter()
+                            .filter(|(_, at)| *at <= now)
+                            .map(|(id, _)| *id)
+                            .collect();
+                        pending.retain(|(_, at)| *at > now);
+                        for id in due {
+                            let frame = json!({
+                                "channel": "post",
+                                "data": {
+                                    "id": id,
+                                    "response": {
+                                        "type": "action",
+                                        "payload": {
+                                            "status": "ok",
+                                            "response": {"echo": id},
+                                        },
+                                    },
+                                },
+                            })
+                            .to_string();
+                            ws.send(Message::Text(frame.into())).await.unwrap();
+                        }
+                    }
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
     #[tokio::test]
     async fn posts_action_and_parses_order_statuses() {
         let url = mock_venue(|request| {
@@ -361,7 +541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serializes_posts_and_correlates_ids() {
+    async fn correlates_ids_across_sequential_posts() {
         let url = mock_venue(
             |_| json!({"type": "action", "payload": {"status": "ok", "response": {"n": 1}}}),
         )
@@ -370,6 +550,157 @@ mod tests {
         for _ in 0..3 {
             exchange.submit(&action()).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn fifty_concurrent_posts_each_get_their_own_reply() {
+        let url = echo_venue(20).await;
+        let exchange = Arc::new(
+            WsExchange::with_url(url, Mode::Live, Some(signer()))
+                .unwrap()
+                .with_request_timeout(Duration::from_secs(5)),
+        );
+
+        let mut tasks = Vec::new();
+        for _ in 0..50 {
+            let exchange = exchange.clone();
+            tasks.push(tokio::spawn(async move {
+                let response = exchange.submit(&action()).await.unwrap();
+                response.value["echo"].as_u64().unwrap()
+            }));
+        }
+        let mut ids = Vec::new();
+        for task in tasks {
+            ids.push(task.await.unwrap());
+        }
+        assert_eq!(ids.len(), 50);
+        // Every reply is unique, i.e. no two callers got the same response.
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 50, "each caller must get its own reply");
+    }
+
+    #[tokio::test]
+    async fn dropped_socket_fails_pending_with_unknown_outcome() {
+        // No server: connect fails, so register_pending dials and errors before
+        // creating a waiter; use a server that accepts then goes silent and
+        // closes, exercising the reader's fail-all path.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = accept_async(stream).await.unwrap();
+            // Drop the socket immediately after the handshake.
+            drop(ws);
+        });
+        let exchange = WsExchange::with_url(format!("ws://{addr}"), Mode::Live, Some(signer()))
+            .unwrap()
+            .with_request_timeout(Duration::from_secs(2));
+        match exchange.submit(&action()).await.unwrap_err() {
+            Error::UnknownOutcome(message) => assert!(!message.is_empty()),
+            other => panic!("expected UnknownOutcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_unknown_outcome() {
+        let url = black_hole_venue().await;
+        let exchange = WsExchange::with_url(url, Mode::Live, Some(signer()))
+            .unwrap()
+            .with_request_timeout(Duration::from_millis(150));
+        match exchange.submit(&action()).await.unwrap_err() {
+            Error::UnknownOutcome(message) => assert!(message.contains("no reply"), "{message}"),
+            other => panic!("expected UnknownOutcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_post_does_not_block_a_fast_one() {
+        // The first post is parked; the second must still get a reply well
+        // before the first returns. This is the H-1 property that a dead-man
+        // refresh can no longer serialize order sends.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let mut ids = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                ids.push(request["id"].as_u64().unwrap());
+                if ids.len() == 2 {
+                    // Park the first, release the second immediately.
+                    let parked = ids[0];
+                    let fast = ids[1];
+                    let frame = json!({
+                        "channel": "post",
+                        "data": { "id": fast, "response": {
+                            "type": "action", "payload": {"status": "ok", "response": {"echo": fast}},
+                        }},
+                    })
+                    .to_string();
+                    ws.send(Message::Text(frame.into())).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let frame = json!({
+                        "channel": "post",
+                        "data": { "id": parked, "response": {
+                            "type": "action", "payload": {"status": "ok", "response": {"echo": parked}},
+                        }},
+                    })
+                    .to_string();
+                    ws.send(Message::Text(frame.into())).await.unwrap();
+                    break;
+                }
+            }
+        });
+        let exchange = Arc::new(
+            WsExchange::with_url(format!("ws://{addr}"), Mode::Live, Some(signer()))
+                .unwrap()
+                .with_request_timeout(Duration::from_secs(5)),
+        );
+
+        let slow = {
+            let exchange = exchange.clone();
+            tokio::spawn(async move { exchange.submit(&action()).await })
+        };
+        // Let the first post reach the venue before the second.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let fast = exchange.submit(&action()).await.unwrap();
+        assert!(fast.value["echo"].is_number());
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "fast post waited {:?}",
+            started.elapsed()
+        );
+        // The parked post still resolves.
+        assert!(slow.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn in_flight_cap_is_enforced() {
+        // A permit-limited semaphore of MAX_IN_FLIGHT means the 101st post
+        // waits; use a small timeout so it still resolves.
+        let url = black_hole_venue().await;
+        let exchange = Arc::new(
+            WsExchange::with_url(url, Mode::Live, Some(signer()))
+                .unwrap()
+                .with_request_timeout(Duration::from_millis(50)),
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..(MAX_IN_FLIGHT + 5) {
+            let exchange = exchange.clone();
+            tasks.push(tokio::spawn(
+                async move { exchange.submit(&action()).await },
+            ));
+        }
+        let mut unknown = 0;
+        for task in tasks {
+            if matches!(task.await.unwrap(), Err(Error::UnknownOutcome(_))) {
+                unknown += 1;
+            }
+        }
+        assert_eq!(unknown, MAX_IN_FLIGHT + 5);
     }
 
     #[tokio::test]
