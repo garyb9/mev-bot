@@ -48,6 +48,7 @@ build order is the roadmap in [`docs/GOAL.md`](docs/GOAL.md). See [`specs/`](spe
 crates/
   mev-core/       shared types, config, errors, clock
   mev-hl-client/  Hyperliquid REST/WS client (market data + execution)
+  mev-engine/     event-driven engine core: types + typed ingest [M4]
   mev-recorder/   raw market-data recorder (SPEC-0008)          [M3]
   mev-hyperevm/   HyperEVM (chain 999) sources & executor      [later]
   mev-strategy/   pluggable strategies + cost/edge model

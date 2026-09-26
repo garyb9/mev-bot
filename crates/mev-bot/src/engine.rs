@@ -1,8 +1,6 @@
 //! Strategy engine: builds views, drives strategies, gates intents through
 //! risk, and executes them (paper in `simulate`, `/exchange` in `live`).
 
-pub mod types;
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/mev-bot",
     "crates/mev-core",
+    "crates/mev-engine",
     "crates/mev-hl-client",
     "crates/mev-hyperevm",
     "crates/mev-metrics",
@@ -19,6 +20,7 @@ repository = "https://github.com/garyb9/mev-bot"
 
 [workspace.dependencies]
 mev-core = { path = "crates/mev-core" }
+mev-engine = { path = "crates/mev-engine" }
 mev-hl-client = { path = "crates/mev-hl-client" }
 mev-hyperevm = { path = "crates/mev-hyperevm" }
 mev-metrics = { path = "crates/mev-metrics" }
@@ -39,6 +41,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = { version = "1", features = ["union"] }
+crossbeam-channel = "0.5"
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }

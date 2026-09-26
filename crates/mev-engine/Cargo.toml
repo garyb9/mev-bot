@@ -1,0 +1,28 @@
+[package]
+name = "mev-engine"
+description = "Event-driven engine core: interned types, typed ingest, and the decision loop (SPEC-0010)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mev-core.workspace = true
+mev-hl-client.workspace = true
+mev-metrics.workspace = true
+mev-strategy.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+crossbeam-channel.workspace = true
+
+[[bench]]
+name = "ingest"
+harness = false
