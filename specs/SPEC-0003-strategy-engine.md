@@ -1,6 +1,6 @@
 # SPEC-0003 — Strategy Engine
 
-**Status:** Draft
+**Status:** Partially implemented. Strategies A (funding/basis) and B (market-making) exist on a v1 tick engine; the engine loop is superseded by [SPEC-0010](SPEC-0010-event-driven-engine.md) (see §16).
 **Depends on:** SPEC-0000, SPEC-0001, SPEC-0002
 **Blocks:** SPEC-0004 (risk consumes intents)
 
@@ -134,3 +134,19 @@ Per-strategy metrics: signals emitted, intents accepted/rejected (by reason), fi
 1. Funding horizon assumption (how many hourly settlements to project) and exit hysteresis.
 2. MM quote cadence and ladder depth per coin (tune via replay).
 3. Whether funding/basis should also use Hyperliquidity Provider (HLP) or other yield legs — out of scope for v1.
+
+## 16. Implementation status & deltas (2026-09-26)
+
+What exists in code, and where it departs from this spec. SPEC-0010 is the source of truth for the engine loop and the strategy API from here on.
+
+| Area | Code | Delta vs this spec | Resolution |
+|---|---|---|---|
+| Strategy trait | `mev-strategy/src/strategy.rs` (`async_trait`, returns `Vec<Action>`) | Async; §8 said event-driven, but the engine calls it on a 1 s timer | Replaced by SPEC-0010 §8 sync API (task E-4) |
+| Actions | `mev-strategy/src/action.rs`: `Place`, `Cancel` | No `Modify`, no multi-leg group | SPEC-0010 §8 adds `Modify`; SPEC-0011 adds `PlaceGroup` |
+| `OrderIntent` | `intent.rs`: adds `strategy`, `cloid`, `signal_ms`, `decision_ms` | `cloid` optional | The engine always assigns a cloid (SPEC-0010 §10, E-0) |
+| Decision loop | `mev-bot/src/engine.rs` (`interval(1s)`) | Not event-driven; §8 violated | SPEC-0010 E-3; the tick engine is deleted in E-13 |
+| Cost / edge model | `cost.rs`, `size.rs` | Matches §5 | Keep; research uses the same fee table (SPEC-0008 §13.2) |
+| Strategy A: funding/basis | `funding.rs` + `paper.rs` | Legs sent as independent orders | Port to `PlaceGroup` (SPEC-0011 L-10) |
+| Strategy B: market-making | `mm.rs` (inventory skew, cancel/replace) | Built ahead of research (allowed: GOAL §2.1); cancel+place instead of modify | Port to v2 with `Modify` (SPEC-0010 E-4). **Doesn't trade live** without G1/G1.5. |
+| Paper execution | `paper.rs` | Fills only on the tick | Becomes `PaperExec` behind SPEC-0010 §14 |
+| Capital allocation (§9) | — | Not implemented | After SPEC-0010; needed only once ≥ 2 strategies run live |

@@ -1,6 +1,6 @@
 # SPEC-0004 — Risk, Portfolio & Accounting
 
-**Status:** Draft
+**Status:** Partially implemented (per-order limit gate in `mev-risk/src/limits.rs`). Remaining work in §16.
 **Depends on:** SPEC-0000, SPEC-0001, SPEC-0002
 **Blocks:** SPEC-0003 intents reaching live execution
 
@@ -133,3 +133,34 @@ Metrics: gross/net exposure, margin utilization, liquidation distance, realized/
 1. Exact default numeric limits (leverage cap, margin-utilization cap, daily-loss limit) — set conservatively for v1, tune later.
 2. Whether automatic flatten should ever be enabled by default (current recommendation: no).
 3. Corporate-action/HIP-3 asset handling for exposure aggregation.
+
+## 16. Follow-ups: risk hardening (K-tasks)
+
+Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path interface and performance contract are in SPEC-0010 §11; this section owns the **rules**. Status: ☐ / 🔄 / ✅.
+
+| ID | Title | Tier | Size | Depends on | Status |
+|---|---|---|---|---|---|
+| K-1 | Fail-closed defaults: `live` refuses to start without explicit finite limits; conservative defaults for `simulate` | T1 | S | — | ☐ |
+| K-2 | Exposure incl. in-flight orders (worst case), and group worst-single-leg exposure (SPEC-0011 §9) | T1 | M | SPEC-0010 E-5 | ☐ |
+| K-3 | Kill switch: `SIGUSR1`, flag file, `hl panic`; cancel-all + halt; SPEC-0011 `on_kill` for residuals; sticky until cleared | T1 | M | SPEC-0010 E-3 | ☐ |
+| K-4 | Circuit breakers: daily loss, drawdown, reject-rate spike, nonce errors, stale feeds, reconciliation drift, exec backpressure | T1 | M | K-3, SPEC-0010 E-8 | ☐ |
+| K-5 | Rate budgets as risk inputs: IP weight + address budget (`userRateLimit`); cancels always allowed above a hard floor | T1 | S | SPEC-0010 E-6 | ☐ |
+| K-6 | PnL & attribution: realized (fills, fees, funding, rebates), unrealized (mark), per strategy / coin / group, written via `DbWriter` | T1 | M | SPEC-0010 E-8, SPEC-0011 L-9 | ☐ |
+| K-7 | Property tests for every limit + breaker (boundary approve/resize/reject; unknown state ⇒ reject) | T1 | M | K-1…K-5 | ☐ |
+| K-8 | Directional-strategy limits: per-strategy stop-loss, volatility-scaled sizing, max holding time, overnight/weekend exposure caps for HIP-3 stock perps | T3 | M | only when a T3 study passes or a G1.5 pilot is approved | ☐ |
+
+**K-1:** `Config::validate` in `live` requires `max_order_notional_usd`, `max_position_notional_usd`, `max_open_orders`, `max_margin_utilization_bps`, `max_daily_loss_usd`, and `max_unhedged_usd` to all be set. `simulate` uses conservative defaults from `config/default.toml`. *Done when:* tests cover live-without-limits ⇒ startup error, and every default is finite.
+
+**K-2:** Per-coin projected exposure = confirmed position + Σ worst-case fills of `PendingNew`/`Resting`/`PartiallyFilled`/`PendingModify`/`Unknown` orders, maintained incrementally by the order manager. Groups are checked on net **and** worst single-leg exposure. *Done when:* a property test shows no approved sequence can exceed a cap.
+
+**K-3:** The kill flag lives in engine state and is checked first in every risk check. Triggers: `SIGUSR1`, the existence of `HL_KILL_FILE` (default `data/KILL`, polled every 250 ms by a control task), and `hl panic` (writes the file). Action: cancel every working order, then `on_kill` policy (SPEC-0011 §9), then halt. Clearing needs `hl resume` **and** deleting the file. *Done when:* an end-to-end test in `simulate` shows all orders cancelled and no new places within one iteration of each trigger.
+
+**K-4:** Each breaker has a threshold in config, a metric (`hl_breaker_trips_total{breaker}`), and a sticky state shown on `/healthz`. Default action: halt new places (cancels allowed). *Done when:* each breaker has a test that trips it.
+
+**K-5:** Implement SPEC-0010 §12's budgets as a risk check. *Done when:* tests show places rejected below `rate_budget_min` while cancels pass.
+
+**K-6:** Tables per §9 (extend the existing `fills`/`funding`/`positions_snapshot`; add `groups`). Daily PnL rollup query. *Done when:* a `simulate` day reconciles computed realized PnL against the paper executor's ledger to the cent.
+
+**K-7:** `proptest` suites under `crates/mev-risk/tests/`. *Done when:* they run in CI.
+
+**K-8:** Only built when needed (T3 gate). *Done when:* SPEC-0004 §5 gains a "Directional strategies" block, with tests.

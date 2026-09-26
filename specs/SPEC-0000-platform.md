@@ -176,3 +176,16 @@ Milestones later in the list may split into smaller commits (e.g. client vs benc
 2. Delete old code outright, or keep under `legacy/` (ABIs + math + docs only)?
 3. Deployment target preference (VPS region, container vs bare metal)?
 4. Do you want the SPEC-0001 client benchmark to also include a community Alloy-native SDK, or custom-vs-official only?
+
+## 18. Follow-ups: CI (C-tasks)
+
+§13 requires `cargo deny`, `cargo audit`, and `nextest`; the current `.github/workflows/ci.yml` runs only fmt, clippy, and tests. GOAL §4.7 also makes latency regressions bugs, so benchmarks belong in CI.
+
+| ID | Title | Tier | Size | Status |
+|---|---|---|---|---|
+| C-1 | `cargo deny` (advisories, licenses, bans incl. `ethers`, duplicate-version warnings) + `deny.toml` | T1 | S | ☐ |
+| C-2 | Switch tests to `cargo nextest` | T1 | S | ☐ |
+| C-3 | Bench job in quick mode (decode, sign, SPEC-0010 engine benches) comparing against a stored baseline; **warn** on > 15% regression (shared runners are noisy, so it doesn't fail the build) | T1 | M | ☐ |
+| C-4 | Research CI: `uv run ruff check` + `uv run pytest` in `research/` when that directory changes | T1 | S | ☐ |
+
+*Done when* (each): the job runs on PRs and on `main`, and is green on the current tree. C-1 must fail the build if `ethers` enters the graph.
