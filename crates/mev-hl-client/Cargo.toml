@@ -26,3 +26,9 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true }
 wiremock.workspace = true
+criterion.workspace = true
+anyhow.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false

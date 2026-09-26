@@ -36,11 +36,12 @@ async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 wiremock = "0.6"
+criterion = { version = "0.5", features = ["html_reports"] }
+anyhow = "1"
 figment = { version = "0.10", features = ["toml", "env"] }
 secrecy = { version = "0.10", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
-anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
