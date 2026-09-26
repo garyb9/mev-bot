@@ -2348,6 +2348,8 @@ dependencies = [
  "rusqlite",
  "secrecy",
  "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
