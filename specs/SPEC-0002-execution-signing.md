@@ -48,7 +48,7 @@ Used for account/security and fund movements (`approveAgent`, `approveBuilderFee
 ### 4.3 Agent wallet lifecycle
 
 - The UI calls it an "API wallet"; it's a separate keypair authorized by the master account and **cannot withdraw**.
-- `approveAgent` is a **user-signed** action performed once (by the master key, off this host or via a documented one-time flow).
+- `approveAgent` is a **user-signed** action performed once by the **master account** to enroll the agent. Recommended: do it via the Hyperliquid UI (Settings → API), keeping the master key off this host entirely. Optional: a guided one-time CLI command for later re-approvals that reads the master key from a prompt (never persisted, never logged).
 - The agent key lives on the bot host; the master key does not.
 - **One agent wallet per bot instance** (nonce isolation). Multiple instances sharing an agent will emit out-of-order nonces and reject each other.
 
@@ -103,7 +103,7 @@ pub trait ExchangeApi {
 }
 ```
 
-- Two transports behind the trait: **REST `POST /exchange`** (default, simple) and **WebSocket post** (max 100 in-flight; lower latency). The SPEC-0001 harness also measures submit latency over both; default chosen by measurement.
+- Two transports behind the trait: **WebSocket post** (default; max 100 simultaneous in-flight posts, lower latency) and **REST `POST /exchange`** (fallback, simpler, stateless). The SPEC-0001 harness measures submit latency over both; the default ships as WS and can be re-decided by measurement.
 - Only SPEC-0002 code may hold the agent signer; it's injected at construction and never logged.
 
 ## 9. Response handling & errors
@@ -126,12 +126,28 @@ Reads (via `InfoApi`): `clearinghouseState` (positions/margin), `spotClearinghou
 - Reconcile on startup and periodically; the executor never assumes a fill without either a stream `orderUpdates`/`userFills` event or an `orderStatus` check.
 - Open orders and positions are the source of truth for risk (SPEC-0004).
 
-## 12. Modes & safety
+## 12. Modes, autonomy & safety
+
+### Modes
 
 - `observe`: **zero** `/exchange` calls (asserted in tests).
 - `simulate`: build + sign (optional) but **never submit**; responses are simulated.
 - `live`: submit; gated by SPEC-0000 (`HL_LIVE_CONFIRM=YES`, keys present).
-- Optional `scheduleCancel` dead-man's switch is armed in `live` so orders auto-cancel if the bot dies.
+
+### Execution autonomy
+
+Orthogonal to the mode above; applies only in `live`.
+
+- `HL_AUTONOMY=auto` (**default**): the engine submits trades on its own once risk checks pass. Required for an unattended trading/MEV bot.
+- `HL_AUTONOMY=confirm`: the engine emits a proposed trade and waits for explicit human approval (CLI/TTY or an approval channel) before submitting. For supervised/manual runs and debugging.
+- Every decision/approval is logged with the sizing rationale; `auto` never bypasses risk limits (SPEC-0004).
+
+### Dead-man's switch (`scheduleCancel`)
+
+- In `live`, arm `scheduleCancel` with a TTL and refresh it on a heartbeat.
+- If the process stalls, loses connectivity, or crashes, the exchange auto-cancels resting orders after the TTL — a dead bot cannot leave stale orders exposed.
+- TTL is configurable (`HL_SCHEDULE_CANCEL_TTL_MS`, default 30s), refreshed with margin below the TTL, and explicitly disarmed on graceful shutdown.
+- Armed status is a metric and a `/healthz` input; failure to refresh within the window raises an alert.
 
 ## 13. Observability
 
@@ -154,8 +170,9 @@ Metrics: submit latency histogram (by transport), order rejects by status, nonce
 - `observe` mode makes zero `/exchange` requests.
 - Sub-10 ms p50 (local) for build+sign of a single order on the reference machine (target, measured in SPEC-0001 harness).
 
-## 16. Open questions
+## 16. Resolved decisions
 
-1. Default transport: REST vs WS post (decided by the SPEC-0001 submit-latency benchmark).
-2. Agent wallet provisioning flow to document (one-time `approveAgent` off-host vs a guided command).
-3. Whether to arm `scheduleCancel` by default in `live`.
+1. **Transport** — default is **WebSocket post**; REST `/exchange` remains a fallback. Both are benchmarked in SPEC-0001 and the default can be re-decided by measurement.
+2. **Agent provisioning** — enroll the agent via the Hyperliquid UI so the master key stays off-host; an optional guided one-time CLI command supports later re-approvals without persisting the master key.
+3. **Autonomy** — engine-driven by default (`HL_AUTONOMY=auto`); `confirm` mode exists for supervised runs.
+4. **Dead-man's switch** — armed by default in `live` via `scheduleCancel`, TTL `HL_SCHEDULE_CANCEL_TTL_MS` (default 30s), refreshed on heartbeat, disarmed on graceful shutdown.
