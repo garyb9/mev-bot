@@ -366,11 +366,25 @@ fn pseudo_random() -> u64 {
     hasher.finish()
 }
 
+/// Enable `TCP_NODELAY` on the underlying TCP socket of a live WebSocket
+/// connection (SPEC-0010 §12/§18: `TCP_NODELAY` is always on).
+///
+/// [`MaybeTlsStream::get_ref`] reaches the inner [`TcpStream`] for both the
+/// plain and the rustls variants (and native-tls, if compiled in), so TLS
+/// sockets are covered too, not only plain ones.
+pub(crate) fn set_tcp_nodelay(stream: &MaybeTlsStream<TcpStream>) -> Result<()> {
+    stream
+        .get_ref()
+        .set_nodelay(true)
+        .map_err(|e| Error::Http(format!("failed to set TCP_NODELAY: {e}")))
+}
+
 async fn dial(url: &str) -> Result<Socket> {
     ensure_crypto_provider();
     let (socket, _resp) = connect_async(url)
         .await
         .map_err(|e| Error::Http(e.to_string()))?;
+    set_tcp_nodelay(socket.get_ref())?;
     Ok(socket)
 }
 
@@ -527,6 +541,27 @@ mod tests {
             RawEvent::Gap { reason, .. } => assert_eq!(reason, "watchdog"),
             other => panic!("expected watchdog gap, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn set_tcp_nodelay_enables_nodelay_on_loopback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Hold the connection open while the client flips the flag.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(stream);
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        tcp.set_nodelay(false).unwrap();
+        assert!(!tcp.nodelay().unwrap(), "precondition: nodelay starts off");
+        let stream = MaybeTlsStream::Plain(tcp);
+        set_tcp_nodelay(&stream).unwrap();
+        assert!(stream.get_ref().nodelay().unwrap());
+
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -35,6 +35,7 @@ use crate::exchange::{
     ActionResponse, ExchangeApi, ExchangeRequest, ExchangeResponse, Prepared, WriteCore, WriteGate,
 };
 use crate::order::Action;
+use crate::raw_ws::set_tcp_nodelay;
 use crate::ws::ensure_crypto_provider;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -163,7 +164,41 @@ impl WsExchange {
         let (socket, _resp) = connect_async(url)
             .await
             .map_err(|e| Error::Http(e.to_string()))?;
+        set_tcp_nodelay(socket.get_ref())?;
         Ok(socket)
+    }
+
+    /// Open the exec connection now if it is not already open (SPEC-0010 §12:
+    /// connections are warmed at startup, never on demand). Does nothing else.
+    pub async fn warm(&self) -> Result<()> {
+        self.ensure_connection().await.map(|_| ())
+    }
+
+    /// Whether a live connection is currently held, without blocking on a dial
+    /// in progress (cheap, best-effort check).
+    pub fn is_connected(&self) -> bool {
+        self.connection
+            .try_lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Return the outbound sender, dialing and spawning the connection task on
+    /// first use. Shared by [`Self::warm`] and [`Self::register_pending`].
+    async fn ensure_connection(&self) -> Result<mpsc::Sender<Message>> {
+        let mut guard = self.connection.lock().await;
+        if guard.is_none() {
+            let socket = Self::dial(&self.url).await?;
+            let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+            let (send_tx, rx) = mpsc::channel::<Message>(MAX_IN_FLIGHT);
+            let task = tokio::spawn(Self::connection_task(socket, rx, pending.clone()));
+            *guard = Some(Connection {
+                tx: send_tx,
+                pending,
+                task,
+            });
+        }
+        Ok(guard.as_ref().expect("connection present").tx.clone())
     }
 
     /// Send `request` and await the correlated `post` reply.
@@ -219,24 +254,15 @@ impl WsExchange {
         id: u64,
         tx: oneshot::Sender<Option<Value>>,
     ) -> Result<mpsc::Sender<Message>> {
-        let mut guard = self.connection.lock().await;
-        if guard.is_none() {
-            let socket = Self::dial(&self.url).await?;
-            let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-            let (send_tx, rx) = mpsc::channel::<Message>(MAX_IN_FLIGHT);
-            let task = tokio::spawn(Self::connection_task(socket, rx, pending.clone()));
-            *guard = Some(Connection {
-                tx: send_tx,
-                pending,
-                task,
-            });
+        let send_tx = self.ensure_connection().await?;
+        let guard = self.connection.lock().await;
+        if let Some(conn) = guard.as_ref() {
+            conn.pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id, tx);
         }
-        let conn = guard.as_ref().expect("connection present");
-        conn.pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(id, tx);
-        Ok(conn.tx.clone())
+        Ok(send_tx)
     }
 
     /// Drop a waiter we no longer care about (e.g. after a timeout).
@@ -744,5 +770,32 @@ mod tests {
             .with_nonce_db(db.clone())
             .unwrap();
         assert_eq!(restarted.last_nonce().await, first);
+    }
+
+    #[tokio::test]
+    async fn warm_opens_the_socket_eagerly() {
+        let url = mock_venue(
+            |_| json!({"type": "action", "payload": {"status": "ok", "response": null}}),
+        )
+        .await;
+        let exchange = WsExchange::with_url(url, Mode::Live, Some(signer())).unwrap();
+        assert!(!exchange.is_connected());
+        exchange.warm().await.unwrap();
+        assert!(exchange.is_connected());
+        // The warmed socket is the one the first order uses.
+        exchange.submit(&action()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_fails_fast_on_refused_connection() {
+        // No listener on port 1: the dial is refused, not hung.
+        let exchange =
+            WsExchange::with_url("ws://127.0.0.1:1", Mode::Live, Some(signer())).unwrap();
+        match tokio::time::timeout(Duration::from_secs(5), exchange.warm()).await {
+            Ok(Err(Error::Http(_))) => {}
+            Ok(other) => panic!("expected Http error, got {other:?}"),
+            Err(_) => panic!("warm hung instead of failing fast"),
+        }
+        assert!(!exchange.is_connected());
     }
 }

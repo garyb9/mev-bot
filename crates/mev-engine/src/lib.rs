@@ -12,7 +12,9 @@
 //! `mev-bot`; a crate above `mev-hl-client` keeps the graph acyclic
 //! (SPEC-0010 §23 Q1).
 
+pub mod builder;
 pub mod channels;
+pub mod exec;
 pub mod ingest;
 pub mod orders;
 pub mod routes;
@@ -23,6 +25,14 @@ pub mod strategy;
 pub mod timers;
 pub mod types;
 
+pub use builder::{
+    AssetMeta, AssetTable, BuiltBatch, DropReason, aggressive_limit_px, aggressive_limit_px_market,
+    plan_iteration,
+};
+pub use exec::{
+    BatchOutcome, ExecBackend, ReqIds, SendError, UnsignedPost, apply_post_ack, dispatch,
+    dispatch_batch,
+};
 pub use orders::{CloidAssigner, LiveOrder, OrderManager, OrderState};
 pub use state::{AccountState, EngineState, MarketSlot};
 pub use strategies::funding::{FundingBasis, FundingConfig};
