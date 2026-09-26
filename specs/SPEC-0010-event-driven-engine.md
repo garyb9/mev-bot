@@ -350,7 +350,7 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 | E-2 | Typed ingest decoders (no `serde_json::Value`) + market/account channels; handoff bench | M | E-1, SPEC-0008 R-3 | ✅ |
 | E-3 | Engine thread + loop (§9), timers, routes, spin/park | M | E-1 | ✅ |
 | E-4 | Strategy API v2 (sync) + port `FundingBasis` and `MarketMaker` | M | E-3 | ✅ |
-| E-5 | Order manager + state machine (§10), cloid assignment, in-flight exposure | M | E-3 | ☐ |
+| E-5 | Order manager + state machine (§10), cloid assignment, in-flight exposure | M | E-3 | ✅ |
 | E-6 | Build/batch/sign on the engine thread + `WsExec` backend (§12) incl. `TCP_NODELAY`, aggressive-price rule, rate budgets | M | E-5, SPEC-0002 H-1, H-2 | ☐ |
 | E-7 | `PaperExec` backend + `hl replay` over recorder segments; determinism test | M | E-5, SPEC-0008 R-7 | ☐ |
 | E-8 | Account stream + reconciler integration; delete `account_poller` | M | E-5, SPEC-0002 H-3 | ☐ |
@@ -387,6 +387,8 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 **E-4 legacy-engine note.** `OrderManager`/`AccountState`/`RiskState` do not exist until E-5/E-8/E-9, so `Ctx` currently exposes `markets`, `account`, and `registry` (no `orders`); `AccountState` is a minimal `positions`/`spot`/`account_value`/`margin_used` holder here and E-5/E-8 extend it. The ported strategies reach their `CoinId`s by resolving names once at build time. The legacy `mev-bot` engine tracks `cloid → (coin, asset_id, …)` locally to turn `Action::Modify` into cancel-then-place until the E-5 order manager lands (E-13 deletes this engine).
 
 **E-5 — Order manager.** §10 in full, plus incremental per-coin exposure (confirmed + worst-case in-flight) consumed by risk. *Done when:* table-driven tests cover every §10 transition, including races (fill arrives before ack; cancel races fill), and the exposure is exact after each.
+
+**E-5 implemented (2026-09-26).** `mev-engine/src/orders.rs`: `OrderState` (with `is_terminal`/`is_working`/`is_unknown`), `LiveOrder` (`remaining`, `remaining_notional`), `OrderManager`, and `CloidAssigner` (wraps `mev_hl_client::CloidFactory`). The manager tracks orders by `Cloid`, routes post acks by `req_id` (`assign_req`/`on_post_ack`), applies stream order updates and incremental fills, and maintains an exact incremental per-coin worst-case in-flight notional (`pending_notional`), adjusted without rescanning orders. Terminal states are sticky and a documented §10 transition guard rejects illegal transitions (`PartiallyFilled` may not fall back to `Resting`), so a fill-before-ack resolves the order and a stale ack/cancel cannot downgrade it. `AccountState::projected_notional` gives the confirmed side; risk (E-9) combines confirmed + in-flight. Tests cover every §10 transition, the two races, exactness after each transition, per-coin `unknown_on_coin`, `on_post_ack` routing, `resting_count`, and cloid round-tripping.
 
 **E-6 — Build, batch, sign, send.** §12 in full. Uses the H-1 concurrent `WsExec`. Precomputed `AssetMeta`, reused buffers. *Done when:* a mock-venue test shows one iteration with 2 places + 1 cancel sends exactly 2 posts (cancel first), statuses route back to the right cloids, `TCP_NODELAY` is set (asserted on the socket), and aggressive prices round in the safe direction.
 

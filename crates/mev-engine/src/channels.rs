@@ -103,7 +103,7 @@ pub fn outbound<T>(cap: usize) -> (Outbound<T>, Receiver<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CoinId, Stamp};
+    use crate::types::Stamp;
 
     fn bbo() -> MarketUpdate {
         MarketUpdate::Gap {
@@ -135,11 +135,5 @@ mod tests {
         assert!(!out.try_send(2));
         drop(rx);
         assert!(!out.try_send(3));
-    }
-
-    #[test]
-    fn coin_ids_compile_in_tests() {
-        // Keeps the import used and documents intent.
-        assert_eq!(CoinId(0).index(), 0);
     }
 }

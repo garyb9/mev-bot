@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 
-use crate::types::{AssetCtxLite, BookSnapshot, CoinId, Level, Stamp};
+use crate::types::{AssetCtxLite, BookSnapshot, CoinId, Level, Px, Stamp};
 
 /// Per-coin market state, indexed by `CoinId`.
 #[derive(Debug, Clone, Default)]
@@ -169,6 +169,14 @@ impl AccountState {
     /// Spot balance for a token (zero when absent).
     pub fn spot_balance(&self, token: &str) -> Decimal {
         self.spot.get(token).copied().unwrap_or(Decimal::ZERO)
+    }
+
+    /// Confirmed exposure for a coin at `reference_px`: `|position| * px`.
+    ///
+    /// This is only the confirmed position; in-flight orders are accounted by
+    /// [`crate::orders::OrderManager::pending_notional`] (SPEC-0010 §10, §11).
+    pub fn projected_notional(&self, coin: CoinId, reference_px: Px) -> Decimal {
+        self.position_szi(coin).abs() * reference_px
     }
 }
 

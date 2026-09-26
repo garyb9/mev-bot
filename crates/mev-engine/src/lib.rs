@@ -14,6 +14,7 @@
 
 pub mod channels;
 pub mod ingest;
+pub mod orders;
 pub mod routes;
 pub mod run;
 pub mod state;
@@ -22,6 +23,7 @@ pub mod strategy;
 pub mod timers;
 pub mod types;
 
+pub use orders::{CloidAssigner, LiveOrder, OrderManager, OrderState};
 pub use state::{AccountState, EngineState, MarketSlot};
 pub use strategies::funding::{FundingBasis, FundingConfig};
 pub use strategies::mm::{MarketMaker, MmConfig};
