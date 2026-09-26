@@ -99,7 +99,7 @@ pub struct OrderIntent {
 
 ## 10. Backtesting & replay
 
-- Record market/account event streams to fixtures; replay drives strategies deterministically.
+- Record market/account events to the SQLite store (SPEC-0004) and export fixtures; replay drives strategies deterministically.
 - `simulate` mode fills intents against the live book (or recorded book) and reports expected-vs-realized edge.
 - Metrics from replay feed strategy tuning without live capital.
 

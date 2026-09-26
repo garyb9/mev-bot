@@ -36,6 +36,7 @@ Establish the foundation for a Hyperliquid-first, always-on trading system: work
 | Errors | `thiserror` (libs) + `anyhow` (binary edges) | Typed where it matters |
 | Logging | `tracing` + `tracing-subscriber` (JSON in prod, pretty in dev) | Structured, async-aware |
 | Metrics | `metrics` facade + Prometheus exporter | Operability |
+| Persistence | **SQLite** (`rusqlite`, bundled) with WAL | Durable event store for PnL, attribution, reconciliation, replay |
 | Testing | `cargo-nextest`, `wiremock`/`httpmock`, `proptest` | Unit + HTTP mocking + property math |
 | Edition/MSRV | edition 2024, MSRV 1.90 | Matches modern dep floor |
 

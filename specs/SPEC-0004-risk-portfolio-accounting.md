@@ -72,8 +72,22 @@ Ordered, fail-closed checks: kill-switch state → account loss/drawdown breaker
 - **Realized**: fills with `closedPnl`, fees (`fee`, `builderFee`), funding (`userFundings`), maker rebates.
 - **Unrealized**: mark-to-market from `AssetCtx`/`clearinghouseState`.
 - **Attribution**: per strategy and per coin; equity curve over time.
-- **Persistence**: append-only event log (JSONL) + periodic state snapshots for durability and replay; queryable store (e.g. SQLite) optional later.
 - Fee accounting uses live effective rates (SPEC-0003) so PnL matches actual costs.
+
+### Persistence — SQLite (primary from day one)
+
+- **Engine:** SQLite via `rusqlite` (`bundled`, no system dependency), **WAL** journal mode.
+- **Access model:** a single dedicated **writer task** (actor) receives events over a bounded channel, keeping DB writes serialized and off the latency-critical path; reads use a small connection pool.
+- **Schema (insert-only event tables + snapshot tables):**
+  - `orders` (intents, submitted, cancels, rejects, cloid/oid, rationale)
+  - `fills` (px, sz, fee, builderFee, closedPnl, tid)
+  - `funding` (hourly payments), `ledger` (transfers)
+  - `positions_snapshot`, `equity_snapshot`, `open_orders_snapshot`
+  - `risk_events` (limit checks, breaker trips, kill-switch state)
+  - `reconciliation` (local vs exchange diffs)
+- **Migrations:** versioned and applied at startup (e.g. `refinery`/embedded migrations).
+- **Config:** DB path via `HL_DB_PATH` (default `./data/hlbot.db`); durability via WAL + `synchronous=NORMAL`.
+- **Uses:** PnL/attribution queries, equity curve, reconciliation audit, and deterministic **replay/backtest** input.
 
 ## 10. Kill switch & circuit breakers
 
@@ -111,7 +125,7 @@ Metrics: gross/net exposure, margin utilization, liquidation distance, realized/
 
 1. **Fail-closed** risk checks, synchronous and deterministic.
 2. **Kill switch** default action = cancel-all + halt; flatten is opt-in.
-3. **Persistence** = append-only JSONL + snapshots (SQLite optional later).
+3. **Persistence** = **SQLite** (`rusqlite`, bundled, WAL) as the primary store from day one, written by a single dedicated writer task; insert-only event tables plus snapshots; versioned migrations.
 4. **Attribution** at strategy and coin granularity.
 
 ## 15. Open questions
