@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::exchange::RejectReason;
+
 /// Perpetuals universe metadata (`meta`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Meta {
@@ -321,21 +323,108 @@ impl OpenOrder {
     }
 }
 
-/// `orderStatus` response for a single order.
+/// `orderStatus` response for a single query (by `oid` or `cloid`).
+///
+/// The venue returns `{"status":"order","order":{"order":{…},"status":<state>}}`
+/// for a hit and `{"status":"unknownOid"}` for a miss (SPEC-0002 §9).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderStatusResponse {
-    /// `order`, `filled`, or `unknownOid`.
+    /// `order` when found, `unknownOid` when not.
     pub status: String,
-    /// The order details when resting.
+    /// The order wrapper when the order was found.
+    #[serde(default)]
+    pub order: Option<OrderStatusOrder>,
+}
+
+/// The nested `order` block of an [`OrderStatusResponse`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderStatusOrder {
+    /// The order details.
     #[serde(default)]
     pub order: Option<OpenOrder>,
+    /// The order state: `open`, `filled`, `canceled`, `triggered`, rejected
+    /// classes, etc. (SPEC-0002 §9).
+    #[serde(default)]
+    pub status: String,
+    /// When the state was recorded.
+    #[serde(default)]
+    pub status_timestamp: u64,
 }
 
 impl OrderStatusResponse {
+    /// Whether the order exists (the venue did not return `unknownOid`).
+    pub fn is_found(&self) -> bool {
+        self.status != "unknownOid"
+    }
+
+    /// The resolved order state, if found.
+    pub fn order_status(&self) -> Option<&str> {
+        self.order.as_ref().map(|order| order.status.as_str())
+    }
+
     /// Whether the order was already fully filled.
     pub fn is_filled(&self) -> bool {
-        self.status == "filled"
+        self.order_status() == Some("filled")
+    }
+
+    /// Resolve the query into a typed [`OrderResolution`] for reconciliation.
+    pub fn resolution(&self) -> OrderResolution {
+        match self.order_status() {
+            Some("open") => OrderResolution::Resting,
+            Some("filled") => OrderResolution::Filled,
+            Some("triggered") => OrderResolution::Triggered,
+            Some(status) if is_canceled(status) => OrderResolution::Cancelled,
+            Some("rejected") => OrderResolution::Rejected,
+            Some(status) if RejectReason::parse(status).is_some() => OrderResolution::Rejected,
+            Some(other) => OrderResolution::Other(other.to_string()),
+            None if !self.is_found() => OrderResolution::NotFound,
+            None => {
+                // Found but the inner block was absent; treat as unknown.
+                OrderResolution::Other("unknown".to_string())
+            }
+        }
+    }
+}
+
+/// Whether a venue status string is a cancellation class (`canceled`,
+/// `marginCanceled`, `scheduledCancel`, …).
+fn is_canceled(status: &str) -> bool {
+    status == "canceled" || status.ends_with("Canceled") || status == "scheduledCancel"
+}
+
+/// The reconciled state of an order queried by `orderStatus` (SPEC-0002 H-2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderResolution {
+    /// Working on the book.
+    Resting,
+    /// Fully filled.
+    Filled,
+    /// Trigger order triggered.
+    Triggered,
+    /// Cancelled (by user, margin, self-trade, dead-man, …).
+    Cancelled,
+    /// Rejected at placement or by a rejection class.
+    Rejected,
+    /// The venue has no such order.
+    NotFound,
+    /// Any other state string, preserved verbatim.
+    Other(String),
+}
+
+impl OrderResolution {
+    /// Stable label for metrics and order records.
+    pub fn label(&self) -> String {
+        match self {
+            OrderResolution::Resting => "resting".into(),
+            OrderResolution::Filled => "filled".into(),
+            OrderResolution::Triggered => "triggered".into(),
+            OrderResolution::Cancelled => "cancelled".into(),
+            OrderResolution::Rejected => "rejected".into(),
+            OrderResolution::NotFound => "notFound".into(),
+            OrderResolution::Other(other) => other.clone(),
+        }
     }
 }
 

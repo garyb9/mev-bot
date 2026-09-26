@@ -26,3 +26,6 @@ mev-hl-client.workspace = true
 mev-metrics.workspace = true
 mev-risk.workspace = true
 mev-strategy.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

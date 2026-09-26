@@ -28,6 +28,8 @@ pub mod names {
     pub const ORDER_SUBMIT_SECONDS: &str = "hl_order_submit_seconds";
     /// Order rejects, tagged by exchange status.
     pub const ORDER_REJECTS: &str = "hl_order_rejects_total";
+    /// Unknown order outcomes resolved via `orderStatus`, tagged by resolution.
+    pub const ORDER_RECONCILE: &str = "hl_order_reconcile_total";
     /// Nonce errors encountered.
     pub const NONCE_ERRORS: &str = "hl_nonce_errors_total";
     /// Nonce self-heal resets, tagged by reason.

@@ -333,10 +333,14 @@ async fn run(
         let (writer, session_id) = session
             .clone()
             .expect("engine requires a recording session");
-        let engine = engine::Engine::new(plan, &config, exchange.clone(), writer, session_id);
+        let mut engine = engine::Engine::new(plan, &config, exchange.clone(), writer, session_id);
+        // Live runs reconcile unknown order outcomes by cloid (SPEC-0002 H-2).
+        let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::new(config.network));
+        if let Some(address) = config.account_address.clone() {
+            engine = engine.with_info(info.clone(), address);
+        }
         let account = engine.account();
         let poller = config.account_address.clone().map(|address| {
-            let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::new(config.network));
             tokio::spawn(engine::account_poller(
                 info,
                 address,

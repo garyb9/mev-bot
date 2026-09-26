@@ -39,6 +39,9 @@ pub trait InfoApi: Send + Sync {
     async fn open_orders(&self, user: &str) -> Result<Vec<OpenOrder>>;
     /// Status of a single order by id.
     async fn order_status(&self, user: &str, oid: u64) -> Result<OrderStatusResponse>;
+    /// Status of a single order by client order id (`cloid`). `orderStatus.oid`
+    /// accepts a `u64` or a 16-byte hex string (SPEC-0002 §9 / H-2).
+    async fn order_status_by_cloid(&self, user: &str, cloid: &str) -> Result<OrderStatusResponse>;
     /// Spot account state: token balances.
     async fn spot_clearinghouse_state(&self, user: &str) -> Result<SpotClearinghouseState>;
     /// The user's funding payment history since `start_ms`.
@@ -150,6 +153,11 @@ impl InfoApi for HttpInfo {
             .await
     }
 
+    async fn order_status_by_cloid(&self, user: &str, cloid: &str) -> Result<OrderStatusResponse> {
+        self.info(json!({ "type": "orderStatus", "user": user, "oid": cloid }))
+            .await
+    }
+
     async fn spot_clearinghouse_state(&self, user: &str) -> Result<SpotClearinghouseState> {
         self.info(json!({ "type": "spotClearinghouseState", "user": user }))
             .await
@@ -185,6 +193,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::types::OrderResolution;
 
     async fn mount(body: &str) -> MockServer {
         let server = MockServer::start().await;
@@ -302,14 +311,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parses_order_status_response() {
-        let body = r#"{"status":"order","order":{"coin":"BTC","oid":7,"side":"A","limitPx":"60000","sz":"0.2","origSz":"0.2","timestamp":1,"reduceOnly":true}}"#;
+    async fn parses_nested_order_status_response() {
+        let body = r#"{"status":"order","order":{"order":{"coin":"BTC","oid":7,"side":"A","limitPx":"60000","sz":"0.2","origSz":"0.2","timestamp":1,"reduceOnly":true},"status":"open","statusTimestamp":9}}"#;
         let server = mount(body).await;
         let client = HttpInfo::with_base_url(server.uri());
         let status = client.order_status("0xabc", 7).await.unwrap();
         assert_eq!(status.status, "order");
+        assert!(status.is_found());
+        assert_eq!(status.order_status(), Some("open"));
         assert!(!status.is_filled());
-        assert_eq!(status.order.as_ref().unwrap().oid, 7);
+        assert_eq!(
+            status.order.as_ref().unwrap().order.as_ref().unwrap().oid,
+            7
+        );
+        assert_eq!(status.resolution(), OrderResolution::Resting);
+    }
+
+    #[tokio::test]
+    async fn resolves_every_order_status_class() {
+        use OrderResolution::*;
+        let cases = [
+            ("open", Resting),
+            ("filled", Filled),
+            ("triggered", Triggered),
+            ("canceled", Cancelled),
+            ("scheduledCancel", Cancelled),
+            ("rejected", Rejected),
+            ("tickRejected", Rejected),
+            ("somethingNew", Other("somethingNew".to_string())),
+        ];
+        for (state, expected) in cases {
+            let body = format!(
+                r#"{{"status":"order","order":{{"order":null,"status":"{state}","statusTimestamp":1}}}}"#
+            );
+            let server = mount(&body).await;
+            let client = HttpInfo::with_base_url(server.uri());
+            let status = client.order_status("0xabc", 1).await.unwrap();
+            assert_eq!(status.resolution(), expected, "state {state}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_unknown_oid_as_not_found() {
+        let server = mount(r#"{"status":"unknownOid"}"#).await;
+        let client = HttpInfo::with_base_url(server.uri());
+        let status = client
+            .order_status_by_cloid("0xabc", "0xdead")
+            .await
+            .unwrap();
+        assert!(!status.is_found());
+        assert_eq!(status.resolution(), OrderResolution::NotFound);
     }
 
     #[tokio::test]

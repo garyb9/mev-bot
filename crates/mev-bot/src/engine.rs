@@ -12,8 +12,8 @@ use mev_core::db::writer::{DbWriter, WriteCmd};
 use mev_core::db::{Db, EventRow, FillRecord, OrderRecord};
 use mev_hl_client::{
     AssetMap, CancelByCloidWire, CancelWire, CloidFactory, ExchangeApi, InfoApi,
-    MIN_ORDER_NOTIONAL, Market, MarketSelector, MarketState, OrderParams, OrderStatus,
-    Subscription, Tolerance, build_order_wire, round_price_aggressive,
+    MIN_ORDER_NOTIONAL, Market, MarketSelector, MarketState, OrderParams, OrderResolution,
+    OrderStatus, Subscription, Tolerance, build_order_wire, round_price_aggressive,
 };
 use mev_risk::{Decision, LimitRisk, Limits, RiskCheck, RiskContext};
 use mev_strategy::{
@@ -203,6 +203,9 @@ pub struct Engine {
     risk: LimitRisk,
     paper: Option<PaperExecutor>,
     exchange: Option<Arc<dyn ExchangeApi>>,
+    /// Read API + account address, used to reconcile unknown order outcomes by
+    /// cloid before anything is resent (SPEC-0002 H-2).
+    info: Option<(Arc<dyn InfoApi>, String)>,
     account: Arc<RwLock<AccountView>>,
     recorder: Recorder,
     cloids: CloidFactory,
@@ -246,11 +249,19 @@ impl Engine {
             risk,
             paper,
             exchange,
+            info: None,
             account: Arc::new(RwLock::new(AccountView::default())),
             recorder: Recorder::new(writer, session_id),
             cloids: CloidFactory::new(),
             max_slippage_bps: Decimal::from(cfg.strategy.max_slippage_bps),
         }
+    }
+
+    /// Attach the read API and account address used to reconcile unknown order
+    /// outcomes by `cloid` (SPEC-0002 H-2).
+    pub fn with_info(mut self, info: Arc<dyn InfoApi>, address: impl Into<String>) -> Self {
+        self.info = Some((info, address.into()));
+        self
     }
 
     /// The shared live-account view (updated by [`account_poller`]).
@@ -506,12 +517,66 @@ impl Engine {
                 }
                 None => self.record_order(intent, "submitted", None, now),
             },
+            Err(mev_core::error::Error::UnknownOutcome(detail)) => {
+                // The order may or may not be live. Reconcile by cloid before
+                // recording anything; never resend (SPEC-0002 H-2).
+                self.reconcile_unknown(intent, &detail, now).await;
+            }
             Err(err) => {
                 warn!(coin = %intent.coin, error = %err, "live submit failed");
                 self.record_order(intent, "reject", Some(&err.to_string()), now);
             }
         }
         Ok(())
+    }
+
+    /// Resolve an unknown order outcome via `orderStatus` by `cloid`.
+    ///
+    /// Records the resolved state (`resting`/`filled`/`rejected`/…), or a
+    /// `reconcile:unknown` marker when the read API is unavailable or the query
+    /// fails. There is no path here that resends the order.
+    async fn reconcile_unknown(&self, intent: &OrderIntent, detail: &str, now: u64) {
+        let Some(cloid) = intent.cloid.as_deref() else {
+            self.record_order(intent, "reconcile", Some("no-cloid"), now);
+            return;
+        };
+        let Some((info, address)) = &self.info else {
+            warn!(cloid, "unknown outcome but no read API to reconcile");
+            self.record_order(intent, "reconcile", Some(&format!("no-info:{detail}")), now);
+            return;
+        };
+        match info.order_status_by_cloid(address, cloid).await {
+            Ok(status) => {
+                let resolution = status.resolution();
+                metrics::counter!(
+                    names::ORDER_RECONCILE,
+                    "resolution" => resolution.label(),
+                )
+                .increment(1);
+                let kind = match resolution {
+                    OrderResolution::Resting | OrderResolution::Triggered => "resting",
+                    OrderResolution::Filled => "filled",
+                    OrderResolution::Rejected => "reject",
+                    OrderResolution::Cancelled => "cancelled",
+                    OrderResolution::NotFound => "reconcile",
+                    OrderResolution::Other(_) => "reconcile",
+                };
+                let label = match resolution {
+                    OrderResolution::NotFound => format!("not-found:{detail}"),
+                    other => other.label(),
+                };
+                self.record_order(intent, kind, Some(&label), now);
+            }
+            Err(err) => {
+                warn!(cloid, error = %err, "reconciliation query failed");
+                self.record_order(
+                    intent,
+                    "reconcile",
+                    Some(&format!("query-failed:{err}")),
+                    now,
+                );
+            }
+        }
     }
 
     fn record_order(&self, intent: &OrderIntent, kind: &str, status: Option<&str>, now: u64) {
@@ -840,13 +905,197 @@ mod tests {
     use std::collections::BTreeMap;
     use std::str::FromStr;
 
+    use async_trait::async_trait;
+    use mev_core::db::writer::DbWriter;
+    use mev_core::error::Error;
     use mev_hl_client::StreamEvent;
-    use mev_hl_client::types::{L2Book, Level};
+    use mev_hl_client::types::{
+        AllMids, ClearinghouseState, L2Book, Level, Meta, MetaAndAssetCtxs, OpenOrder,
+        OrderStatusResponse, PerpDex, SpotClearinghouseState, SpotMeta, UserFees, UserFill,
+        UserFunding, UserRateLimit,
+    };
 
     use super::*;
 
     fn ds(value: &str) -> Decimal {
         Decimal::from_str(value).unwrap()
+    }
+
+    /// A stub info API returning a fixed `orderStatus` body (or an error).
+    struct FakeInfo {
+        response: std::result::Result<OrderStatusResponse, String>,
+    }
+
+    #[async_trait]
+    impl InfoApi for FakeInfo {
+        async fn order_status_by_cloid(
+            &self,
+            _user: &str,
+            _cloid: &str,
+        ) -> std::result::Result<OrderStatusResponse, Error> {
+            match &self.response {
+                Ok(status) => Ok(status.clone()),
+                Err(message) => Err(Error::Http(message.clone())),
+            }
+        }
+        async fn meta(&self) -> std::result::Result<Meta, Error> {
+            Err(Error::Unimplemented("meta"))
+        }
+        async fn meta_for(&self, _dex: &str) -> std::result::Result<Meta, Error> {
+            Err(Error::Unimplemented("meta_for"))
+        }
+        async fn perp_dexs(&self) -> std::result::Result<Vec<PerpDex>, Error> {
+            Err(Error::Unimplemented("perp_dexs"))
+        }
+        async fn spot_meta(&self) -> std::result::Result<SpotMeta, Error> {
+            Err(Error::Unimplemented("spot_meta"))
+        }
+        async fn all_mids(&self) -> std::result::Result<AllMids, Error> {
+            Err(Error::Unimplemented("all_mids"))
+        }
+        async fn all_mids_for(&self, _dex: &str) -> std::result::Result<AllMids, Error> {
+            Err(Error::Unimplemented("all_mids_for"))
+        }
+        async fn l2_book(&self, _coin: &str) -> std::result::Result<L2Book, Error> {
+            Err(Error::Unimplemented("l2_book"))
+        }
+        async fn meta_and_asset_ctxs(&self) -> std::result::Result<MetaAndAssetCtxs, Error> {
+            Err(Error::Unimplemented("meta_and_asset_ctxs"))
+        }
+        async fn clearinghouse_state(
+            &self,
+            _user: &str,
+        ) -> std::result::Result<ClearinghouseState, Error> {
+            Err(Error::Unimplemented("clearinghouse_state"))
+        }
+        async fn open_orders(&self, _user: &str) -> std::result::Result<Vec<OpenOrder>, Error> {
+            Err(Error::Unimplemented("open_orders"))
+        }
+        async fn order_status(
+            &self,
+            _user: &str,
+            _oid: u64,
+        ) -> std::result::Result<OrderStatusResponse, Error> {
+            Err(Error::Unimplemented("order_status"))
+        }
+        async fn spot_clearinghouse_state(
+            &self,
+            _user: &str,
+        ) -> std::result::Result<SpotClearinghouseState, Error> {
+            Err(Error::Unimplemented("spot_clearinghouse_state"))
+        }
+        async fn user_funding(
+            &self,
+            _user: &str,
+            _start_ms: u64,
+        ) -> std::result::Result<Vec<UserFunding>, Error> {
+            Err(Error::Unimplemented("user_funding"))
+        }
+        async fn user_fills_by_time(
+            &self,
+            _user: &str,
+            _start_ms: u64,
+        ) -> std::result::Result<Vec<UserFill>, Error> {
+            Err(Error::Unimplemented("user_fills_by_time"))
+        }
+        async fn user_fees(&self, _user: &str) -> std::result::Result<UserFees, Error> {
+            Err(Error::Unimplemented("user_fees"))
+        }
+        async fn user_rate_limit(&self, _user: &str) -> std::result::Result<UserRateLimit, Error> {
+            Err(Error::Unimplemented("user_rate_limit"))
+        }
+    }
+
+    fn status(found_state: Option<&str>) -> OrderStatusResponse {
+        match found_state {
+            Some(state) => OrderStatusResponse {
+                status: "order".into(),
+                order: Some(mev_hl_client::OrderStatusOrder {
+                    order: None,
+                    status: state.into(),
+                    status_timestamp: 1,
+                }),
+            },
+            None => OrderStatusResponse {
+                status: "unknownOid".into(),
+                order: None,
+            },
+        }
+    }
+
+    fn test_engine(info: Option<Arc<dyn InfoApi>>) -> Engine {
+        let db = Db::open_in_memory().unwrap();
+        let writer = Arc::new(DbWriter::spawn(db, 512));
+        let build = EngineBuild {
+            strategies: Vec::new(),
+            subscriptions: Vec::new(),
+            coins: vec!["BTC".into()],
+            sz_decimals: BTreeMap::new(),
+            instruments: BTreeMap::new(),
+            markets: AssetMap::new(),
+        };
+        let cfg = Config::default();
+        let mut engine = Engine::new(build, &cfg, None, writer, 1);
+        if let Some(info) = info {
+            engine = engine.with_info(info, "0xaccount");
+        }
+        engine
+    }
+
+    fn intent_with_cloid(cloid: Option<&str>) -> OrderIntent {
+        OrderIntent {
+            strategy: StrategyId::from("test"),
+            coin: "BTC".into(),
+            side: mev_strategy::Side::Buy,
+            limit_px: Some(ds("100")),
+            size: ds("1"),
+            tif: mev_strategy::TimeInForce::Gtc,
+            reduce_only: false,
+            rationale: "test".into(),
+            cloid: cloid.map(str::to_string),
+            signal_ms: 0,
+            decision_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_unknown_resolves_by_cloid_without_resending() {
+        // The fake info reports the order resting; reconciliation must record
+        // it and must not submit anything (the engine has no exchange).
+        let info: Arc<dyn InfoApi> = Arc::new(FakeInfo {
+            response: Ok(status(Some("open"))),
+        });
+        let engine = test_engine(Some(info));
+        let intent = intent_with_cloid(Some("0xdead"));
+        engine.reconcile_unknown(&intent, "dropped", 1).await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_unknown_handles_not_found_and_query_failure() {
+        let not_found: Arc<dyn InfoApi> = Arc::new(FakeInfo {
+            response: Ok(status(None)),
+        });
+        let engine = test_engine(Some(not_found));
+        engine
+            .reconcile_unknown(&intent_with_cloid(Some("0xdead")), "dropped", 1)
+            .await;
+
+        let failing: Arc<dyn InfoApi> = Arc::new(FakeInfo {
+            response: Err("boom".into()),
+        });
+        let engine = test_engine(Some(failing));
+        engine
+            .reconcile_unknown(&intent_with_cloid(Some("0xdead")), "dropped", 1)
+            .await;
+
+        // No cloid and no info are both handled without panicking.
+        engine
+            .reconcile_unknown(&intent_with_cloid(None), "dropped", 1)
+            .await;
+        let engine = test_engine(None);
+        engine
+            .reconcile_unknown(&intent_with_cloid(Some("0xdead")), "dropped", 1)
+            .await;
     }
 
     fn row(seq: u64, ts_ms: u64, kind: &str, event: &Event) -> EventRow {

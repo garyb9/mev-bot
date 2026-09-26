@@ -189,7 +189,7 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 | ID | Title | Tier | Size | Depends on | Status |
 |---|---|---|---|---|---|
 | H-1 | Concurrent WS `post` (reader task + pending map) | **T0** | M | — | ✅ |
-| H-2 | Mandatory `cloid` + unknown-outcome reconciliation | **T0** | M | H-1 | ☐ |
+| H-2 | Mandatory `cloid` + unknown-outcome reconciliation | **T0** | M | H-1 | ✅ |
 | H-3 | Account stream (`orderUpdates`, `userFills`, `userEvents`) | T1 | M | SPEC-0008 R-3 | ☐ |
 | H-4 | Dead-man's switch policy (arm only when needed; fail closed) | **T0** | S | H-1 | ☐ |
 | H-5 | Apply `bbo` to `MarketState` | T1 | S | — | ☐ |
@@ -222,4 +222,4 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 ## 18. Open questions (M2.5)
 
 1. H-4 default TTL (120 s) vs strategy needs; market-making may want a shorter TTL with more budget.
-2. `OrderStatusResponse` (`mev-hl-client/src/types.rs`) models a flat `{"status":"order","order":{OpenOrder}}` shape, but the venue returns a nested `{"status":"order","order":{"order":{…},"status":<state>,"statusTimestamp":…}}` (verified 2026-09-26, see §9). H-2 must correct the type and its `is_filled`/resolution logic before using it for reconciliation.
+2. ~~`OrderStatusResponse` … must correct the type …~~ **Resolved by H-2 (2026-09-26):** the type is now nested (`OrderStatusOrder`) and exposes `resolution() -> OrderResolution` with `Resting`/`Filled`/`Triggered`/`Cancelled`/`Rejected`/`NotFound`/`Other`.
