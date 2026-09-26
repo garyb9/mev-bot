@@ -143,11 +143,13 @@ Mode transitions are logged and surfaced as a metric. `live` cannot be entered s
 | M0.6 | CI + Cargo.lock | `ci: add fmt/clippy/test/deny pipeline` |
 | M1.x | Client + market data + benchmark | `feat(hl): client, market data, benchmark` |
 | M2.x | Execution/signing/nonce | `feat(hl): order execution, eip-712 signing, nonce` |
-| M3.x | Funding/basis strategy + risk | `feat(strategy): delta-neutral funding/basis with risk limits` |
-| M4.x | Market-making | `feat(strategy): market-making` |
-| M5.x | HyperEVM | `feat(hyperevm): dex source and executor` |
+| M2.5 | Execution hardening + latency baseline (SPEC-0002 §17) | `feat(hl): …` / `bench(hl): …` per task |
+| M3.x | Recorder + opportunity research (SPEC-0008) | `feat(recorder): …` / `feat(research): …` per task |
+| M4+ | See the roadmap | — |
 
 Milestones later in the list may split into smaller commits (e.g. client vs benchmark).
+
+> **Roadmap moved (2026-09-26).** The authoritative milestone order from M2.5 onward lives in [`docs/GOAL.md`](../docs/GOAL.md) §7. The recorder and research milestone (SPEC-0008) now comes before the funding pilot; market-making and HyperEVM are conditional on research results.
 
 ## 15. Milestones (P0)
 

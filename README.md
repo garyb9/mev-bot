@@ -1,17 +1,25 @@
 # mev-bot
 
-A Hyperliquid-first trading system in Rust. It starts as a market-neutral
-**funding/basis** bot on HyperCore, with **market-making** next and HyperEVM DEX
-arbitrage after that. The original Ethereum Uniswap V2 bot is retired under
-[`legacy/`](legacy/).
+A **low-latency arbitrage / MEV-style trading system for Hyperliquid**, written
+in Rust (HyperCore first, HyperEVM where it pays). Which arb we build is
+decided by recorded data, not preference. The original Ethereum Uniswap V2 bot
+is retired under [`legacy/`](legacy/).
 
-> Status: **platform scaffold**. Config, modes, observability, and health are
-> live; Hyperliquid market data and execution land next (SPEC-0001+). The bot
-> defaults to `observe` and never trades without explicit configuration.
+**Start here:**
+
+- [`docs/GOAL.md`](docs/GOAL.md): the goal, success metrics, latency budget,
+  and roadmap.
+- [`AGENTS.md`](AGENTS.md): how agents and contributors work in this repo.
+
+> Status: **M0–M2 done** (platform, HyperCore market data, signing and
+> execution). **Now:** M2.5 execution hardening (SPEC-0002 §17) and M3
+> market-data recorder + opportunity research (SPEC-0008). The bot defaults
+> to `observe` and never trades without explicit configuration.
 
 ## Design
 
-Everything is specified before it is built. See [`specs/`](specs/):
+Everything is specified before it is built. Spec numbers are identifiers; the
+build order is the roadmap in [`docs/GOAL.md`](docs/GOAL.md). See [`specs/`](specs/):
 
 | Spec | Topic |
 |---|---|
@@ -23,6 +31,7 @@ Everything is specified before it is built. See [`specs/`](specs/):
 | [SPEC-0005](specs/SPEC-0005-hyperevm.md) | HyperEVM sources & executor (deferred) |
 | [SPEC-0006](specs/SPEC-0006-deployment-observability-runbooks.md) | Deployment, observability & runbooks |
 | [SPEC-0007](specs/SPEC-0007-polymarket-parked.md) | Polymarket (parked) |
+| [SPEC-0008](specs/SPEC-0008-recorder-and-opportunity-research.md) | Market-data recorder & opportunity research (M3) |
 
 ## Workspace
 
@@ -30,11 +39,14 @@ Everything is specified before it is built. See [`specs/`](specs/):
 crates/
   mev-core/       shared types, config, errors, clock
   mev-hl-client/  Hyperliquid REST/WS client (market data + execution)
+  mev-recorder/   raw market-data recorder (SPEC-0008)          [M3]
   mev-hyperevm/   HyperEVM (chain 999) sources & executor      [later]
   mev-strategy/   pluggable strategies + cost/edge model
   mev-risk/       risk limits, portfolio, accounting, kill switch
   mev-metrics/    tracing, metrics, health
   mev-bot/        the `hl` binary (orchestration)
+research/         Python opportunity-research toolkit (SPEC-0008) [M3]
+docs/             project goal and roadmap
 ```
 
 ## Quickstart
