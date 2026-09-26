@@ -1,0 +1,418 @@
+# SPEC-0010 — Event-Driven Engine & Hot Path
+
+**Status:** Draft
+**Milestone:** M4 (engine), **Tier T1** ([`docs/GOAL.md`](../docs/GOAL.md) §2.1). It serves every arb.
+**Depends on:** SPEC-0001 (market data), SPEC-0002 incl. §17 (H-1 concurrent WS post, H-2 mandatory `cloid`, H-3 account stream), SPEC-0008 R-3 (`RawWsConn`) and R-7 (segment reader, for replay).
+**Supersedes:** the decision loop in SPEC-0003 §8 and the current tick engine in `crates/mev-bot/src/engine.rs`.
+**Blocks:** SPEC-0011 (multi-leg execution), M5 (first strategy live), all T1 strategies.
+
+---
+
+## 0. How to use this spec
+
+1. Read [`docs/GOAL.md`](../docs/GOAL.md), especially **§5 (Latency first)**, and [`AGENTS.md`](../AGENTS.md).
+2. Pick a task from **§20**. Respect its dependencies and do exactly its **Do**; it's finished when every **Done when** item holds. Tick the status in the same commit.
+3. Every hot-path change needs a benchmark or latency-histogram evidence (GOAL §4.7). A latency regression is a bug.
+4. If something here is wrong or unclear, write it under §22 and stop. Don't improvise on the hot path.
+
+## 1. Purpose
+
+Replace the 1-second polling engine with a **single-threaded, event-driven engine** that reacts to every market and account event immediately. It must run the full decision → risk → build → sign → send path in **microseconds**, and it must run **the same code** in `live`, `simulate`, and deterministic **replay** over recorded data.
+
+## 2. Why: the current engine (as of commit `b3718e0`)
+
+| # | Current behavior | Where | Consequence |
+|---|---|---|---|
+| 1 | Decides on a fixed `interval(1s)` tick, not on events | `engine.rs` `Engine::run` | Reacts on average 500 ms, and up to 1 s, after a price change. Fatal for any arb. |
+| 2 | Clones the whole `MarketView` and `AccountView` every tick, under `RwLock`s | `engine.rs` `step`, `snapshot_market` | Allocation and lock traffic on the hot path |
+| 3 | Account state comes from REST polling every 5 s | `engine.rs` `account_poller` | Risk sees a position up to 5 s stale, and own orders placed since the last poll are invisible |
+| 4 | Strategy trait is `async` (`async_trait`) | `mev-strategy/src/strategy.rs` | A boxed future per call; strategies do no I/O, so async buys nothing |
+| 5 | Orders are sent one at a time, each awaited | `engine.rs` `gate_and_execute` → `submit_live` | A 2-leg trade waits a full round trip between legs. `WsExchange` also allows only one post in flight (SPEC-0002 H-1). |
+| 6 | Live orders may have `cloid: None` | `submit_live` (`intent.cloid.clone()`) | An unknown outcome can't be reconciled or safely retried (SPEC-0002 H-2) |
+| 7 | `exchange.place(...)` result `Ok(_)` is recorded as "submitted" without reading per-order statuses | `submit_live` | Rejected orders (margin, tick, min-notional) look like live orders |
+| 8 | Aggressive orders (`limit_px: None`) use the **mid** as the limit | `submit_live` | An IOC at mid usually doesn't fill; a GTC at mid rests unexpectedly |
+| 9 | Risk limits are all `Option`, and `None` means unlimited | `mev-risk/src/limits.rs`, `config.rs` | **Fail-open** by default, contradicting SPEC-0004 §4 |
+| 10 | Risk checks each intent against the account snapshot only; pending/in-flight orders from the same cycle aren't counted | `LimitRisk::check` | Several intents in one cycle can each pass and together breach a cap |
+| 11 | Every tick serializes the whole `AccountView` to JSON for the replay log | `Recorder::record` | CPU on the hot path; duplicates what SPEC-0008 records |
+
+Items 6–10 are **safety** issues on a real-money path. They get quick fixes in task **E-0**, before anything else, even on the old engine.
+
+## 3. Goals and non-goals
+
+**Goals**
+
+| # | Goal | Target (GOAL §5.2) |
+|---|---|---|
+| G-1 | Event-driven: a decision on **every** relevant event | No timers in the decision path, except strategy timers |
+| G-2 | Internal tick-to-order latency (socket read → order bytes written) | **p50 ≤ 100 µs, p99 ≤ 1 ms** on the reference host |
+| G-3 | No allocation per market event in steady state | 0 allocations per `bbo` event (measured, §17) |
+| G-4 | No locks and no `.await` on the engine thread | Enforced by design (§5) and review |
+| G-5 | Same engine code for `live`, `simulate`, `replay` | One engine; pluggable I/O backends (§14) |
+| G-6 | Deterministic replay | Same recorded input ⇒ byte-identical action log |
+| G-7 | Safe under failure | Feed gaps, exec disconnects, and unknown order outcomes fail closed (§16) |
+
+**Non-goals:** multi-leg execution policy (SPEC-0011); new strategies; kernel-bypass networking; FPGA. Colocation and our own node are SPEC-0009.
+
+## 4. Hot-path rules (specific to this engine)
+
+These refine GOAL §5.1. Reviewers reject changes that break them.
+
+| Rule | Detail |
+|---|---|
+| One owner | The engine thread owns all trading state (markets, account, orders, strategies, risk). Nothing else mutates it. **No `Arc<RwLock<…>>` of trading state.** |
+| No `.await`, no blocking | The engine thread is a plain `std::thread`. It never awaits, never does network or disk I/O, and never takes a lock that another thread can hold for longer than a queue operation. |
+| Bounded handoffs only | In: bounded channels from I/O tasks. Out: bounded channels to exec I/O and background writers. Full outbound channel ⇒ fail closed (halt new orders), never block. |
+| Interned ids | Coins are `CoinId(u16)` resolved at startup (`AssetMap`); per-coin state lives in `Vec`s indexed by `CoinId`. No `String` keys or string hashing on the hot path. |
+| Preallocate | Action buffers, order-wire buffers, msgpack scratch buffers, and book arrays are allocated once and reused. |
+| Fixed-size books | Books are fixed arrays of the top N levels (N = 20, per SPEC-0008 V-1), not `BTreeMap`. |
+| Serialization off-thread | The engine sends typed records to the persistence/metrics threads; **they** serialize. The engine never calls `serde_json`. |
+| Logging | No `tracing` at INFO or above per event. Per-event data goes to counters and histograms; rare events (rejects, gaps) may log at WARN. |
+| Time | The engine reads time only through `EngineClock` (§13). Strategies read `ctx.now` only. |
+
+## 5. Architecture
+
+```
+ tokio runtime (I/O)                                   engine thread (std::thread, optional pinned core)
+ ─────────────────────                                  ───────────────────────────────────────────────
+ market WS conns (RawWsConn, SPEC-0008 R-3)             loop {
+   read → t_recv → decode → MarketUpdate ──[market ch, bounded, lossy]──►   1. drain control/account/exec ch (lossless) first
+ account WS (H-3: orderUpdates/userFills/userEvents)                         2. drain market ch (all available) → apply to state,
+   read → decode → AccountUpdate ──────[acct ch, bounded, lossless]────►       mark dirty coins
+ exec reader (post replies, H-1)                                             3. fire due timers
+   → PostAck{req_id, statuses} ────────[acct ch]───────────────────────►     4. for each dirty coin: dispatch to interested strategies
+ REST reconciler (every 30–60 s)                                                → actions → risk → order manager → batch → sign
+   → Reconcile{…} ─────────────────────[acct ch]───────────────────────►     5. push signed payloads ──[exec ch]──► exec writer task
+ control (kill switch file/signal/CLI)                                            (WS post, H-1) ──► socket (TCP_NODELAY)
+   → Control{…} ───────────────────────[acct ch]───────────────────────►     6. push records ──► DbWriter / metrics (try_send)
+                                                                             7. nothing pending? spin `spin_us`, then block on
+                                                                                recv with timeout = next timer deadline
+                                                                           }
+```
+
+| Piece | Runs on | Notes |
+|---|---|---|
+| Market ingest | tokio tasks (one per WS connection) | Decode happens here, off the engine thread. Stamp `t_recv` immediately after the socket read. |
+| Account ingest | tokio task | H-3 stream; lossless |
+| Exec writer/reader | tokio tasks (H-1 design) | The writer receives already-signed payloads from the engine and writes them; the reader routes replies back as `PostAck` |
+| REST reconciler | tokio task | `clearinghouseState`, `openOrders`, `spotClearinghouseState` on a cadence and after reconnects; results arrive as `Reconcile` events |
+| Engine | one `std::thread` | Owns state; everything in §6–§12 |
+| Persistence / metrics export | existing `DbWriter` thread; a metrics-export task | Receive typed records |
+
+**Channels:** use `crossbeam-channel` (bounded, MPMC, parks efficiently, non-blocking `try_send` from async tasks). Engine → exec uses `tokio::sync::mpsc` (`try_send` works from a non-async thread and wakes the exec task). E-2 benchmarks the handoff latency; alternatives (SPSC rings such as `rtrb` plus manual `unpark`) are only adopted if the bench shows > 10 µs p99 handoff.
+
+**Conflation:** HL `bbo`/`l2Book` messages are full snapshots, so the engine drains **all** available market messages, applies each (cheap: overwrite a slot), and then evaluates strategies **once per dirty coin**. Under load, several updates for a coin collapse into one decision on the latest state. If the market channel is full, the producer drops the **new** message and increments `hl_engine_market_drops_total{coin}`; the next snapshot repairs state. Trades aren't snapshots: dropped trades are counted, and strategies that need a complete tape must say so in `interests()` (§8) so the planner gives them a dedicated lossless channel.
+
+## 6. Events
+
+```rust
+pub struct Stamp {
+    pub t_recv_ns: i64,     // wall clock at socket read (or recorded t_ns in replay)
+    pub mono_ns: u64,       // monotonic at socket read
+    pub ts_exch_ms: u64,    // venue timestamp if present, else 0
+}
+
+pub enum MarketUpdate {           // produced by ingest tasks
+    Bbo   { coin: CoinId, stamp: Stamp, bid: Level, ask: Level },
+    Book  { coin: CoinId, stamp: Stamp, book: BookSnapshot },        // fixed arrays
+    Trades{ coin: CoinId, stamp: Stamp, trades: SmallVec<[Trade; 8]> },
+    Ctx   { coin: CoinId, stamp: Stamp, ctx: AssetCtxLite },          // funding, mark, oracle, OI
+    Gap   { conn: ConnId, stamp: Stamp, open: bool },                 // feed gap start/end
+}
+
+pub enum AccountUpdate {          // lossless
+    OrderUpdate { stamp: Stamp, cloid: Cloid, oid: u64, status: VenueOrderStatus, filled_sz: Sz, avg_px: Px },
+    Fill        { stamp: Stamp, cloid: Option<Cloid>, oid: u64, coin: CoinId, side: Side, px: Px, sz: Sz, fee: Px, liquidation: bool },
+    PostAck     { stamp: Stamp, req_id: u64, result: PostResult },    // per-order statuses or error
+    Reconcile   { stamp: Stamp, snapshot: AccountSnapshot },
+    Funding     { stamp: Stamp, coin: CoinId, usdc: Px },
+    Control     (Control),                                            // KillSwitch, Resume, Pause{strategy}, ReloadLimits
+}
+```
+
+- `CoinId`, `Cloid` (`[u8; 16]`), `Level { px, sz, n }`, `BookSnapshot { bids: [Level; 20], asks: [Level; 20], n_bids: u8, n_asks: u8, time_ms }`.
+- `Px`/`Sz` are `rust_decimal::Decimal` in v1. Task **E-11** may switch them to fixed-point `i64` with a per-asset scale, **only if** E-10 shows decode or evaluation over budget. Money math stays exact either way (GOAL §4.5).
+- Ingest decodes straight into these types. There are no intermediate `serde_json::Value`s on the market path (today's `ws::decode` goes via `Value`; E-2 replaces it with typed borrowed-string deserialization).
+
+## 7. Engine state
+
+```rust
+pub struct EngineState {
+    pub markets: Vec<MarketSlot>,          // index = CoinId
+    pub account: AccountState,             // positions, spot balances, margin; from stream + reconcile
+    pub orders: OrderManager,              // §10: every live/pending order by cloid
+    pub risk: RiskState,                   // §11: limits, exposure incl. in-flight, breakers, kill flag
+    pub timers: TimerHeap,                 // BinaryHeap<(deadline_mono_ns, TimerId)>
+    pub strategies: Vec<Box<dyn Strategy>>,
+    pub routes: Routes,                    // CoinId × stream → strategy indices (precomputed)
+}
+
+pub struct MarketSlot {
+    pub meta: AssetMeta,                   // asset id, sz_decimals, tick rules: precomputed for the order builder
+    pub bbo: Option<(Level, Level, Stamp)>,
+    pub book: Option<(BookSnapshot, Stamp)>,
+    pub ctx: Option<(AssetCtxLite, Stamp)>,
+    pub stale: bool,                       // set by Gap events / staleness check
+}
+```
+
+Best bid/ask prefers the fresher of `bbo` and book top (SPEC-0002 H-5). A coin whose inputs are older than its tolerance, or inside a gap, is `stale`. Strategies can see that, and **risk rejects new non-reduce-only orders on stale coins**.
+
+## 8. Strategy API v2 (synchronous)
+
+```rust
+pub trait Strategy: Send {
+    fn id(&self) -> StrategyId;
+    /// Coins, streams, and timers this strategy reacts to. Called once at startup.
+    fn interests(&self) -> Interests;
+    /// React to a market change on a coin it's interested in. Push actions into `out`.
+    fn on_market(&mut self, coin: CoinId, ctx: &Ctx<'_>, out: &mut Actions);
+    /// React to its own order updates and fills.
+    fn on_order(&mut self, update: &OrderEvent, ctx: &Ctx<'_>, out: &mut Actions);
+    /// Timer fired.
+    fn on_timer(&mut self, timer: TimerId, ctx: &Ctx<'_>, out: &mut Actions) {}
+}
+
+pub struct Ctx<'a> {
+    pub now: Stamp,                 // event time (replay-safe)
+    pub markets: &'a [MarketSlot],  // read-only
+    pub account: &'a AccountState,  // read-only
+    pub orders: &'a OrderManager,   // read-only: this strategy's working orders
+}
+
+pub enum Action {
+    Place(OrderIntent),             // cloid assigned by the engine if absent
+    Cancel { cloid: Cloid },
+    Modify { cloid: Cloid, px: Px, sz: Sz },     // one venue action instead of cancel + place
+    PlaceGroup(GroupIntent),        // multi-leg: SPEC-0011
+}
+```
+
+Rules: strategies are **pure and synchronous**. No I/O, no clock reads, no randomness except a seeded `DeterministicRng` (already in `mev-strategy`). `Actions` is a reusable buffer (`SmallVec` inside), cleared by the engine. Dispatch uses the precomputed `routes`, so a strategy is only called for coins it cares about.
+
+Migration: `FundingBasis` and `MarketMaker` are already pure. E-4 ports them to v2 and deletes the `async_trait` version. `MarketMaker` switches its cancel/replace to `Modify` where possible.
+
+## 9. Per-iteration algorithm (the loop)
+
+```
+loop:
+  n = 0
+  while let Ok(ev) = acct_rx.try_recv():  apply_account(ev); n += 1      // lossless first
+  while let Ok(ev) = market_rx.try_recv(): apply_market(ev); n += 1      // marks dirty coins
+  fire_due_timers(now_mono)                                              // pushes timer dispatches
+  for coin in dirty.drain():               dispatch_market(coin)         // strategies → actions
+  for ev in pending_order_events.drain():  dispatch_order(ev)
+  process_actions()                        // §10–§12: risk → order manager → batch → build → sign → exec_tx.try_send
+  flush_records()                          // try_send typed records to DbWriter / metrics
+  if n == 0:
+      spin up to `spin_us` checking both channels (default 50 µs; 0 = never spin)
+      else block: select(acct_rx, market_rx) with timeout = next timer deadline
+```
+
+Ordering is deterministic: account before market, coins in `CoinId` order, strategies in registration order, actions in emission order.
+
+## 10. Order manager and state machine
+
+Every order the engine sends is tracked by `Cloid`. **The engine always assigns a `cloid`** (per-process 8-byte random prefix + 8-byte counter) if the strategy didn't.
+
+| State | Entered when | Next states |
+|---|---|---|
+| `PendingNew` | Action accepted by risk and handed to exec | `Resting`, `Filled`, `PartiallyFilled`, `Rejected(reason)`, `Unknown` |
+| `Resting` / `PartiallyFilled` | Ack / order update says resting | `Filled`, `PendingCancel`, `PendingModify`, `Cancelled` |
+| `PendingCancel` / `PendingModify` | Cancel/modify sent | `Cancelled`, `Resting` (modified), `Filled` (raced), `Unknown` |
+| `Filled` / `Cancelled` / `Rejected` | Terminal | — |
+| `Unknown` | Exec disconnect or timeout with no ack | Resolved by the exec task querying `orderStatus` by cloid (SPEC-0002 H-2), which comes back as `Reconcile`/`OrderUpdate` |
+
+- `PostAck` statuses are parsed per order (`resting` / `filled` / `error:<reason>`); `Rejected` carries the typed `RejectReason` (SPEC-0002 §9). This fixes §2 item 7.
+- **Exposure accounting:** for risk, every order in `PendingNew`, `Resting`, `PartiallyFilled`, `PendingModify`, or `Unknown` counts at its **worst case** (full remaining size fills). This fixes §2 item 10.
+- While any order on a coin is `Unknown`, new non-reduce-only orders on that coin are rejected.
+
+## 11. Risk on the hot path
+
+SPEC-0004 owns the rules; this section fixes the interface and the performance contract.
+
+- `fn check(&mut self, action: &Action, ctx: &RiskCtx) -> Decision`: synchronous, O(1) per action, no allocation. Incremental per-coin and account exposure is kept up to date by the order manager, not recomputed by scanning.
+- Check order (first failure wins): **kill switch** (an in-state flag, set by `Control::KillSwitch`) → breaker state → stale coin → unknown orders on coin → rate budget (§12) → per-order notional → per-coin projected exposure (confirmed + in-flight) → account margin utilization → min notional / rounding validity.
+- `live` refuses to start unless every limit is explicitly set to a finite value (fixes §2 item 9; config validation in E-0).
+- Cancels are never blocked by risk (they reduce risk), except by the rate budget's hard floor.
+
+## 12. Building, batching, signing, sending
+
+| Step | Rule |
+|---|---|
+| Aggressive price | For `limit_px: None` (take liquidity): IOC with limit = best opposite price × (1 ± `max_slippage_bps`/1e4), rounded to tick in the safe direction. Never the mid (fixes §2 item 8). `max_slippage_bps` is per strategy, default 10. |
+| Batch | All approved actions from one iteration are coalesced: all places ⇒ **one** `order` action (bulk); all cancels by cloid ⇒ one `cancelByCloid`; all modifies ⇒ one `batchModify`. Places, cancels, and modifies go as separate posts, sent in this order: **cancels first, then modifies, then places.** |
+| Build | Precomputed `AssetMeta` per `CoinId`; rounding per SPEC-0002 §6; msgpack into a reused buffer. |
+| Sign | On the engine thread (budget: p50 ≤ 150 µs incl. msgpack; SPEC-0002 H-7). The nonce comes from the engine-owned `NonceManager` (single writer by construction), and persistence is write-behind (H-6). |
+| Send | `exec_tx.try_send(SignedPost { req_id, payload, cloids })`. On failure (channel full or exec down): mark those orders `Rejected(LocalBackpressure)` and set a breaker (§16). |
+| Rate budget | Engine-side token buckets for IP weight (1200/min shared; the engine's share is configurable) and the address budget (from `userRateLimit`, polled by the reconciler). Below `min_budget`: reject places, allow cancels. Metric `hl_rate_budget_remaining{kind}`. |
+| Socket | Exec connections set **`TCP_NODELAY`** (connect the `TcpStream` ourselves, `set_nodelay(true)`, then TLS + WS handshake) and disable permessage-deflate. Connections are opened and warmed at startup, never on demand. |
+
+## 13. Clock
+
+`trait EngineClock { fn now(&self) -> Stamp; fn mono_ns(&self) -> u64; }`
+
+- `LiveClock`: `SystemTime` + a monotonic anchor.
+- `ReplayClock`: the time of the event being processed (from recorded `t_ns`/`mono_ns`); timers fire when replayed time passes their deadline.
+- Nonces use wall time in live, and the replay clock in simulate/replay (signatures in replay are never sent).
+
+## 14. Backends: live, simulate, replay
+
+The engine is generic over its I/O. Only the edges change between modes.
+
+| Mode | Market input | Account input | Exec backend | Clock |
+|---|---|---|---|---|
+| `observe` | live WS | — | none: the engine doesn't run strategies (current behavior kept) | live |
+| `simulate` | live WS | `PaperExec` fills as `AccountUpdate`s | `PaperExec`: fills against the live book after a configurable latency `sim_latency_ms` (default: measured p50 ack latency, else 20 ms), maker fills when the book trades through | live |
+| `replay` | **SPEC-0008 recorder segments** via `hl-recorder`'s reader, decoded by the same ingest decoders | `PaperExec` | `PaperExec` with the same latency model | `ReplayClock` |
+| `live` | live WS | H-3 stream + reconciler | `WsExec` (H-1), REST fallback | live |
+
+`hl replay --from … --to … --strategies … --out actions.jsonl` runs the real engine over recorded data. Its action log (every approved action with its cloid, px, and sz, plus every fill) is the determinism artifact: the same input must give a byte-identical log. This also lets SPEC-0008 study winners be re-validated with production code before going live.
+
+The existing `PaperExecutor` in `mev-strategy/src/paper.rs` becomes the core of `PaperExec`, moved behind the exec-backend interface.
+
+## 15. Account state and reconciliation
+
+- The source of truth for own orders and fills is the H-3 stream (`orderUpdates`, `userFills`, `userEvents`), applied in order.
+- The REST reconciler runs every 30 s, after any reconnect, and on demand (after `Unknown`s). It produces `Reconcile` snapshots; the engine diffs them against local state. On drift: fix local state, count `hl_reconcile_drift_total{kind}`, and if drift repeats 3 times within 10 min, trip the breaker.
+- The 5 s `account_poller` is deleted once E-8 lands.
+
+## 16. Failure handling
+
+| Failure | Engine response |
+|---|---|
+| Market feed gap on a conn | Mark affected coins `stale`; risk rejects new non-reduce-only orders there; strategies see `stale` |
+| Account stream gap | Halt new places account-wide; request an immediate reconcile; resume after a clean reconcile |
+| Exec disconnect / post timeout | Affected orders → `Unknown`; halt new places; exec reconnects and resolves via `orderStatus`; resume when no `Unknown` remains |
+| Outbound channel full | Reject the batch locally, trip the breaker `exec_backpressure`, alert |
+| Kill switch (`SIGUSR1`, flag file, `hl panic`) | Set the kill flag; emit cancel-all for every working order; strategies get no more dispatches; multi-leg residuals follow SPEC-0011 `on_kill` |
+| Engine thread panic | `panic = abort` (release profile) ⇒ process exits ⇒ the dead-man switch (`scheduleCancel`) cancels resting orders; systemd restarts; startup reconciles before trading |
+| Dead-man refresh | An **engine timer** emits the `scheduleCancel` action through the same exec path (ordered with orders; SPEC-0002 H-4 policy) |
+
+## 17. Latency instrumentation and benchmarks
+
+**Stamps carried per decision:** `t_recv` (socket read) → `t_decoded` → `t_dequeued` (engine) → `t_decided` (strategy returned) → `t_risked` → `t_signed` → `t_handoff` (exec_tx) → `t_written` (exec writer returned from the socket write) → `t_ack` (reply received).
+
+| Histogram (Prometheus, exported every 1 s from in-thread `hdrhistogram`s, so there's no per-event metrics-facade cost) | Span |
+|---|---|
+| `hl_engine_decode_seconds` | `t_decoded − t_recv` |
+| `hl_engine_queue_seconds` | `t_dequeued − t_decoded` |
+| `hl_engine_decide_seconds` | `t_decided − t_dequeued` |
+| `hl_engine_risk_seconds` | `t_risked − t_decided` |
+| `hl_engine_sign_seconds` | `t_signed − t_risked` |
+| `hl_engine_handoff_seconds` | `t_written − t_signed` |
+| **`hl_tick_to_order_seconds`** | **`t_written − t_recv`** (the GOAL §5.2 headline) |
+| `hl_submit_ack_seconds` | `t_ack − t_written` (network + venue) |
+| `hl_engine_iteration_seconds`, `hl_engine_events_per_iteration`, `hl_engine_market_drops_total`, `hl_engine_idle_ratio` | loop health |
+
+**Benchmarks (criterion, `crates/mev-bot/benches/engine.rs`):**
+1. `bbo_to_action`: one `Bbo` event through apply → dispatch (a trivial threshold strategy) → risk → build → sign, excluding the socket. Must meet G-2 on the reference machine.
+2. `drain_1000`: 1000 queued market events → one decision per dirty coin.
+3. `zero_alloc`: a counting global allocator in a test binary asserts **0 allocations** per `Bbo` event after warm-up (G-3).
+4. `replay_throughput`: events/second in `replay` (target ≥ 1M events/s, so a day replays in minutes).
+
+Reference machine = the chosen production host type (SPEC-0008 V-4). Results are recorded in §21.
+
+## 18. Performance engineering checklist (E-12)
+
+| Item | Default | Decide by |
+|---|---|---|
+| Pin the engine thread to a dedicated core (`core_affinity`) | on if ≥ 4 vCPUs | bench p99 with and without; check VPS steal time |
+| Spin before blocking (`spin_us`) | 50 µs | p99 vs CPU cost |
+| Allocator (`mimalloc`) | off | bench |
+| `TCP_NODELAY` on every exec and market socket | **on** | always |
+| Warm standby exec connection (fail over without a handshake) | off | measured reconnect gap |
+| `lto = "fat"` for release | thin today | bench |
+| Fixed-point `Px`/`Sz` (E-11) | off | E-10 results |
+
+## 19. Configuration
+
+```toml
+[engine]
+spin_us               = 50
+pin_core              = "auto"        # "auto" | "off" | <core index>
+market_channel_cap    = 65_536
+account_channel_cap   = 16_384
+exec_channel_cap      = 1_024
+reconcile_secs        = 30
+sim_latency_ms        = 20
+max_slippage_bps      = 10            # default; strategies may override
+rate_budget_min       = { ip_weight = 100, address = 500 }
+```
+
+## 20. Work breakdown
+
+All tasks are **T1**. Status: ☐ / 🔄 / ✅. Size: S ≤ ½ day, M ≤ 2 days, L ≤ 5 days.
+
+| ID | Title | Size | Depends on | Status |
+|---|---|---|---|---|
+| E-0 | **Safety fixes on the current engine** (before any testnet run) | S | — | ☐ |
+| E-1 | Core types: `CoinId` interning, `Stamp`, `MarketUpdate`, `AccountUpdate`, `Level`, `BookSnapshot`, `Cloid` | S | — | ☐ |
+| E-2 | Typed ingest decoders (no `serde_json::Value`) + market/account channels; handoff bench | M | E-1, SPEC-0008 R-3 | ☐ |
+| E-3 | Engine thread + loop (§9), timers, routes, spin/park | M | E-1 | ☐ |
+| E-4 | Strategy API v2 (sync) + port `FundingBasis` and `MarketMaker` | M | E-3 | ☐ |
+| E-5 | Order manager + state machine (§10), cloid assignment, in-flight exposure | M | E-3 | ☐ |
+| E-6 | Build/batch/sign on the engine thread + `WsExec` backend (§12) incl. `TCP_NODELAY`, aggressive-price rule, rate budgets | M | E-5, SPEC-0002 H-1, H-2 | ☐ |
+| E-7 | `PaperExec` backend + `hl replay` over recorder segments; determinism test | M | E-5, SPEC-0008 R-7 | ☐ |
+| E-8 | Account stream + reconciler integration; delete `account_poller` | M | E-5, SPEC-0002 H-3 | ☐ |
+| E-9 | Hot-path risk integration (§11) with SPEC-0004 K-tasks | M | E-5, SPEC-0004 K-1, K-2, K-3 | ☐ |
+| E-10 | Latency stamps, histograms, benches incl. zero-alloc (§17) | M | E-6 | ☐ |
+| E-11 | Fixed-point `Px`/`Sz` (**only if** E-10 shows decode/eval over budget) | L | E-10 | ☐ |
+| E-12 | Performance checklist (§18), results recorded | M | E-10 | ☐ |
+| E-13 | Remove the tick engine; update SPEC-0003 status; update RUNBOOK | S | E-4, E-6, E-7, E-8 | ☐ |
+
+### Task details
+
+**E-0 — Safety fixes on the current engine.** In `crates/mev-bot/src/engine.rs`, `mev-risk`, and `mev-core/src/config.rs`: (1) assign a `cloid` to every live order when the intent has none; (2) parse the `place` response's per-order statuses and record `resting` / `filled` / `rejected:<reason>` instead of "submitted"; (3) for `limit_px: None`, use the §12 aggressive-price rule instead of the mid; (4) `Config::validate` rejects `live` unless all four risk limits are set; (5) `LimitRisk` counts the notional of intents already approved **in the same cycle** toward the position cap. *Done when:* a unit test covers each of the five, and existing tests pass.
+
+**E-1 — Core types.** New module `crates/mev-bot/src/engine/types.rs` (or a new `mev-engine` crate, if the dependency graph needs it: decide in the task and note why). `CoinId` is built from `AssetMap` at startup with a bidirectional map. *Done when:* types compile with docs, and a unit test round-trips `CoinId` ↔ coin name for perps, spot, and HIP-3.
+
+**E-2 — Typed ingest.** Decoders for `bbo`, `l2Book`, `trades`, `activeAssetCtx`, and the H-3 account channels deserialize straight into §6 types (serde with borrowed `&str` → parse). Ingest tasks stamp `t_recv` right after the read, then `try_send`. *Done when:* golden-fixture tests pass (reuse `benches/fixtures`), decode bench ≤ ADR-0001 numbers, and the handoff bench (async `try_send` → engine thread receive) is recorded, p99 target ≤ 10 µs.
+
+**E-3 — Engine loop.** Implement §9 on a `std::thread` with `crossbeam_channel::select!`. `TimerHeap` with `BinaryHeap`. Precomputed `Routes` from `interests()`. *Done when:* unit tests cover drain order (account before market), conflation (5 updates for one coin ⇒ 1 dispatch), timer firing order, and spin → block with timeout.
+
+**E-4 — Strategy API v2.** Replace the `async_trait` `Strategy` with §8's trait. Port `FundingBasis` and `MarketMaker`; `MarketMaker` uses `Modify` for re-quotes. Keep their existing tests, adapted. *Done when:* both strategies pass their tests under v2 and no `async_trait` remains in `mev-strategy`.
+
+**E-5 — Order manager.** §10 in full, plus incremental per-coin exposure (confirmed + worst-case in-flight) consumed by risk. *Done when:* table-driven tests cover every §10 transition, including races (fill arrives before ack; cancel races fill), and the exposure is exact after each.
+
+**E-6 — Build, batch, sign, send.** §12 in full. Uses the H-1 concurrent `WsExec`. Precomputed `AssetMeta`, reused buffers. *Done when:* a mock-venue test shows one iteration with 2 places + 1 cancel sends exactly 2 posts (cancel first), statuses route back to the right cloids, `TCP_NODELAY` is set (asserted on the socket), and aggressive prices round in the safe direction.
+
+**E-7 — Paper + replay.** `PaperExec` (from `paper.rs`) behind the exec backend interface, with a latency model. `hl replay` reads SPEC-0008 segments. *Done when:* replaying a fixture segment twice gives byte-identical action logs, and a `simulate` run of `FundingBasis` produces the same decisions as replay over the same recorded window (within the latency model).
+
+**E-8 — Account stream + reconciler.** Wire H-3 and the §15 reconciler. Delete `account_poller`. *Done when:* tests cover drift detection and correction, the account-gap halt/resume, and `Unknown` resolution through a mocked `orderStatus`.
+
+**E-9 — Risk integration.** Implement §11 against SPEC-0004's K-tasks. *Done when:* property tests show that no sequence of approved actions can push projected exposure over a cap, and the kill switch stops all new places within one iteration.
+
+**E-10 — Latency instrumentation.** §17 stamps, histograms, and benches. *Done when:* the benches run in CI quick mode (warn-only thresholds), the zero-alloc test passes, and §21 has the first numbers.
+
+**E-11 — Fixed-point (conditional).** `Px(i64)`/`Sz(i64)` with per-asset scale; parse from strings directly; convert to `Decimal` at the persistence/display edges. *Done when:* property tests show round-trip exactness vs `Decimal` for all assets in `AssetMap`, and benches show the gain (else revert and record why).
+
+**E-12 — Performance checklist.** Measure each §18 item on the reference host. Keep only what helps. *Done when:* §21 has a before/after table, and the chosen defaults are in `config/default.toml`.
+
+**E-13 — Cleanup.** Remove the tick engine and its `RwLock` plumbing; update SPEC-0003 §16, `RUNBOOK.md`, and `AGENTS.md`'s repo map. *Done when:* `grep -r "interval(Duration::from_secs(1))" crates/mev-bot` finds no decision loop, and all tests pass.
+
+## 21. Measured results (filled in by E-10 / E-12)
+
+| Metric | Target | Measured | Host | Date |
+|---|---|---|---|---|
+| `bbo_to_action` p50 / p99 | ≤ 100 µs / ≤ 1 ms | | | |
+| Handoff ingest → engine p99 | ≤ 10 µs | | | |
+| Sign (single order) p50 / p99 | ≤ 150 / 500 µs | | | |
+| Allocations per `Bbo` event | 0 | | | |
+| Replay throughput | ≥ 1M events/s | | | |
+| `hl_submit_ack_seconds` p50 (live, testnet) | minimize | | | |
+
+## 22. Acceptance criteria
+
+- [ ] E-0 merged before any testnet or live run.
+- [ ] G-2 met on the reference host (bench + a 24 h `simulate` run's `hl_tick_to_order_seconds`).
+- [ ] G-3: the zero-alloc test passes.
+- [ ] G-6: replay determinism test passes in CI.
+- [ ] `FundingBasis` and `MarketMaker` run on the new engine in `simulate` for 24 h with no panics, no drops on the account channel, and reconciliation drift = 0.
+- [ ] Every §16 failure row has a test.
+- [ ] The tick engine is removed (E-13).
+
+## 23. Open questions
+
+1. `mev-engine` as its own crate vs a module inside `mev-bot` (E-1 decides; prefer a crate if replay tooling or benches need it without the binary).
+2. Busy-spin budget on a VPS with shared cores: does pinning help, or does steal time dominate? (E-12)
+3. Should signing move to a second pinned thread when one iteration emits many independent batches? Only if E-10 shows sign time dominating p99.
