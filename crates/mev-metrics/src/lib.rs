@@ -1,10 +1,16 @@
-//! Observability: `tracing` initialization, metric names, and health state.
+//! Observability: `tracing` initialization, Prometheus metrics, and health.
 //!
-//! See SPEC-0000 §9 and SPEC-0006. Concrete setup lands in milestone M0.5.
+//! See SPEC-0000 §9 and SPEC-0006.
+
+pub mod health;
+pub mod logging;
+pub mod prometheus;
 
 /// Metric names used across the system, kept in one place to avoid drift.
 pub mod names {
-    /// WebSocket messages decoded per second, tagged by channel.
+    /// Process startups.
+    pub const STARTUPS: &str = "hl_startups_total";
+    /// WebSocket messages decoded, tagged by channel.
     pub const WS_MSGS: &str = "hl_ws_msgs_total";
     /// Market feed staleness in seconds, tagged by feed.
     pub const FEED_STALENESS_SECONDS: &str = "hl_feed_staleness_seconds";

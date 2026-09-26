@@ -235,7 +235,9 @@ mod tests {
         assert!(is_hex_address("0x0000000000000000000000000000000000000000"));
         assert!(!is_hex_address("0x0"));
         assert!(!is_hex_address("0000000000000000000000000000000000000000"));
-        assert!(!is_hex_address("0xZZ00000000000000000000000000000000000000"));
+        assert!(!is_hex_address(
+            "0xZZ00000000000000000000000000000000000000"
+        ));
     }
 
     #[test]
@@ -255,8 +257,10 @@ mod tests {
 
     #[test]
     fn live_requires_confirmation() {
-        let mut config = Config::default();
-        config.mode = Mode::Live;
+        let config = Config {
+            mode: Mode::Live,
+            ..Config::default()
+        };
         // No HL_LIVE_CONFIRM, no keys: must fail.
         assert!(config.validate().is_err());
     }

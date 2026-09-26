@@ -1,16 +1,18 @@
 //! `hl` — orchestration binary for the Hyperliquid-first trading system.
 //!
-//! Milestone M0.4 (SPEC-0000): layered config, execution modes, and the CLI
-//! surface. The runtime loop (M0.5/M0.7) and Hyperliquid wiring (SPEC-0001+)
-//! arrive in later milestones.
+//! Milestone M0.5 (SPEC-0000): tracing, metrics, health endpoints, and
+//! graceful shutdown. Config/modes from M0.4; the client wiring (SPEC-0001+)
+//! arrives in later milestones.
 
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
+use anyhow::Result;
+use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
-use mev_core::{
-    config::{Config, ConfigOverrides, Mode, Network},
-    error::Result,
-};
+use mev_core::config::{Config, ConfigOverrides, Mode, Network};
+use mev_metrics::{health::Health, prometheus::PrometheusHandle};
+use tokio::signal;
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(name = "hl", version, about = "Hyperliquid-first trading system")]
@@ -108,34 +110,52 @@ impl From<NetworkArg> for Network {
     }
 }
 
-fn main() {
-    let cli = Cli::parse();
-    let command = cli
-        .command
-        .unwrap_or(Command::Run { mode: None, network: None, coins: None, db: None });
+#[tokio::main]
+async fn main() {
+    mev_metrics::logging::init();
+    std::panic::set_hook(Box::new(|info| {
+        error!(panic = %info, "panic");
+    }));
 
-    if let Err(err) = dispatch(command) {
+    let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Run {
+        mode: None,
+        network: None,
+        coins: None,
+        db: None,
+    });
+
+    if let Err(err) = dispatch(command).await {
+        error!(error = %err, "fatal");
         eprintln!("error: {err}");
         std::process::exit(1);
     }
 }
 
-fn dispatch(command: Command) -> Result<()> {
+async fn dispatch(command: Command) -> Result<()> {
     match command {
-        Command::Run { mode, network, coins, db } => run(mode, network, coins, db),
-        Command::Config { cmd } => match cmd {
-            ConfigCmd::Show => show_config(),
-        },
-        Command::Markets { query } => not_yet("markets", query.as_deref()),
-        Command::Book { coin, levels } => not_yet("book", Some(&format!("{coin} x{levels}"))),
-        Command::Watch { coins } => not_yet("watch", Some(&coins.join(","))),
-        Command::Select { add, remove } => {
-            not_yet("select", Some(&format!("+{:?} -{:?}", add, remove)))
+        Command::Run {
+            mode,
+            network,
+            coins,
+            db,
+        } => run(mode, network, coins, db).await,
+        Command::Config { cmd } => {
+            match cmd {
+                ConfigCmd::Show => show_config()?,
+            }
+            Ok(())
         }
+        Command::Markets { query } => {
+            not_yet(&format!("markets {}", query.as_deref().unwrap_or("")))
+        }
+        Command::Book { coin, levels } => not_yet(&format!("book {coin} x{levels}")),
+        Command::Watch { coins } => not_yet(&format!("watch {}", coins.join(","))),
+        Command::Select { add, remove } => not_yet(&format!("select +{add:?} -{remove:?}")),
     }
 }
 
-fn run(
+async fn run(
     mode: Option<ModeArg>,
     network: Option<NetworkArg>,
     coins: Option<Vec<String>>,
@@ -148,8 +168,24 @@ fn run(
         db_path: db,
     };
     let config = Config::load(overrides)?;
-    println!("[config]\n{}", config.summary());
-    println!("\n[run] runtime loop arrives in milestone M0.7 (observe mode).");
+
+    let metrics = mev_metrics::prometheus::install_recorder();
+    metrics::counter!(mev_metrics::names::STARTUPS).increment(1);
+
+    info!(
+        network = ?config.network,
+        mode = ?config.mode,
+        autonomy = ?config.autonomy,
+        watchlist = ?config.watchlist,
+        "starting"
+    );
+
+    let health = Health::new();
+    health.set_ready(true);
+    info!("ready; runtime loop arrives in milestone M0.7 (observe mode)");
+
+    serve(health, metrics, config.http_port).await?;
+    info!("shutdown complete");
     Ok(())
 }
 
@@ -159,10 +195,68 @@ fn show_config() -> Result<()> {
     Ok(())
 }
 
-fn not_yet(what: &str, detail: Option<&str>) -> Result<()> {
-    match detail {
-        Some(detail) => println!("`{what} {detail}` is not implemented yet (arrives with SPEC-0001)."),
-        None => println!("`{what}` is not implemented yet (arrives with SPEC-0001)."),
-    }
+fn not_yet(what: &str) -> Result<()> {
+    println!("`{what}` is not implemented yet (arrives with SPEC-0001).");
     Ok(())
+}
+
+#[derive(Clone)]
+struct AppState {
+    health: Health,
+    metrics: PrometheusHandle,
+}
+
+async fn serve(health: Health, metrics: PrometheusHandle, port: u16) -> Result<()> {
+    let app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(render_metrics))
+        .with_state(AppState { health, metrics });
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(%addr, "http server listening");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+async fn healthz() -> (StatusCode, &'static str) {
+    (StatusCode::OK, "ok\n")
+}
+
+async fn readyz(State(state): State<AppState>) -> (StatusCode, &'static str) {
+    if state.health.is_ready() {
+        (StatusCode::OK, "ready\n")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready\n")
+    }
+}
+
+async fn render_metrics(State(state): State<AppState>) -> String {
+    state.metrics.render()
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("failed to listen for ctrl-c");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to listen for SIGTERM")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
