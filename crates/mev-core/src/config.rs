@@ -198,6 +198,14 @@ impl Config {
         Ok(())
     }
 
+    /// The configured agent private key, if any. Handle with care: never log
+    /// the returned value.
+    pub fn agent_key(&self) -> Option<&str> {
+        self.agent_private_key
+            .as_ref()
+            .map(|secret| secret.expose_secret())
+    }
+
     /// A human-readable summary with secrets redacted.
     pub fn summary(&self) -> String {
         let key_state = match &self.agent_private_key {

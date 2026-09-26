@@ -6,12 +6,15 @@
 //! post (later milestone). The agent signer and nonce manager are injected and
 //! never logged.
 
+use std::sync::{Arc, Mutex};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use mev_core::{
     config::{Mode, Network},
+    db::Db,
     error::{Error, Result},
 };
 
@@ -209,10 +212,15 @@ pub trait ExchangeApi: Send + Sync {
 }
 
 /// A signed `/exchange` request payload.
+///
+/// The action is stored (not converted to a `Value`) so that its JSON field
+/// order matches the msgpack order used for the hash: the venue re-encodes the
+/// action it receives to verify the signature, and that encoding is
+/// order-sensitive.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExchangeRequest {
     /// The action (serialized inline).
-    pub action: Value,
+    pub action: Action,
     /// Nonce (ms timestamp).
     pub nonce: u64,
     /// Signature over the action.
@@ -241,9 +249,8 @@ pub fn build_request(
         None => None,
     };
     let signature = signer.sign_l1(action, nonce, vault, expires_after)?;
-    let action_value = serde_json::to_value(action).map_err(|e| Error::Decode(e.to_string()))?;
     Ok(ExchangeRequest {
-        action: action_value,
+        action: action.clone(),
         nonce,
         signature,
         vault_address,
@@ -278,6 +285,8 @@ pub struct HttpExchange {
     base_url: String,
     signer: Option<AgentSigner>,
     nonce: tokio::sync::Mutex<NonceManager>,
+    /// Optional durable high-water mark (SQLite). Persisted before each send.
+    db: Option<Arc<Mutex<Db>>>,
     gate: WriteGate,
     expires_after: Option<u64>,
     vault_address: Option<String>,
@@ -314,10 +323,28 @@ impl HttpExchange {
             base_url: base_url.into(),
             signer,
             nonce: tokio::sync::Mutex::new(NonceManager::new()),
+            db: None,
             gate,
             expires_after: None,
             vault_address: None,
         })
+    }
+
+    /// Attach a durable nonce store and restore the persisted high-water mark.
+    pub fn with_nonce_db(mut self, db: Arc<Mutex<Db>>) -> Result<Self> {
+        let restored = {
+            let guard = db
+                .lock()
+                .map_err(|_| Error::Config("db lock poisoned".into()))?;
+            guard.nonce_last()?
+        };
+        let mut manager = NonceManager::new();
+        if let Some(last) = restored {
+            manager = NonceManager::restore(last);
+        }
+        self.nonce = tokio::sync::Mutex::new(manager);
+        self.db = Some(db);
+        Ok(self)
     }
 
     /// The effective write gate.
@@ -349,7 +376,20 @@ impl HttpExchange {
 
     /// Resync the nonce after a stale/duplicate/recent-window rejection.
     pub async fn heal_nonce(&self) -> u64 {
-        self.nonce.lock().await.on_reject(now_ms())
+        let nonce = self.nonce.lock().await.on_reject(now_ms());
+        let _ = self.persist_nonce(nonce);
+        nonce
+    }
+
+    /// Write the nonce high-water mark to the durable store, if attached.
+    fn persist_nonce(&self, nonce: u64) -> Result<()> {
+        if let Some(db) = &self.db {
+            let guard = db
+                .lock()
+                .map_err(|_| Error::Config("db lock poisoned".into()))?;
+            guard.set_nonce_last(nonce)?;
+        }
+        Ok(())
     }
 
     /// Build, sign, and (if allowed) POST an action.
@@ -372,6 +412,9 @@ impl HttpExchange {
                 value: json!({ "status": "simulated", "request": request }),
             });
         }
+
+        // Persist before sending so a crash cannot reuse this nonce.
+        self.persist_nonce(nonce)?;
 
         let url = format!("{}/exchange", self.base_url.trim_end_matches('/'));
         let resp = self
@@ -550,6 +593,53 @@ mod tests {
                 OrderStatus::Other("someUnknownStatus".into()),
             ]
         );
+    }
+
+    #[test]
+    fn envelope_preserves_action_field_order() {
+        // The venue re-encodes the received action to verify the hash, so the
+        // JSON field order must match the msgpack order.
+        let action = simple_action();
+        let request = build_request(&action, &signer(), 1, None, None).unwrap();
+        let json = serde_json::to_string(&request).unwrap();
+        let action_json = json
+            .split("\"action\":")
+            .nth(1)
+            .and_then(|rest| rest.find(",\"nonce\"").map(|end| &rest[..end]))
+            .unwrap();
+        assert_eq!(
+            action_json,
+            r#"{"type":"order","orders":[{"a":0,"b":true,"p":"50000","s":"0.1","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_persists_across_instances() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/exchange"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"status":"ok"}"#))
+            .mount(&server)
+            .await;
+
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let exchange = HttpExchange::with_base_url(server.uri(), Mode::Live, Some(signer()))
+            .unwrap()
+            .with_nonce_db(db.clone())
+            .unwrap();
+        exchange.submit(&simple_action()).await.unwrap();
+        let first = exchange.last_nonce().await;
+        assert_eq!(db.lock().unwrap().nonce_last().unwrap(), Some(first));
+
+        // A fresh instance restores the persisted high-water mark and never
+        // regresses.
+        let restarted = HttpExchange::with_base_url(server.uri(), Mode::Live, Some(signer()))
+            .unwrap()
+            .with_nonce_db(db.clone())
+            .unwrap();
+        assert_eq!(restarted.last_nonce().await, first);
+        restarted.submit(&simple_action()).await.unwrap();
+        assert!(restarted.last_nonce().await > first);
     }
 
     #[test]

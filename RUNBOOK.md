@@ -53,6 +53,24 @@ The watchlist is stored at `HL_WATCHLIST_PATH` (default `data/watchlist.txt`,
 one coin per line, `#` comments allowed). Precedence: `--coins` > persisted file
 > config/env default. Unknown or delisted coins fail fast before any subscription.
 
+## Dry-run an order / inspect an account
+
+```sh
+# Build + sign an order WITHOUT submitting (needs HL_AGENT_PRIVATE_KEY).
+# Prints the rounded wire order, nonce, signature, and the /exchange envelope.
+HL_AGENT_PRIVATE_KEY=0x... hl order BTC --side buy --sz 0.123456 --px 61000.7
+HL_AGENT_PRIVATE_KEY=0x... hl order BTC --side sell --sz 0.5 --px 50000 \
+    --tif alo --reduce-only --cloid 0x0123456789abcdef0123456789abcdef
+
+# Read-only account snapshot (positions, margin, open orders).
+hl account 0xYourAddress
+```
+
+`hl order` never posts, in any mode. Invalid orders (bad tick/lot, below the
+$10 minimum notional) are rejected locally before signing. The nonce
+high-water mark is persisted in SQLite (`meta.nonce.last`) so a restart cannot
+reuse a nonce.
+
 ## Go live (checklist)
 
 1. Confirm the agent wallet is approved (Hyperliquid UI → Settings → API).

@@ -8,7 +8,10 @@ use mev_core::{
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use crate::types::{AllMids, AssetCtx, L2Book, Meta, MetaAndAssetCtxs, PerpDex, SpotMeta};
+use crate::types::{
+    AllMids, AssetCtx, ClearinghouseState, L2Book, Meta, MetaAndAssetCtxs, OpenOrder,
+    OrderStatusResponse, PerpDex, SpotMeta, UserFees, UserRateLimit,
+};
 
 /// Read-only HyperCore info API.
 #[async_trait]
@@ -29,6 +32,16 @@ pub trait InfoApi: Send + Sync {
     async fn l2_book(&self, coin: &str) -> Result<L2Book>;
     /// Perpetuals metadata plus per-asset contexts for the default dex.
     async fn meta_and_asset_ctxs(&self) -> Result<MetaAndAssetCtxs>;
+    /// Perp account state: positions, margin, withdrawable.
+    async fn clearinghouse_state(&self, user: &str) -> Result<ClearinghouseState>;
+    /// Open orders for a user.
+    async fn open_orders(&self, user: &str) -> Result<Vec<OpenOrder>>;
+    /// Status of a single order by id.
+    async fn order_status(&self, user: &str, oid: u64) -> Result<OrderStatusResponse>;
+    /// The user's effective fee schedule.
+    async fn user_fees(&self, user: &str) -> Result<UserFees>;
+    /// The user's address-based rate-limit budget.
+    async fn user_rate_limit(&self, user: &str) -> Result<UserRateLimit>;
 }
 
 /// HTTP implementation of [`InfoApi`].
@@ -114,6 +127,30 @@ impl InfoApi for HttpInfo {
             self.info(json!({ "type": "metaAndAssetCtxs" })).await?;
         Ok(MetaAndAssetCtxs { meta, asset_ctxs })
     }
+
+    async fn clearinghouse_state(&self, user: &str) -> Result<ClearinghouseState> {
+        self.info(json!({ "type": "clearinghouseState", "user": user }))
+            .await
+    }
+
+    async fn open_orders(&self, user: &str) -> Result<Vec<OpenOrder>> {
+        self.info(json!({ "type": "openOrders", "user": user }))
+            .await
+    }
+
+    async fn order_status(&self, user: &str, oid: u64) -> Result<OrderStatusResponse> {
+        self.info(json!({ "type": "orderStatus", "user": user, "oid": oid }))
+            .await
+    }
+
+    async fn user_fees(&self, user: &str) -> Result<UserFees> {
+        self.info(json!({ "type": "userFees", "user": user })).await
+    }
+
+    async fn user_rate_limit(&self, user: &str) -> Result<UserRateLimit> {
+        self.info(json!({ "type": "userRateLimit", "user": user }))
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +223,71 @@ mod tests {
         assert_eq!(dexs.len(), 2);
         assert_eq!(dexs[0].name, "xyz");
         assert_eq!(dexs[1].name, "cash");
+    }
+
+    #[tokio::test]
+    async fn parses_clearinghouse_state() {
+        let body = r#"{
+            "marginSummary":{"accountValue":"1234.5","totalNtlPos":"5000","totalRawUsd":"1200","totalMarginUsed":"300"},
+            "crossMarginSummary":{"accountValue":"1234.5","totalNtlPos":"5000","totalRawUsd":"1200","totalMarginUsed":"300"},
+            "withdrawable":"900.25",
+            "assetPositions":[{"position":{"coin":"BTC","szi":"0.5","entryPx":"60000","positionValue":"30500","unrealizedPnl":"500","returnOnEquity":"0.05","marginUsed":"1500","leverage":{"type":"cross","value":20}}}]
+        }"#;
+        let server = mount(body).await;
+        let client = HttpInfo::with_base_url(server.uri());
+        let state = client.clearinghouse_state("0xabc").await.unwrap();
+        assert_eq!(
+            state.margin_summary.account_value,
+            Decimal::from_str("1234.5").unwrap()
+        );
+        assert_eq!(state.withdrawable, Decimal::from_str("900.25").unwrap());
+        let position = state.position("BTC").unwrap();
+        assert_eq!(position.szi, Decimal::from_str("0.5").unwrap());
+        assert_eq!(position.leverage.as_ref().unwrap().value, 20);
+        assert!(state.position("ETH").is_none());
+    }
+
+    #[tokio::test]
+    async fn parses_open_orders_and_status() {
+        let orders = r#"[{"coin":"BTC","oid":42,"side":"B","limitPx":"50000","sz":"0.1","origSz":"0.1","timestamp":1700000000000,"reduceOnly":false,"cloid":"0x01"}]"#;
+        let server = mount(orders).await;
+        let client = HttpInfo::with_base_url(server.uri());
+        let open = client.open_orders("0xabc").await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert!(open[0].is_buy());
+        assert_eq!(open[0].oid, 42);
+    }
+
+    #[tokio::test]
+    async fn parses_user_fees() {
+        let body = r#"{
+            "feeSchedule":{"add":"0.00015","cross":"0.00045"},
+            "dailyUserVlm":[{"date":"2026-09-01","userVlm":"100000"}],
+            "userCrossRate":"0.0003",
+            "userAddRate":"0.0001"
+        }"#;
+        let server = mount(body).await;
+        let client = HttpInfo::with_base_url(server.uri());
+        let fees = client.user_fees("0xabc").await.unwrap();
+        assert_eq!(
+            fees.fee_schedule.as_ref().unwrap().cross.as_deref(),
+            Some("0.00045")
+        );
+        assert_eq!(
+            fees.user_cross_rate,
+            Some(Decimal::from_str("0.0003").unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn parses_order_status_response() {
+        let body = r#"{"status":"order","order":{"coin":"BTC","oid":7,"side":"A","limitPx":"60000","sz":"0.2","origSz":"0.2","timestamp":1,"reduceOnly":true}}"#;
+        let server = mount(body).await;
+        let client = HttpInfo::with_base_url(server.uri());
+        let status = client.order_status("0xabc", 7).await.unwrap();
+        assert_eq!(status.status, "order");
+        assert!(!status.is_filled());
+        assert_eq!(status.order.as_ref().unwrap().oid, 7);
     }
 
     #[tokio::test]

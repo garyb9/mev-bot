@@ -6,6 +6,7 @@
 
 pub mod assets;
 pub mod client;
+pub mod deadman;
 pub mod exchange;
 pub mod market;
 pub mod nonce;
@@ -16,6 +17,7 @@ pub mod ws;
 
 pub use assets::{AssetMap, Market, MarketKind, MarketSelector};
 pub use client::{HttpInfo, InfoApi};
+pub use deadman::DeadMansSwitch;
 pub use exchange::{
     ActionResponse, ExchangeApi, ExchangeRequest, ExchangeResponse, HttpExchange, OrderResponse,
     OrderStatus, RejectReason, WriteGate, build_request,
@@ -28,8 +30,9 @@ pub use order::{
 };
 pub use signing::{AgentSigner, Signature, action_hash, recover_address, signing_hash};
 pub use types::{
-    AllMids, AssetCtx, AssetCtxUpdate, AssetMeta, Bbo, L2Book, Level, Meta, MetaAndAssetCtxs,
-    PerpDex, SpotMeta, SpotPair, SpotToken, Trade,
+    AllMids, AssetCtx, AssetCtxUpdate, AssetMeta, AssetPosition, Bbo, ClearinghouseState, L2Book,
+    Level, Leverage, MarginSummary, Meta, MetaAndAssetCtxs, OpenOrder, OrderStatusResponse,
+    PerpDex, Position, SpotMeta, SpotPair, SpotToken, Trade, UserFees, UserRateLimit,
 };
 pub use ws::{MarketStream, StreamEvent, Subscription, WsMarketStream};
 

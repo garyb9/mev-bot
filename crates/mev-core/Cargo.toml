@@ -11,3 +11,4 @@ repository.workspace = true
 serde.workspace = true
 figment.workspace = true
 secrecy.workspace = true
+rusqlite.workspace = true

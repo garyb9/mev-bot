@@ -15,8 +15,9 @@ use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
 use mev_core::config::{Config, ConfigOverrides, Mode, Network};
 use mev_hl_client::{
-    AssetMap, HttpInfo, InfoApi, Market, MarketKind, MarketSelector, MarketState, MarketStream,
-    StreamEvent, Subscription, Tolerance, WsMarketStream,
+    Action, AgentSigner, AssetMap, HttpInfo, InfoApi, Market, MarketKind, MarketSelector,
+    MarketState, MarketStream, OrderParams, StreamEvent, Subscription, Tif, Tolerance,
+    WsMarketStream, build_order_wire, build_request, now_ms,
 };
 use mev_metrics::{health::Health, prometheus::PrometheusHandle};
 use tokio::signal;
@@ -81,6 +82,13 @@ enum Command {
         /// Market symbols.
         coins: Vec<String>,
     },
+    /// Build and sign an order without submitting it (SPEC-0002).
+    Order(OrderArgs),
+    /// Show account state (positions, margin, open orders).
+    Account {
+        /// Account address (`0x...`).
+        address: String,
+    },
     /// Edit the persisted watchlist (SPEC-0001).
     Select {
         /// Replace the watchlist with these coins.
@@ -100,11 +108,59 @@ enum ConfigCmd {
     Show,
 }
 
+/// Arguments for the dry-run `order` command.
+#[derive(clap::Args)]
+struct OrderArgs {
+    /// Market symbol (e.g. `BTC` or `xyz:TSLA`).
+    coin: String,
+    /// Order side.
+    #[arg(long, value_enum)]
+    side: Side,
+    /// Order size.
+    #[arg(long)]
+    sz: String,
+    /// Limit price.
+    #[arg(long)]
+    px: String,
+    /// Time in force.
+    #[arg(long, value_enum, default_value_t = TifArg::Gtc)]
+    tif: TifArg,
+    /// Mark the order reduce-only.
+    #[arg(long)]
+    reduce_only: bool,
+    /// Optional client order id (`0x` + 32 hex chars).
+    #[arg(long)]
+    cloid: Option<String>,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum ModeArg {
     Observe,
     Simulate,
     Live,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Side {
+    Buy,
+    Sell,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TifArg {
+    Alo,
+    Ioc,
+    Gtc,
+}
+
+impl From<TifArg> for Tif {
+    fn from(value: TifArg) -> Self {
+        match value {
+            TifArg::Alo => Tif::Alo,
+            TifArg::Ioc => Tif::Ioc,
+            TifArg::Gtc => Tif::Gtc,
+        }
+    }
 }
 
 impl From<ModeArg> for Mode {
@@ -171,6 +227,8 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
         Command::Dexs => dexs(network).await,
         Command::Book { coin, levels } => book(network, coin, levels).await,
         Command::Watch { coins } => watch(network, coins).await,
+        Command::Order(args) => order(network, args).await,
+        Command::Account { address } => account(network, address).await,
         Command::Select { coins, add, remove } => select(network, coins, add, remove).await,
     }
 }
@@ -400,6 +458,104 @@ async fn select(
     );
     for market in &resolved {
         println!("  {}", format_market(market));
+    }
+    Ok(())
+}
+
+/// Build and sign a single order, printing the wire form and envelope. Never
+/// submits, so it is safe to run in any mode.
+async fn order(network: Option<NetworkArg>, args: OrderArgs) -> Result<()> {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let config = Config::load(ConfigOverrides {
+        network: network.map(Into::into),
+        ..Default::default()
+    })?;
+    let key = config
+        .agent_key()
+        .ok_or_else(|| anyhow::anyhow!("set HL_AGENT_PRIVATE_KEY to sign an order"))?;
+    let signer = AgentSigner::from_hex(key, config.network == Network::Mainnet)?;
+
+    let selector = selector_for(config.network, std::slice::from_ref(&args.coin)).await?;
+    let market = selector.resolve(&args.coin)?;
+
+    let params = OrderParams {
+        is_buy: matches!(args.side, Side::Buy),
+        size: Decimal::from_str(&args.sz)
+            .map_err(|e| anyhow::anyhow!("invalid --sz `{}`: {e}", args.sz))?,
+        limit_px: Decimal::from_str(&args.px)
+            .map_err(|e| anyhow::anyhow!("invalid --px `{}`: {e}", args.px))?,
+        tif: args.tif.into(),
+        reduce_only: args.reduce_only,
+        cloid: args.cloid,
+    };
+    let wire = build_order_wire(&market, &params)?;
+    let action = Action::order(vec![wire.clone()]);
+    let nonce = now_ms();
+    let request = build_request(&action, &signer, nonce, None, None)?;
+
+    println!("mode:      dry-run (nothing submitted)");
+    println!("network:   {:?}", config.network);
+    println!("agent:     {}", signer.address());
+    println!(
+        "market:    {} (asset_id={}, szDecimals={})",
+        market.coin,
+        market.asset_id(),
+        market.sz_decimals
+    );
+    println!("order:     {}", serde_json::to_string(&wire)?);
+    println!("nonce:     {nonce}");
+    println!(
+        "signature: r={} s={} v={}",
+        request.signature.r_hex(),
+        request.signature.s_hex(),
+        request.signature.v
+    );
+    println!("envelope:  {}", serde_json::to_string(&request)?);
+    Ok(())
+}
+
+/// Print account state and open orders for an address.
+async fn account(network: Option<NetworkArg>, address: String) -> Result<()> {
+    let network = resolve_network(network)?;
+    let info = HttpInfo::new(network);
+
+    let state = info.clearinghouse_state(&address).await?;
+    println!(
+        "account {address}  value={}  withdrawable={}  marginUsed={}",
+        state.margin_summary.account_value,
+        state.withdrawable,
+        state.margin_summary.total_margin_used
+    );
+    if state.asset_positions.is_empty() {
+        println!("positions: none");
+    } else {
+        println!("positions:");
+        for entry in &state.asset_positions {
+            let position = &entry.position;
+            println!(
+                "  {:<12} szi={:<14} entry={:<12} value={:<14} uPnl={}",
+                position.coin,
+                position.szi,
+                position.entry_px.map(|p| p.to_string()).unwrap_or_default(),
+                position.position_value,
+                position.unrealized_pnl,
+            );
+        }
+    }
+
+    let orders = info.open_orders(&address).await?;
+    println!("open orders: {}", orders.len());
+    for order in &orders {
+        println!(
+            "  {:<12} {} {:<12} @ {:<12} oid={}",
+            order.coin,
+            if order.is_buy() { "buy " } else { "sell" },
+            order.sz,
+            order.limit_px,
+            order.oid,
+        );
     }
     Ok(())
 }

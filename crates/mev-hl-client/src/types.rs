@@ -204,3 +204,191 @@ pub struct MetaAndAssetCtxs {
     /// Asset contexts, positionally aligned with `meta.universe`.
     pub asset_ctxs: Vec<AssetCtx>,
 }
+
+/// A single perp position (`clearinghouseState.assetPositions[].position`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Position {
+    /// Coin.
+    pub coin: String,
+    /// Signed size (positive long, negative short).
+    pub szi: Decimal,
+    /// Entry price.
+    pub entry_px: Option<Decimal>,
+    /// Position value in USD.
+    pub position_value: Decimal,
+    /// Unrealized PnL.
+    pub unrealized_pnl: Decimal,
+    /// Return on equity.
+    pub return_on_equity: Decimal,
+    /// Liquidation price, if any.
+    #[serde(default)]
+    pub liquidation_px: Option<Decimal>,
+    /// Margin used.
+    pub margin_used: Decimal,
+    /// Leverage details.
+    #[serde(default)]
+    pub leverage: Option<Leverage>,
+}
+
+/// Leverage settings for a position.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Leverage {
+    /// Leverage type (`cross` or `isolated`).
+    #[serde(rename = "type")]
+    pub type_field: String,
+    /// Leverage value.
+    pub value: u32,
+}
+
+/// One entry of `assetPositions` (wraps a [`Position`]).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AssetPosition {
+    /// The wrapped position.
+    pub position: Position,
+}
+
+/// Perp clearinghouse account summary.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearinghouseState {
+    /// Account value.
+    pub margin_summary: MarginSummary,
+    /// Cross-margin summary.
+    pub cross_margin_summary: MarginSummary,
+    /// Withdrawable USDC.
+    pub withdrawable: Decimal,
+    /// Open positions.
+    #[serde(default)]
+    pub asset_positions: Vec<AssetPosition>,
+}
+
+impl ClearinghouseState {
+    /// Find a position by coin.
+    pub fn position(&self, coin: &str) -> Option<&Position> {
+        self.asset_positions
+            .iter()
+            .map(|entry| &entry.position)
+            .find(|position| position.coin == coin)
+    }
+}
+
+/// Margin summary block.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarginSummary {
+    /// Account value.
+    pub account_value: Decimal,
+    /// Total notional position.
+    pub total_ntl_pos: Decimal,
+    /// Total raw USD used as margin.
+    pub total_raw_usd: Decimal,
+    /// Total margin used.
+    pub total_margin_used: Decimal,
+}
+
+/// An open order (`openOrders` / `frontendOpenOrders`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenOrder {
+    /// Coin.
+    pub coin: String,
+    /// Order id.
+    pub oid: u64,
+    /// Buy if true.
+    pub side: String,
+    /// Limit price.
+    pub limit_px: Decimal,
+    /// Remaining size.
+    pub sz: Decimal,
+    /// Original size.
+    pub orig_sz: Decimal,
+    /// Server timestamp.
+    pub timestamp: u64,
+    /// Client order id, if any.
+    #[serde(default)]
+    pub cloid: Option<String>,
+    /// Whether reduce-only.
+    #[serde(default)]
+    pub reduce_only: bool,
+}
+
+impl OpenOrder {
+    /// Whether this order is a buy.
+    pub fn is_buy(&self) -> bool {
+        self.side.eq_ignore_ascii_case("B")
+    }
+}
+
+/// `orderStatus` response for a single order.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderStatusResponse {
+    /// `order`, `filled`, or `unknownOid`.
+    pub status: String,
+    /// The order details when resting.
+    #[serde(default)]
+    pub order: Option<OpenOrder>,
+}
+
+impl OrderStatusResponse {
+    /// Whether the order was already fully filled.
+    pub fn is_filled(&self) -> bool {
+        self.status == "filled"
+    }
+}
+
+/// User fee schedule (`userFees`), reduced to the fields the EV model needs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFees {
+    /// Active fee schedule.
+    #[serde(default)]
+    pub fee_schedule: Option<FeeSchedule>,
+    /// Recent daily volumes.
+    #[serde(default)]
+    pub daily_user_vlm: Vec<DailyVolume>,
+    /// Current maker/taker rates applied to the user.
+    pub user_cross_rate: Option<Decimal>,
+    /// Current spot maker/taker rates.
+    pub user_add_rate: Option<Decimal>,
+}
+
+/// Fee tier schedule details.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeeSchedule {
+    /// Maker rate as a string (e.g. `"0.00015"`).
+    #[serde(default)]
+    pub add: Option<String>,
+    /// Taker rate as a string.
+    #[serde(default)]
+    pub cross: Option<String>,
+}
+
+/// Daily volume entry.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DailyVolume {
+    /// Date.
+    #[serde(default)]
+    pub date: String,
+    /// Volume.
+    #[serde(default)]
+    pub user_vlm: Decimal,
+}
+
+/// `userRateLimit` response.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRateLimit {
+    /// Requests used so far.
+    #[serde(default)]
+    pub n_requests_used: u64,
+    /// Requests still available.
+    #[serde(default)]
+    pub n_requests_cap: u64,
+    /// Time (ms) until the budget resets.
+    #[serde(default)]
+    pub request_used: u64,
+}
