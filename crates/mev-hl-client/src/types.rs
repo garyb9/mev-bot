@@ -579,6 +579,122 @@ impl UserFill {
     }
 }
 
+/// One entry of an `orderUpdates` push (SPEC-0002 H-3).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsOrder {
+    /// The order details.
+    pub order: WsBasicOrder,
+    /// Venue status string (see `OrderResolution` for the vocabulary).
+    pub status: String,
+    /// When the status was recorded.
+    #[serde(default)]
+    pub status_timestamp: u64,
+}
+
+/// The basic order block carried by `WsOrder`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsBasicOrder {
+    /// Coin.
+    pub coin: String,
+    /// Side (`B`/`A`).
+    pub side: String,
+    /// Limit price.
+    pub limit_px: Decimal,
+    /// Remaining size.
+    pub sz: Decimal,
+    /// Order id.
+    pub oid: u64,
+    /// Venue timestamp.
+    pub timestamp: u64,
+    /// Original size.
+    pub orig_sz: Decimal,
+    /// Client order id, if any.
+    #[serde(default)]
+    pub cloid: Option<String>,
+}
+
+/// `userFills` push: a snapshot (`isSnapshot: true`) then streaming fills.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsUserFills {
+    /// Whether this is the subscription's initial snapshot.
+    #[serde(default)]
+    pub is_snapshot: bool,
+    /// The user.
+    #[serde(default)]
+    pub user: String,
+    /// The fills.
+    #[serde(default)]
+    pub fills: Vec<UserFill>,
+}
+
+/// `userEvents` push. Exactly one variant field is present.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsUserEvent {
+    /// Fills (also carried by `userFills`).
+    #[serde(default)]
+    pub fills: Option<Vec<UserFill>>,
+    /// A funding payment.
+    #[serde(default)]
+    pub funding: Option<WsUserFunding>,
+    /// A liquidation.
+    #[serde(default)]
+    pub liquidation: Option<WsLiquidation>,
+    /// Orders cancelled not by the user.
+    #[serde(default)]
+    pub non_user_cancel: Option<Vec<WsNonUserCancel>>,
+}
+
+/// A funding payment pushed on `userEvents` / `userFundings`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsUserFunding {
+    /// Settlement time in milliseconds.
+    pub time: u64,
+    /// Coin.
+    pub coin: String,
+    /// Signed USDC amount.
+    pub usdc: Decimal,
+    /// Position size at settlement.
+    #[serde(default)]
+    pub szi: Decimal,
+    /// Funding rate applied.
+    #[serde(default)]
+    pub funding_rate: Decimal,
+}
+
+/// A liquidation event.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WsLiquidation {
+    /// Liquidation id.
+    #[serde(default)]
+    pub lid: u64,
+    /// The liquidator's address.
+    #[serde(default)]
+    pub liquidator: String,
+    /// The liquidated user's address.
+    #[serde(default)]
+    pub liquidated_user: String,
+    /// Liquidated notional position.
+    #[serde(default)]
+    pub liquidated_ntl_pos: Decimal,
+    /// Liquidated account value.
+    #[serde(default)]
+    pub liquidated_account_value: Decimal,
+}
+
+/// An order cancelled by the system (not the user).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WsNonUserCancel {
+    /// Coin.
+    pub coin: String,
+    /// Order id.
+    pub oid: u64,
+}
+
 /// `userRateLimit` response.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

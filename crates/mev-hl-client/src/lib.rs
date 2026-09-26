@@ -40,7 +40,8 @@ pub use types::{
     FundingDelta, L2Book, Level, Leverage, MarginSummary, Meta, MetaAndAssetCtxs, OpenOrder,
     OrderResolution, OrderStatusOrder, OrderStatusResponse, PerpDex, Position, SpotBalance,
     SpotClearinghouseState, SpotMeta, SpotPair, SpotToken, Trade, UserFees, UserFill, UserFunding,
-    UserRateLimit,
+    UserRateLimit, WsBasicOrder, WsLiquidation, WsNonUserCancel, WsOrder, WsUserEvent, WsUserFills,
+    WsUserFunding,
 };
 pub use ws::{MarketStream, StreamEvent, Subscription, WsMarketStream};
 pub use ws_exchange::WsExchange;

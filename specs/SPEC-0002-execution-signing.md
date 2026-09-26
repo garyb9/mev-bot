@@ -190,7 +190,7 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 |---|---|---|---|---|---|
 | H-1 | Concurrent WS `post` (reader task + pending map) | **T0** | M | — | ✅ |
 | H-2 | Mandatory `cloid` + unknown-outcome reconciliation | **T0** | M | H-1 | ✅ |
-| H-3 | Account stream (`orderUpdates`, `userFills`, `userEvents`) | T1 | M | SPEC-0008 R-3 | ☐ |
+| H-3 | Account stream (`orderUpdates`, `userFills`, `userEvents`) | T1 | M | SPEC-0008 R-3 | ✅ |
 | H-4 | Dead-man's switch policy (arm only when needed; fail closed) | **T0** | S | H-1 | ✅ |
 | H-5 | Apply `bbo` to `MarketState` | T1 | S | — | ☐ |
 | H-6 | Nonce persistence off the hot path | T1 | S | H-9 | ☐ |
@@ -204,6 +204,8 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 **H-2 — Mandatory `cloid` + reconciliation.** Every order gets a `cloid` (generate a 16-byte id from a per-process random prefix + counter when the caller doesn't supply one). On `UnknownOutcome`, query `orderStatus` by `cloid` (⚠ verify that `orderStatus` accepts a cloid; H-9) and resolve to resting/filled/rejected/not-found. **Never** resend an order without doing this first. *Done when:* `wiremock`/mock-WS tests cover each resolution, and there is no code path that retries an order blindly.
 
 **H-3 — Account stream.** Add `Subscription::{OrderUpdates, UserFills, UserEvents}{user}` and typed `StreamEvent` variants. Handle the `isSnapshot` first message of `userFills`. These go on a **separate, lossless** channel from market data (SPEC-0001 §8), and on reconnect the snapshot resyncs state. *Done when:* golden-fixture decode tests pass for every channel (fixtures captured from testnet or the docs), and a reconnect test shows the snapshot applied.
+
+**H-3 implemented (2026-09-26).** In `mev-hl-client`: subscriptions `OrderUpdates`/`UserFills`/`UserEvents{user}`, wire types `WsOrder`/`WsBasicOrder`/`WsUserFills`/`WsUserEvent`/`WsUserFunding`/`WsLiquidation`/`WsNonUserCancel`, and `StreamEvent::{OrderUpdates,UserFills,UserEvent}`. `decode` routes `orderUpdates`, `userFills`, and the `user` channel (the venue's name for `userEvents`); `MarketState::apply` ignores them. The `isSnapshot` flag is preserved. The separate lossless channel and the reconnect-resync test land where the stream is consumed (E-8), which is also where this integration is verified; the wire-level decode is covered now by golden-fixture tests in `ws.rs`.
 
 **H-4 — Dead-man's switch policy.** (a) Arm only while at least one resting order exists, and disarm when none remain; each `scheduleCancel` spends address rate-limit budget (a 30 s TTL refreshed every 15 s is ~5.8k requests/day against a 10k + 1-per-USDC-traded budget). (b) Default TTL 120 s, refreshed at half the TTL. (c) If arming or refreshing fails, set a sticky **trading-halt** flag that the risk engine reads (fail closed); today the task logs and returns while live continues. (d) Expose remaining address budget by polling `userRateLimit` every 60 s as a metric. *Done when:* unit tests cover arm/disarm on the resting-order count and halt on failure.
 

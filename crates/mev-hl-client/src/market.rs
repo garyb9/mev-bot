@@ -201,7 +201,11 @@ impl MarketState {
                     buffer.push_back(trade.clone());
                 }
             }
-            StreamEvent::Bbo(_) => {}
+            // Account channels (H-3) are not market state.
+            StreamEvent::Bbo(_)
+            | StreamEvent::OrderUpdates(_)
+            | StreamEvent::UserFills(_)
+            | StreamEvent::UserEvent(_) => {}
         }
     }
 

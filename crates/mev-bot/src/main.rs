@@ -969,6 +969,32 @@ fn print_event(event: StreamEvent) {
             "ctx       {:<12} mark={} oracle={} funding={}",
             update.coin, update.ctx.mark_px, update.ctx.oracle_px, update.ctx.funding,
         ),
+        StreamEvent::OrderUpdates(orders) => {
+            if let Some(order) = orders.first() {
+                println!(
+                    "order     {:<12} oid={} status={}",
+                    order.order.coin, order.order.oid, order.status
+                );
+            }
+        }
+        StreamEvent::UserFills(fills) => {
+            println!(
+                "fills     {} (snapshot={})",
+                fills.fills.len(),
+                fills.is_snapshot
+            );
+        }
+        StreamEvent::UserEvent(event) => {
+            if let Some(fills) = &event.fills {
+                println!("userEvent fills={}", fills.len());
+            } else if event.funding.is_some() {
+                println!("userEvent funding");
+            } else if event.liquidation.is_some() {
+                println!("userEvent liquidation");
+            } else if event.non_user_cancel.is_some() {
+                println!("userEvent nonUserCancel");
+            }
+        }
     }
 }
 

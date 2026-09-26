@@ -16,7 +16,9 @@ use mev_metrics::names;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::raw_ws::{HlProtocol, RawEvent, RawWsConn};
-use crate::types::{AllMids, AssetCtxUpdate, Bbo, L2Book, Trade};
+use crate::types::{
+    AllMids, AssetCtxUpdate, Bbo, L2Book, Trade, WsOrder, WsUserEvent, WsUserFills,
+};
 
 /// A Hyperliquid WS subscription request.
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +53,22 @@ pub enum Subscription {
         /// Candle interval, e.g. `1m`.
         interval: String,
     },
+    /// A user's order state changes (SPEC-0002 H-3).
+    OrderUpdates {
+        /// Account address.
+        user: String,
+    },
+    /// A user's fills, snapshot then streamed (SPEC-0002 H-3).
+    UserFills {
+        /// Account address.
+        user: String,
+    },
+    /// A user's non-order events: fills, funding, liquidations, cancels
+    /// (SPEC-0002 H-3). The wire channel for these is `"user"`.
+    UserEvents {
+        /// Account address.
+        user: String,
+    },
 }
 
 /// A decoded market-data event.
@@ -71,6 +89,12 @@ pub enum StreamEvent {
     Trades(Vec<Trade>),
     /// Asset context update.
     AssetCtx(AssetCtxUpdate),
+    /// A user's order state updates (SPEC-0002 H-3).
+    OrderUpdates(Vec<WsOrder>),
+    /// A user's fills, snapshot then streamed (SPEC-0002 H-3).
+    UserFills(WsUserFills),
+    /// A user's non-order event (SPEC-0002 H-3).
+    UserEvent(WsUserEvent),
 }
 
 /// A reconnect-capable market-data stream.
@@ -189,7 +213,11 @@ pub fn decode(text: &str) -> Result<Option<StreamEvent>> {
         "trades" => StreamEvent::Trades(from_value(envelope.data)?),
         "activeAssetCtx" => StreamEvent::AssetCtx(from_value(envelope.data)?),
         "allMids" => StreamEvent::Mids(parse_mids(envelope.data)?),
-        "subscription" | "pong" | "pongEvent" => return Ok(None),
+        "orderUpdates" => StreamEvent::OrderUpdates(from_value(envelope.data)?),
+        "userFills" => StreamEvent::UserFills(from_value(envelope.data)?),
+        // The venue's channel name for `userEvents` is `"user"`.
+        "user" => StreamEvent::UserEvent(from_value(envelope.data)?),
+        "subscriptionResponse" | "subscription" | "pong" | "pongEvent" => return Ok(None),
         "error" => {
             return Err(Error::Http(format!("websocket error: {}", envelope.data)));
         }
@@ -283,6 +311,107 @@ mod tests {
                 .is_none()
         );
         assert!(decode(r#"{"channel":"pong","data":{}}"#).unwrap().is_none());
+    }
+
+    #[test]
+    fn decodes_order_updates() {
+        let frame = r#"{"channel":"orderUpdates","data":[
+            {"order":{"coin":"ETH","side":"B","limitPx":"2412.7","sz":"0.0","oid":1,
+              "timestamp":1724361546645,"origSz":"0.0076","cloid":"0x01"},
+             "status":"filled","statusTimestamp":1724361546645}]}"#;
+        match decode(frame).unwrap() {
+            Some(StreamEvent::OrderUpdates(orders)) => {
+                assert_eq!(orders.len(), 1);
+                assert_eq!(orders[0].order.oid, 1);
+                assert_eq!(orders[0].status, "filled");
+                assert_eq!(orders[0].order.cloid.as_deref(), Some("0x01"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_user_fills_snapshot() {
+        let frame = r#"{"channel":"userFills","data":{
+            "isSnapshot":true,"user":"0xabc","fills":[
+            {"coin":"BTC","px":"60000","sz":"0.01","side":"B","time":1754450974231,
+             "closedPnl":"0","oid":42,"crossed":true,"fee":"0.27","tid":7,"dir":"Open Long"}]}}"#;
+        match decode(frame).unwrap() {
+            Some(StreamEvent::UserFills(fills)) => {
+                assert!(fills.is_snapshot);
+                assert_eq!(fills.user, "0xabc");
+                assert_eq!(fills.fills.len(), 1);
+                assert!(fills.fills[0].is_buy());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_user_events_on_user_channel() {
+        let funding = r#"{"channel":"user","data":{"funding":{
+            "time":1,"coin":"ETH","usdc":"-0.5","szi":"2","fundingRate":"0.00001"}}}"#;
+        match decode(funding).unwrap() {
+            Some(StreamEvent::UserEvent(event)) => {
+                let funding = event.funding.expect("funding present");
+                assert_eq!(funding.coin, "ETH");
+                assert_eq!(funding.usdc, Decimal::new(-5, 1));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cancel = r#"{"channel":"user","data":{"nonUserCancel":[{"coin":"BTC","oid":9}]}}"#;
+        match decode(cancel).unwrap() {
+            Some(StreamEvent::UserEvent(event)) => {
+                assert_eq!(event.non_user_cancel.unwrap()[0].oid, 9);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_fills_snapshot_then_stream_are_distinguishable() {
+        // On (re)subscribe the first fill message is a snapshot; the consumer
+        // resyncs state from it, then applies streaming fills (SPEC-0002 H-3).
+        let snapshot = r#"{"channel":"userFills","data":{"isSnapshot":true,"user":"0xabc",
+            "fills":[{"coin":"BTC","px":"1","sz":"1","side":"B","time":1,"closedPnl":"0","oid":1,"crossed":false,"fee":"0","tid":1,"dir":"Open Long"}]}}"#;
+        let streamed = r#"{"channel":"userFills","data":{"isSnapshot":false,"user":"0xabc",
+            "fills":[{"coin":"BTC","px":"2","sz":"1","side":"A","time":2,"closedPnl":"0","oid":2,"crossed":false,"fee":"0","tid":2,"dir":"Close Long"}]}}"#;
+        let first = match decode(snapshot).unwrap() {
+            Some(StreamEvent::UserFills(fills)) => fills,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert!(first.is_snapshot, "first message must be the snapshot");
+        let second = match decode(streamed).unwrap() {
+            Some(StreamEvent::UserFills(fills)) => fills,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert!(!second.is_snapshot);
+    }
+
+    #[test]
+    fn account_subscriptions_serialize() {
+        assert_eq!(
+            serde_json::to_value(Subscription::OrderUpdates {
+                user: "0xabc".into()
+            })
+            .unwrap(),
+            json!({ "type": "orderUpdates", "user": "0xabc" })
+        );
+        assert_eq!(
+            serde_json::to_value(Subscription::UserFills {
+                user: "0xabc".into()
+            })
+            .unwrap(),
+            json!({ "type": "userFills", "user": "0xabc" })
+        );
+        assert_eq!(
+            serde_json::to_value(Subscription::UserEvents {
+                user: "0xabc".into()
+            })
+            .unwrap(),
+            json!({ "type": "userEvents", "user": "0xabc" })
+        );
     }
 
     #[test]
