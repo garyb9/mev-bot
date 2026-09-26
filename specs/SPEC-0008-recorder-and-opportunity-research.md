@@ -3,7 +3,7 @@
 **Status:** Draft
 **Milestone:** M3 (see [`docs/GOAL.md`](../docs/GOAL.md) §7). Runs in parallel with M2.5 and comes **before** the funding pilot (M4).
 **Depends on:** SPEC-0000, SPEC-0001 (market data client). Execution (SPEC-0002) is **not** required.
-**Blocks:** ADR-0002 (which arb to build), SPEC-0009 (first arb strategy), and the go/no-go for SPEC-0003 (B) and SPEC-0005.
+**Blocks:** ADR-0002 (which strategy to build first), the first strategy spec (next free number, SPEC-0010+), and the go/no-go for SPEC-0003 (B) and SPEC-0005.
 
 ---
 
@@ -36,12 +36,12 @@ The spec has two halves:
 | G-3 | Stay within Hyperliquid rate limits by construction | Subscription planner refuses plans over budget; REST weight metered |
 | G-4 | Research is reproducible | Same raw files + same code ⇒ identical report numbers |
 | G-5 | Opportunities are comparable | Every study uses the same episode definition, cost model, latency grid, and report template |
-| G-6 | A clear decision | ADR-0002 names the first arb (or "none yet") with the numbers behind it |
+| G-6 | A clear decision | ADR-0002 names the first strategy (or "none yet") with the numbers behind it |
 
 ## 3. Non-goals
 
 - Placing, signing, or simulating orders. The recorder never loads keys.
-- Building strategies. Studies measure opportunities; strategies come in SPEC-0009.
+- Building strategies. Studies measure opportunities; strategies come in their own spec after ADR-0002.
 - Replacing the SQLite event log (SPEC-0004 §9). That log stores **the bot's own session inputs and decisions**. The recorder stores **raw market data at research scale** in files (see §5.2 for why).
 - Real-time dashboards. Prometheus metrics for recorder health are enough.
 - Machine learning. Studies use transparent, rule-based detection.
@@ -76,7 +76,7 @@ Components and where they live:
 | HyperEVM pool source | `crates/mev-recorder/src/sources/evm.rs` | Rust | R-9 |
 | Deployment | `deploy/recorder/`, `RUNBOOK.md` | systemd / docs | R-10 |
 | Research toolkit | `research/hlr/` | Python | P-1…P-5 |
-| Studies + reports | `research/studies/`, `research/reports/` | Python / Markdown | S-1…S-8 |
+| Studies + reports | `research/studies/`, `research/reports/` | Python / Markdown | S-1…S-10 |
 
 **Decision — Python for research.** Research uses Python 3.12 + `uv` + `polars` (+ `duckdb` where SQL is easier). Rationale: much faster iteration for analysis, and research code never touches money paths. Production stays Rust. Research code must not be imported by, or deployed with, the bot.
 
@@ -143,6 +143,10 @@ Rough volume: one `l2Book` stream is about 1–3 KB every ~0.5 s ⇒ ~0.2–0.5 
 | `binance-spot` | Binance spot `bookTicker` | R-8 |
 | `bybit-linear` | Bybit v5 linear `orderbook.1` | R-8 |
 | `hyperevm` | HyperEVM block headers + pool state | R-9 |
+| `finsnap` | Options positioning snapshots from the owner's finsnap service | R-11 |
+| `deribit` | Deribit crypto options summaries (IV, OI, volume) | R-12 |
+| `equities` | Real-time US equity quotes for HIP-3 stock-perp underlyings | R-13 |
+| `hl-node` | Output files of our own node (SPEC-0009) | SPEC-0009 N-6 |
 
 ## 6. Storage layout, rotation, and manifest
 
@@ -312,13 +316,23 @@ Used by study O5 (cross-venue lead-lag) and as fair-value references in O1/O3.
 
 All three ⚠ verify (V-2): URLs, field names, and whether each venue is reachable from the chosen host region. Symbols are lowercased for Binance URLs. Reuse `RawWsConn` from R-3; only the subscribe and keepalive hooks differ.
 
+### 9.1 Options and equities sources (tasks R-11, R-12, R-13)
+
+These feed studies **O9** and **O10**: options-informed trading of HIP-3 tokenized-stock perps and crypto bluechips. None of them is latency-critical except `equities` for O10 Part A.
+
+| `src` | What | Cadence | Notes |
+|---|---|---|---|
+| `finsnap` | The owner's finsnap service (`../finsnap`, TypeScript, Yahoo Finance data): `GET /snap` JSON with per-expiry options positioning (`pcRatio`, `skewScore`, weighted-mean strike, wall inference, labels) and the per-strike profile | every 5 min during US regular hours, plus one snapshot after the close | Recorded raw as `rest` envelopes. Yahoo data is **delayed** ⚠ verify how much (V-9). finsnap today keeps only strike/volume/OI and drops IV/bid/ask; cross-repo task **F-1** adds them. finsnap's default options universe is ETFs (SPY, QQQ, sectors, IBIT), so single stocks behind HIP-3 perps must be added (F-1). |
+| `deribit` | Deribit public API: `public/get_book_summary_by_currency` (`currency=BTC\|ETH`, `kind=option`) + `public/get_index_price` | every 60 s | Free and real-time; includes mark IV, OI, volume, and underlying price per instrument. The right options source for BTC/ETH (much better than Yahoo/IBIT). ⚠ verify endpoints, fields, and limits (V-10). |
+| `equities` | Streaming real-time quotes (bid/ask/last) for the underlyings of HIP-3 stock perps (e.g. TSLA, NVDA, the index behind `XYZ100`) | streaming during US hours (+ pre/post market if the provider has it) | Provider chosen in **V-11** (free feeds cover only part of the volume; consolidated feeds are paid). Check the provider's terms allow storing the data. |
+
 ## 10. HyperEVM pool state (task R-9)
 
 Only needed for studies O4/O8. **Start R-9 only after V-5 and V-6 are ✅.**
 
 | Item | Requirement |
 |---|---|
-| RPC | Not the public `rpc.hyperliquid.xyz/evm` (100 req/min is too low). Use a provider/own-node WS URL from env `HL_EVM_WS_URL`. |
+| RPC | Not the public `rpc.hyperliquid.xyz/evm` (100 req/min is too low). Use our own node ([SPEC-0009](SPEC-0009-own-node.md), preferred) or a provider, configured by env `HL_EVM_WS_URL`. |
 | Blocks | Subscribe `newHeads`; write each header as `kind:"frame"` with `raw` = the JSON header. |
 | Pool list | `config/hyperevm-pools.toml`: `[[pool]] address, dex, kind = "v2"\|"v3", token0, token1, fee_bps`. Produced by V-6. Never hardcode addresses in Rust. |
 | State | For every new block, one `Multicall3` `eth_call` at that block number reading `getReserves()` (v2) or `slot0()` + `liquidity()` (v3) for every pool. Write the raw JSON-RPC response as a `kind:"rest"` envelope with `meta.req` = the call and `meta.block` = the block number. |
@@ -398,6 +412,10 @@ Every study **must** use these definitions, so studies can be ranked against eac
 | `markets` | `snapshot_t_ns, market, kind(perp/spot/hip3), dex, base, quote, asset_id, sz_decimals, max_leverage` | REST meta snapshots |
 | `gaps` | `src, conn, start_ns, end_ns, reason` | `gap_start`/`gap_end`, crashed segments, `seq` holes |
 | `evm_pools` | `t_ns, block, pool, reserve0, reserve1, sqrt_price_x96, liquidity, tick` | R-9 records |
+| `options_expiry` | `t_ns, t_data, underlying, expiry, pc_ratio, skew_score, wmean_strike, wmean_std, wall_strike, wall_side, label, call_vol, put_vol, call_oi, put_oi` | `finsnap` (`t_data` = the data's own as-of time, which is **not** `t_ns`) |
+| `options_strikes` | `t_ns, t_data, underlying, strike, call_vol, call_oi, put_vol, put_oi, call_iv, put_iv` (IVs null until F-1) | `finsnap` strike profile |
+| `deribit_options` | `t_ns, instrument, underlying, expiry, strike, cp, mark_iv, bid_iv, ask_iv, open_interest, volume, underlying_px, index_px` | `deribit` |
+| `equity_quotes` | `t_ns, ts_exch_ms, symbol, bid_px, bid_sz, ask_px, ask_sz, last_px, session(pre/regular/post)` | `equities` |
 
 Market naming in every table: HL perps `BTC`, HIP-3 `xyz:TSLA`, HL spot as `BASE/QUOTE` (resolved from `spotMeta`, never `@123`), CEX as `binance-usdm:BTCUSDT`.
 
@@ -465,25 +483,47 @@ Every latency-sensitive number is reported for **L ∈ {10, 50, 100, 250, 500, 1
 | `peak_net_bps` | p50 / p90 |
 | `capture_rate_L` | Share of episodes still open at `+L` |
 | `usd_per_day_L` | Σ `captured_L` / days, at the study's `max_notional` |
-| `capital_usd` | Capital needed to run the strategy at that notional (both legs, margin at 3× unless stated) |
-| `apr_L` | `usd_per_day_L × 365 / capital_usd` |
+| `capital_usd` | Capital needed to run the strategy at that notional (both legs, margin at 3× unless stated). Evaluated at every point of the **capital grid** in `research/thresholds.toml` (default $10k / $25k / $50k / $100k): `max_notional` scales with capital, but capture is capped by the book size available in each episode, so APR usually falls as capital grows. |
+| `apr_L` | `usd_per_day_L × 365 / capital_usd`, reported for each capital grid point |
+| `best_capital_usd` | The grid point with the highest `usd_per_day_L` that still meets the APR floor |
 | `concentration` | Share of total PnL from the single best day (robustness; > 50% is a red flag) |
 | `competition_hint` | p50 duration < 100 ms ⇒ "latency-competitive"; > 2 s ⇒ "slow / capacity-bound" |
 | `latency_requirement_ms` | Largest `L` in the grid at which the study still passes §13.6 (or "none"). Tells us how fast we must be. |
 
 ### 13.6 Scoring and the go/no-go rule
 
-A study **passes** when all of these hold at the headline latency (L = 250 ms, or the measured L once known):
+**The profit bar is a range, not a single number, and it is adjustable.** Every threshold lives in `research/thresholds.toml` (created by task P-3). Studies and `hlr-rank` read it at run time; changing the file and re-running `uv run hlr-rank` re-grades every study without touching code. Owner decisions (2026-09-26): **capital is small to medium** (the $10k–$100k grid), **target APR 25%**, **floor APR 10%**.
 
-| Criterion | Default threshold (owner may override in ADR-0002) |
-|---|---|
-| `apr_L` | ≥ 25% on `capital_usd` |
-| `episodes_per_day` (median) | ≥ 10 |
-| `concentration` | ≤ 40% |
-| `coverage_pct` | ≥ 90% |
-| Robustness | `usd_per_day_L` is still positive with `buffer_bps` doubled |
+```toml
+# research/thresholds.toml: owner-adjustable; re-run `uv run hlr-rank` after editing
+[capital]
+grid_usd     = [10_000, 25_000, 50_000, 100_000]   # small → medium
+headline_usd = 25_000                               # the capital used for the headline verdict
 
-The **ranking score** across passing studies is `usd_per_day_L × (1 − concentration)`, with ties broken by implementation cost (S/M/L from the report). `RANKING.md` lists every study (pass or fail) with its metrics row and score.
+[apr]
+target = 0.25    # ≥ target ⇒ PASS
+floor  = 0.10    # floor ≤ APR < target ⇒ MARGINAL; < floor ⇒ FAIL
+
+[quality]
+min_episodes_per_day = 10
+max_concentration    = 0.40
+min_coverage_pct     = 0.90
+robustness_buffer_multiplier = 2.0   # usd_per_day must stay > 0 with buffer_bps × this
+
+[latency]
+headline_ms = 250   # replace with measured (V-4 + H-7) when known
+```
+
+Each study gets one verdict, evaluated at the headline latency **and** the headline capital (and also reported for every capital grid point):
+
+| Verdict | Rule | Meaning |
+|---|---|---|
+| **PASS** | `apr_L ≥ apr.target` **and** every `[quality]` criterion holds | Build it (candidate for M5) |
+| **MARGINAL** | `apr.floor ≤ apr_L < apr.target` **and** every `[quality]` criterion holds | Acceptable. Build it if it's cheap to implement, stacks with a PASS strategy on shared infrastructure, or nothing passes. |
+| **FAIL** | `apr_L < apr.floor`, **or** any `[quality]` criterion fails | Don't build it (re-test later if conditions change) |
+| **INCONCLUSIVE** | Not enough data (`days`/`coverage_pct` too low) | Keep recording; re-run |
+
+The **ranking score** is `usd_per_day_L × (1 − concentration)` at the headline capital, with ties broken by implementation cost (S/M/L from the report). `RANKING.md` lists every study (every verdict) grouped PASS → MARGINAL → INCONCLUSIVE → FAIL, with its metrics row, score, and a per-capital-grid APR column, so the owner can see at a glance how each opportunity scales.
 
 ### 13.7 Report template (task P-5)
 
@@ -494,12 +534,29 @@ Every study writes `research/reports/O{n}-{slug}.md` with exactly these sections
 3. **Method**: which legs, the `net_bps` formula, parameters (`buffer_bps`, `max_notional`, `stale_ms`), anything that departs from §13
 4. **Results**: the §13.5 metrics table, latency-grid table, per-day bar chart (PNG in `research/reports/img/`), top-10 episodes table
 5. **Sanity checks**: at least 3 of the largest episodes inspected by hand against raw frames; is each real, or a data artifact?
-6. **Verdict**: PASS / FAIL / INCONCLUSIVE against §13.6, plus implementation cost S/M/L and the main risks
+6. **Verdict**: PASS / MARGINAL / FAIL / INCONCLUSIVE against §13.6 (and §13.8 for slow-signal studies), the APR at each capital grid point, implementation cost S/M/L, and the main risks
 7. **Reproduce**: the exact command(s) and git SHA
 
-## 13.8 The studies
+### 13.8 Slow-signal method (task P-6; used by O9, O10 Part B, and optionally O6/O7)
 
-Each study below is one task (S-1…S-8). All depend on P-1…P-5, plus the data listed.
+Episodes (§13.3) fit fast dislocations. **Directional signals held for hours or days** use this method instead. It follows the no-lookahead discipline finsnap already uses.
+
+| Step | Rule |
+|---|---|
+| Availability | A signal computed from data with as-of time `t_data` can only be acted on at `t_avail = max(t_ns received, t_data + data_delay)`, where `data_delay` comes from V-9/V-10 (e.g. Yahoo delay). Never use data before it was available. |
+| Entry | Taker at the HL `bbo` at `t_avail + 1 s` (latency is irrelevant at this horizon). Skip the signal if the HL feed is invalid then. |
+| Horizons | Exit taker at each of **H ∈ {1 h, 4 h, 1 d, 3 d}** after entry (report all), or at the signal's own exit rule if it has one. |
+| Costs | 2 × HL taker fee (HIP-3 fees from V-3/V-12) + funding accrued over the hold (from `ctx`/`funding_hist`) + `buffer_bps`. |
+| Sizing | Fixed fraction of capital per signal (default 20%, leverage ≤ 2×), at each capital grid point; overlapping positions share capital. |
+| Pre-registration | Every signal variant is written in the study file **before** it's run on data. All tested variants are reported, including failures. No tuning on the full sample. |
+| Out-of-sample | Split chronologically 60% / 40%. Parameters (if any) are fixed on the first 60%. The **headline results are the last 40%**. |
+| Baselines | (a) same entry times with a random direction (1000 shuffles → p-value); (b) buy-and-hold of the same perp over the same periods; (c) the signal delayed by one extra snapshot (detects leakage). |
+| Metrics | `n_signals`, hit rate, mean and median net return per trade (bps), per-trade t-stat, daily-aggregated Sharpe (annualized), max drawdown, worst trade, max adverse excursion, `apr` at each capital grid point, `concentration` (share of PnL from the best single week). |
+| Verdict | Same PASS / MARGINAL / FAIL / INCONCLUSIVE tiers and APR range as §13.6 (on out-of-sample results), **plus**: ≥ 30 out-of-sample signals, t-stat ≥ 2, beats the random-direction baseline at p ≤ 0.05, and the delayed-signal variant doesn't beat the real one (otherwise suspect leakage). |
+
+### 13.9 The studies
+
+Each study below is one task (S-1…S-10). All depend on P-1…P-5, plus the data listed.
 
 ### O1 — HIP-3 / main-dex same-underlying dislocations (task S-1)
 
@@ -581,6 +638,31 @@ Each study below is one task (S-1…S-8). All depend on P-1…P-5, plus the data
 | Questions | (1) Are pending txs visible (public mempool, node gossip, per-RPC)? (2) How is order within a block decided (priority fee, arrival, other)? (3) Are there private relays/builders? (4) Priority-fee economics: burned or paid to someone? (5) Pool-vs-pool dislocations between HyperEVM DEXes per block (use `evm_pools`, same §13 method with pool fees + gas). |
 | Prereq | V-5, V-6, and R-9 for question (5) |
 
+### O9 — Options positioning → HIP-3 stock perps and crypto bluechips (task S-9)
+
+The owner's thesis: tokenized-stock perps on HIP-3 dexes (and BTC/ETH on the main dex) move with the broad market and with their options chains, so options positioning can tell us which way to lean. This is a **directional, slow-signal** strategy family, not arb, and it's judged with the §13.8 method.
+
+| Item | Detail |
+|---|---|
+| Hypothesis | Options positioning in the underlying (put/call imbalance, skew, open-interest walls near expiry; for crypto, Deribit IV and skew) predicts the underlying's direction or pinning over hours to days, and trading the matching HL perp captures that net of fees and funding. |
+| Universe | HIP-3 stock perps whose underlying has a liquid US options chain (e.g. `xyz:TSLA` ↔ TSLA; an index perp ↔ QQQ/SPY), plus BTC/ETH (Deribit). Built in V-9 into `research/mappings/underlyings.toml`, e.g. `TSLA = { hl = ["xyz:TSLA"], options = "TSLA", equity = "TSLA" }`. |
+| Data | `options_expiry`, `options_strikes` (finsnap), `deribit_options`, `bbo` + `ctx` for the mapped perps, `equity_quotes` (the underlying's real price), `funding_hist` |
+| Pre-registered signals (v1) | **P1 wall pinning**: within 2 trading days of a large expiry, if spot is more than 1σ (the expiry's strike std) from the dominant OI strike, lean toward that strike; exit at expiry. **P2 skew extreme**: `skew_score` 60-day z-score beyond ±2 ⇒ contrarian position for H; the momentum sign is also tested and both are reported. **P3 crypto IV skew** (Deribit): 25-delta risk-reversal z-score beyond ±2 ⇒ contrarian BTC/ETH perp position. **P4 market regime**: SPY/QQQ positioning label (finsnap) as a filter on P1–P3 (trade only when the index label agrees). |
+| Data history | Options history exists only from when collection started (finsnap's Postgres + the `finsnap` recorder source), so this study is **forward-collected**. Preliminary after ≥ 20 US trading days; final after ≥ 60 trading days **and** ≥ 30 out-of-sample signals per variant. Buying historical options data would shorten this (§17). |
+| HIP-3 specifics | Stock perps trade 24/7, but the underlying and its options trade only in US hours. Oracle, funding, fees, and leverage per dex come from V-12. Entry/exit prices outside US hours must use the HL perp price only. |
+| Honesty note | finsnap itself labels options positioning "context, never signal". O9 is exactly the test of whether it can be a signal. |
+
+### O10 — HIP-3 stock perps vs the real stock (task S-10)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | HIP-3 stock perps are priced off the real stock during US hours and trade on their own the rest of the time. That creates (A) short-lived dislocations vs the live stock price, (B) predictable convergence at the US open after nights/weekends, and (C) persistent funding/premium patterns. |
+| Part A: market-hours dislocation | Fair = equity mid (`equity_quotes`) + rolling 5-min median basis. Episodes per §13.3 when the HL perp is through fair by more than HL taker + buffer. HL-only execution; a hedge in the stock needs a brokerage, so it's measured only (like O5). **Latency grid applies.** |
+| Part B: open convergence | For every US open after a closed period (overnight, weekend, holiday): compare the perp's last price before 09:30 ET with the stock's opening print. Measure whether the perp's closed-hours move over- or under-shoots, overall and relative to the options-implied move (IV from F-1 or Deribit-style straddle pricing). Pre-registered trade: fade closed-hours perp moves larger than k × implied move (k ∈ {1, 1.5, 2}) shortly before the open, exit after the open. §13.8 method. |
+| Part C: funding and premium | Distribution of HIP-3 stock-perp funding and perp-vs-stock premium by session (regular / pre / post / closed / weekend). Report whether a carry-like pattern clears costs. |
+| Data | `bbo`, `ctx` for HIP-3 stock perps; `equity_quotes`; `options_*` (for Part B implied moves); HIP-3 oracle updates from the node (SPEC-0009, optional) |
+| Prereq | V-11 + R-13 for Parts A/B; Part C needs only HL data |
+
 ---
 
 ## 14. Work breakdown
@@ -599,6 +681,11 @@ Status: ☐ not started · 🔄 in progress · ✅ done. Size: **S** ≤ ½ day,
 | V-6 | Build the HyperEVM pool list | M | V-5 | ☐ |
 | V-7 | Measure data volume per stream | S | R-6 | ☐ |
 | V-8 | Check the HL public S3 archive for backfill | S | — | ☐ |
+| V-9 | finsnap integration + HIP-3 stock universe mapping | S | — | ☐ |
+| V-10 | Verify the Deribit public API (endpoints, fields, limits, reachability) | S | — | ☐ |
+| V-11 | Choose a real-time US equities data provider (owner approves) | S | — | ☐ |
+| V-12 | HIP-3 stock-perp mechanics (oracle in/out of hours, funding, fees, leverage, halts) | S | — | ☐ |
+| F-1 | **finsnap repo:** keep IV/bid/ask/last in options data; add HIP-3 underlyings to the options universe | M | V-9 | ☐ |
 | R-1 | `mev-recorder` crate skeleton + envelope types | S | — | ☐ |
 | R-2 | Segment writer (zstd, rotation, manifest, crash recovery, disk guard) | M | R-1 | ☐ |
 | R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | M | — | ☐ |
@@ -609,11 +696,15 @@ Status: ☐ not started · 🔄 in progress · ✅ done. Size: **S** ≤ ½ day,
 | R-8 | Binance/Bybit sources | S | R-3, R-6, V-2 | ☐ |
 | R-9 | HyperEVM pool source | L | R-6, V-5, V-6 | ☐ |
 | R-10 | Deploy recorder (systemd, chrony, runbook, optional shipping) | M | R-6, R-7, V-4 | ☐ |
+| R-11 | `finsnap` poller source | S | R-5, V-9 | ☐ |
+| R-12 | `deribit` options summary source | S | R-5, V-10 | ☐ |
+| R-13 | `equities` real-time quote source | M | R-3, V-11 | ☐ |
 | P-1 | `research/` scaffold + segment reader in Python | S | R-2 (format frozen) | ☐ |
 | P-2 | Normalizer → Parquet tables (§13.1) | M | P-1, V-1 | ☐ |
 | P-3 | Cost model module + `costs.toml` | S | P-1, V-2, V-3 | ☐ |
 | P-4 | Episode detector + latency capture (§13.3–13.5) | M | P-2, P-3 | ☐ |
 | P-5 | Report template + `RANKING.md` generator | S | P-4 | ☐ |
+| P-6 | Slow-signal backtester (§13.8) | M | P-2, P-3 | ☐ |
 | S-1 | Study O1 HIP-3 dislocations | M | P-5 | ☐ |
 | S-2 | Study O2 spot triangles | M | P-5 | ☐ |
 | S-3 | Study O3 spot-perp dislocation | S | P-5 | ☐ |
@@ -622,7 +713,9 @@ Status: ☐ not started · 🔄 in progress · ✅ done. Size: **S** ≤ ½ day,
 | S-6 | Study O6 liquidation/flow events | M | P-5 | ☐ |
 | S-7 | Study O7 funding carry | M | P-5 | ☐ |
 | S-8 | Study O8 HyperEVM MEV feasibility | M | V-5, V-6 (R-9 for Q5) | ☐ |
-| D-1 | `RANKING.md` + ADR-0002 + SPEC-0009 stub | S | all S-tasks that are feasible | ☐ |
+| S-9 | Study O9 options positioning → HIP-3 stocks / bluechips | L | P-6, R-11, R-12, V-12, ≥ 20 trading days of data | ☐ |
+| S-10 | Study O10 HIP-3 stock perps vs the real stock | M | P-4, P-6, R-13, V-12 | ☐ |
+| D-1 | `RANKING.md` + ADR-0002 + first strategy spec stub | S | all S-tasks that are feasible | ☐ |
 
 **Critical path to "recording in production":** R-1 → R-2 → R-4/R-5 (parallel with R-3) → R-6 → V-4 → R-10. Get this done first; the research tasks can start once a few days of data exist.
 
@@ -633,6 +726,7 @@ Status: ☐ not started · 🔄 in progress · ✅ done. Size: **S** ≤ ½ day,
 | A (recorder core) | R-1 → R-2 → R-5 → R-7 |
 | B (connectivity) | R-3 → R-4 → R-6 → R-8 |
 | C (facts) | V-1, V-2, V-3, V-8, V-5 → V-6 |
+| F (options & equities) | V-9, V-10, V-11, V-12 → F-1 (in `../finsnap`) → R-11, R-12, R-13 → start collecting early: O9 needs weeks of forward data |
 | D (ops) | V-4 → R-10 → V-7 |
 | E (research, after ~3 days of data) | P-1 → P-2 → P-3 → P-4 → P-5 → S-* |
 
@@ -659,7 +753,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 
 #### V-5 — Verify HyperEVM facts
 - **Do:** From the docs plus measurement, answer: block types and cadence (small/large blocks), gas pricing (base fee, priority fee, burned or paid), mempool visibility, how to move HYPE and other tokens between Core and EVM (system addresses, delay, cost), and whether `CoreWriter` delays apply to transfers. Every answer needs a source.
-- **Done when:** §15 has a HyperEVM block; §10 and §13.8 O4/O8 are corrected where needed.
+- **Done when:** §15 has a HyperEVM block; §10 and §13.9 O4/O8 are corrected where needed.
 
 #### V-6 — Build the HyperEVM pool list
 - **Do:** Identify the main HyperEVM DEXes and, for each token that also trades on HyperCore spot (HYPE first), the deepest pools. Write `config/hyperevm-pools.toml` (schema in §10) with source links as comments. Check each address on-chain with an `eth_call` (`token0()`, `token1()`, `fee()`, or `getReserves()`).
@@ -672,6 +766,26 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 #### V-8 — Check the HL public S3 archive
 - **Do:** Hyperliquid is believed to publish historical data to a requester-pays S3 bucket (e.g. `s3://hyperliquid-archive/…`, possibly also node data buckets) ⚠ unverified. Confirm the bucket(s), the paths, the data types (l2Book snapshots? asset ctxs? fills?), the formats (lz4?), the update lag, and the cost. Download one sample file per data type into the scratchpad and describe it.
 - **Done when:** §15 has an "S3 archive" block; if usable, add a follow-up task `P-6 backfill importer` to §14 (don't implement it now).
+
+#### V-9 — finsnap integration + HIP-3 stock universe mapping
+- **Do:** Read `../finsnap` (its `AGENTS.md`, `apps/backend/src/collectors/options.ts`, `analyzers/options.ts`, the `/snap` route). Document the `/snap` JSON shape for options (field names, as-of timestamps), the data delay of the Yahoo source, how to run finsnap next to the recorder (Docker Compose), and its options universe (`OPTIONS_SYMBOLS`). List every HIP-3 stock/index perp (`hl dexs`, `hl markets --dex …`), and map each one to its underlying stock/ETF and options symbol in `research/mappings/underlyings.toml`.
+- **Done when:** §15 has the finsnap block; the mapping file covers every HIP-3 stock perp with a liquid US options chain (or marks it "no chain").
+
+#### V-10 — Verify the Deribit public API
+- **Do:** Confirm the §9.1 endpoints, response fields (`mark_iv`, `open_interest`, `volume`, `underlying_price`, `instrument_name` format), rate limits, and reachability from the recorder host.
+- **Done when:** §15 row filled in with sources.
+
+#### V-11 — Choose a real-time US equities data provider
+- **Do:** Compare ≥ 3 options (at least one free, e.g. an IEX-only feed; at least one consolidated/SIP feed) on coverage, latency, pre/post-market coverage, WS support, cost, and whether the terms allow storing data for research. Recommend one.
+- **Done when:** §15 has the comparison; the owner has approved the choice (record the approval date).
+
+#### V-12 — HIP-3 stock-perp mechanics
+- **Do:** For each HIP-3 dex listing stock/index perps: how the oracle/mark is set during US regular hours, pre/post market, overnight, and weekends; funding formula and cadence; fees (links to V-3); max leverage; trading halts and behavior around corporate actions (splits, dividends, earnings). Sources required.
+- **Done when:** §15 has a per-dex table.
+
+#### F-1 — finsnap: richer options data (in the `../finsnap` repo)
+- **Do:** In the finsnap repo, following **its** `AGENTS.md`: keep `impliedVolatility`, `bid`, `ask`, `lastPrice` per contract in the options collector/store (the Yahoo response already carries them; `normalizeContracts` drops them today), expose them in the `/snap` options payload, and add the HIP-3 underlyings from V-9 to the options universe. Commit in the finsnap repo, not here.
+- **Done when:** finsnap tests pass, and `/snap` shows IVs for the new symbols. Record the finsnap commit SHA in §15.
 
 #### R-1 — `mev-recorder` crate skeleton + envelope
 - **Do:** Create `crates/mev-recorder` (add it to the workspace `members`). Define `Envelope` (§5.1) and `Kind` (§5.3) with `serde`, plus constructors that take `t_ns`/`mono_ns` from an injectable clock (reuse the `mev_core::clock::Clock` pattern; add a monotonic-ns source). `raw` is stored as `String` and serialized as a JSON string.
@@ -719,6 +833,21 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Tests:** unit tests for multicall encoding and decoding with fixed vectors; a mock JSON-RPC test for the per-block flow.
 - **Done when:** tests pass; a manual 10-minute run against the configured RPC records one state snapshot per block for every pool in the list.
 
+#### R-11 — `finsnap` poller
+- **Do:** A source that polls the configured finsnap base URL (`HL_FINSNAP_URL`, profile `[finsnap]` section with the cadence from §9.1, gated to US market hours using an exchange calendar) and records raw responses as `rest` envelopes under `src:"finsnap"`. Reuse the R-5 scheduling code; no weight budget, but back off on errors.
+- **Tests:** `wiremock` → envelopes; the market-hours gate on a fixed-clock test (weekday / weekend / holiday).
+- **Done when:** tests pass; a 1-day run shows the expected snapshot count.
+
+#### R-12 — `deribit` source
+- **Do:** Poll the §9.1 Deribit endpoints every 60 s for the configured currencies; record `rest` envelopes under `src:"deribit"`. Respect V-10's rate limits.
+- **Tests:** `wiremock` → envelopes; cadence.
+- **Done when:** tests pass; a 1-hour run shows 60 snapshots per currency.
+
+#### R-13 — `equities` source
+- **Do:** Implement the V-11 provider as a `RawWsConn` `Protocol` (auth from env, never logged), subscribed to the mapped underlyings; record frames under `src:"equities"`. If the provider only offers REST, poll at its fastest allowed rate and note it.
+- **Tests:** mock-server subscribe/auth tests; keys absent from logs.
+- **Done when:** tests pass; a 1-session run records quotes for every mapped symbol.
+
 #### R-10 — Deploy
 - **Do:** Add `deploy/recorder/hl-recorder.service` and `deploy/recorder/README.md` (host setup: user, dirs, chrony, build/copy the binary, env file with `HL_EVM_WS_URL` if used, enable the service). Optional: `deploy/recorder/ship.sh` for daily sync + retention. Add the "Recorder" section to `RUNBOOK.md`.
 - **Done when:** the recorder has run ≥ 48 h on the chosen host with `/readyz` green ≥ 99% of the time, and `hl record verify` shows ≥ 99% coverage for priority-1 streams. Record the start date in §15.
@@ -734,7 +863,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Done when:** tests pass; running it on one real day finishes and `SELECT count(*)` per table looks plausible (numbers in the commit message).
 
 #### P-3 — Cost model
-- **Do:** `research/costs.toml` (values from §13.2 as confirmed by V-2/V-3) and `hlr/costs.py` with `fee_bps(venue, market_kind, liquidity="taker")`, `buffer_bps`, gas helpers, and a book-walk `slippage_bps(book_levels, side, usd)`.
+- **Do:** `research/costs.toml` (values from §13.2 as confirmed by V-2/V-3), `research/thresholds.toml` (exactly the §13.6 block), and `hlr/costs.py` with `fee_bps(venue, market_kind, liquidity="taker")`, `buffer_bps`, gas helpers, and a book-walk `slippage_bps(book_levels, side, usd)`.
 - **Tests:** fee lookup for each venue/kind; slippage on a synthetic book equals the hand-computed value.
 - **Done when:** tests pass.
 
@@ -748,12 +877,17 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Tests:** rendering on a synthetic episode table; ranking order.
 - **Done when:** tests pass.
 
-#### S-1 … S-8 — Studies
-- **Do:** Implement the study in `research/studies/o{n}_{slug}.py` (entry point `uv run python -m studies.o{n}_{slug} --from … --to …`) following its §13.8 block exactly, and write the report via P-5. Run it first as **preliminary** (≥ 3 days of data), then **final** (≥ 14 days).
+#### P-6 — Slow-signal backtester
+- **Do:** `hlr/signals.py`: implement §13.8 (availability rule, entry/exit at horizons, costs incl. funding, sizing on the capital grid, 60/40 out-of-sample split, the three baselines, metrics, verdict). Studies call it with a DataFrame of pre-registered signals `(t_data, market, direction, variant, exit_rule?)`.
+- **Tests:** synthetic price paths with known returns → exact PnL; the availability rule blocks lookahead (a signal with `t_data + delay` in the future is never filled early); the random-baseline p-value on a known-null signal is not significant.
+- **Done when:** tests pass.
+
+#### S-1 … S-10 — Studies
+- **Do:** Implement the study in `research/studies/o{n}_{slug}.py` (entry point `uv run python -m studies.o{n}_{slug} --from … --to …`) following its §13.9 block exactly, and write the report via P-5. Run it first as **preliminary** (≥ 3 days of data), then **final** (≥ 14 days). O9 and the §13.8 parts of O10 use the longer data requirements stated in their blocks.
 - **Done when:** the final report exists with all §13.7 sections, including the hand-checked sanity section; the verdict is stated; the report front-matter feeds `RANKING.md`.
 
 #### D-1 — Decision
-- **Do:** Regenerate `RANKING.md`. Write `specs/decisions/0002-first-arb-strategy.md` (context, the ranking table, the decision, capital and hurdle as set by the owner, rejected alternatives with one-line reasons, consequences for M5/M6/M7). If a study passes, create a `specs/SPEC-0009-<name>.md` stub with Purpose / Goals / Legging model / Open questions filled from the report. **The owner approves ADR-0002; an agent only drafts it.**
+- **Do:** Regenerate `RANKING.md`. Write `specs/decisions/0002-first-arb-strategy.md` (context, the ranking table, the decision, capital and hurdle as set by the owner, rejected alternatives with one-line reasons, consequences for M5/M6/M7). If a study passes (or is the best MARGINAL), create a stub for the first strategy spec at the next free number (`specs/SPEC-0010-<name>.md` or later) with Purpose / Goals / Legging model / Open questions filled from the report. **The owner approves ADR-0002; an agent only drafts it.**
 - **Done when:** ADR-0002 is drafted and marked "Proposed", and `docs/GOAL.md` §7 is updated to match.
 
 ## 15. Verified facts (filled in by V-tasks)
@@ -775,6 +909,11 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 | Data volume per stream (MB/h raw, zst) | | | | V-7 |
 | S3 archive availability | | | | V-8 |
 | Recorder production start date + host | | | | R-10 |
+| finsnap `/snap` options shape, data delay, run mode | | | | V-9 |
+| Deribit endpoints, fields, limits | | | | V-10 |
+| Equities provider comparison + owner approval | | | | V-11 |
+| HIP-3 stock-perp mechanics per dex | | | | V-12 |
+| finsnap F-1 commit SHA | | | | F-1 |
 
 ## 16. Acceptance criteria
 
@@ -782,14 +921,16 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - [ ] `hl record plan` proves the default profile stays within every HL WS limit in §7.1.
 - [ ] REST weight used by the recorder never exceeds its 300/min budget (metric evidence).
 - [ ] The normalizer + studies reproduce identical numbers when re-run on the same files (checked for at least one study).
-- [ ] Studies O1, O2, O3, O5, O6, O7 have final reports; O4 and O8 have final reports **or** a documented reason they are blocked (e.g. no RPC access).
+- [ ] Studies O1, O2, O3, O5, O6, O7, O10 have final reports; O4, O8, and O9 have final reports **or** a documented reason they are blocked or still collecting (e.g. no RPC access, not enough trading days).
 - [ ] `RANKING.md` exists, and ADR-0002 is drafted with a decision.
 - [ ] No keys are read by any recorder or research code path (grep-verified in review).
 
 ## 17. Open questions
 
-1. **Profit hurdle and capital.** The §13.6 thresholds (25% APR, 10 episodes/day) are placeholders. The owner sets the real numbers in ADR-0002.
+1. ~~Profit hurdle and capital~~ **Resolved 2026-09-26:** small-to-medium capital ($10k–$100k grid), APR target 25% and floor 10%, all adjustable in `research/thresholds.toml` (§13.6).
 2. **Shipping and backup** of recordings (bucket, retention). Optional in v1.
 3. **HyperEVM RPC provider** for R-9 (commercial provider vs own node), and budget.
 4. **Should O5's CEX hedge ever be built?** Holding CEX accounts is a new operational surface (keys, KYC, transfers). Measured only for now.
 5. **Maker-leg variants** (fill-probability modeling) are deferred until a taker-taker study looks promising.
+6. **Historical options data.** Buying history (e.g. end-of-day chains with IV) would let O9 be backtested now instead of after ~60 trading days of forward collection. Worth the cost?
+7. **Directional risk limits.** O9/O10 Part B strategies carry market risk that the arb strategies don't; if one passes, SPEC-0004 needs per-strategy stop-loss and volatility-scaled sizing before it goes live.

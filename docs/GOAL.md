@@ -10,10 +10,19 @@ Hyperliquid** (HyperCore first, HyperEVM where it pays). It must be **as low
 latency as we can make it**, and **every strategy that trades real money must
 be justified by edge measured from recorded data, net of all costs**.
 
-In arbitrage, speed decides who captures the edge. When two designs are
-equally correct and equally safe, **choose the faster one**. Speed never
-overrides correctness or safety (§4), but it outranks convenience, elegance,
-and dependency preferences.
+There are two strategy families, both running on the same fast infrastructure:
+
+1. **Arbitrage / MEV-style** (primary): short-lived price dislocations where
+   speed decides who captures the edge.
+2. **Options-informed directional trading** (secondary): using options-market
+   positioning (from the owner's `finsnap` project and Deribit) to trade
+   **HIP-3 tokenized-stock perps** and crypto bluechips over hours to days.
+
+When two designs are equally correct and equally safe, **choose the faster
+one**. Speed never overrides correctness or safety (§4), but it outranks
+convenience, elegance, and dependency preferences. (For the slower
+directional family, data quality and no-lookahead discipline matter more than
+microseconds, but it still runs on the same low-latency stack.)
 
 ## 2. What "MEV / arb on Hyperliquid" actually means
 
@@ -31,15 +40,17 @@ So in this project, "MEV/arb" means, in rough order of expected fit:
 3. **Cross-venue latency.** Binance/Bybit move first and HyperCore quotes lag.
 4. **Flow events.** Liquidation cascades, oracle-update timing, funding settlement.
 5. **Carry.** Funding/basis. This is not arb; it is a low-risk **pilot** used to prove the stack end to end.
+6. **HIP-3 tokenized stocks vs the real stock.** Stock perps trade 24/7 while the stock and its options trade only in US hours. That gives market-hours dislocations vs the live stock price, and convergence at the US open (SPEC-0008 O10).
+7. **Options-informed direction** (the second family). Options positioning (put/call imbalance, skew, open-interest walls; IV for crypto) as a signal for HIP-3 stock perps and BTC/ETH (SPEC-0008 O9). It is directional, so it carries market risk and needs its own risk limits before it can go live.
 
 Which of these we actually build is **decided by data** (SPEC-0008), not by
-preference.
+preference. If you have a new idea, add it as a study there first.
 
 ## 3. How we measure success
 
 | Kind | Metric | Target |
 |---|---|---|
-| North star | Net realized PnL after fees, funding, gas, and slippage | Positive, and above the ADR-0002 hurdle (set by the owner) |
+| North star | Net realized PnL after fees, funding, gas, and slippage | Positive; APR at or above the floor, aiming for the target (below) |
 | Evidence | Every live strategy has a research report showing net-positive edge at a realistic latency | 100% of live strategies |
 | **Speed** | Internal tick-to-order latency (frame read → order bytes written to the socket) | p50 ≤ 100 µs, p99 ≤ 1 ms (see §5) |
 | **Speed** | Network path: order sent → venue acknowledgement | As low as the best measured host allows; tracked per release, never allowed to regress |
@@ -47,8 +58,17 @@ preference.
 | Safety | Orders sent without passing the risk engine | **Zero** |
 | Operability | Recorder and bot uptime; feed staleness | ≥ 99% of time with fresh feeds |
 
-Capital allocation and the numeric profit hurdle are owner decisions. They are
-recorded in `specs/decisions/0002-*.md` once SPEC-0008 finishes.
+**Owner decisions (2026-09-26), adjustable at any time in
+`research/thresholds.toml` (SPEC-0008 §13.6):**
+
+| Setting | Value | Meaning |
+|---|---|---|
+| Capital | **Small to medium**: evaluated at $10k / $25k / $50k / $100k; headline $25k | Opportunities are judged at the sizes we'll actually trade |
+| APR target | **25%** | At or above ⇒ PASS: build it |
+| APR floor | **10%** | Between floor and target ⇒ MARGINAL: acceptable, built if cheap or nothing better; below ⇒ FAIL |
+
+The final choice of what to build is recorded in ADR-0002
+(`specs/decisions/0002-*.md`) when SPEC-0008's studies are done.
 
 ## 4. Principles (non-negotiable)
 
@@ -125,9 +145,10 @@ Spec numbers are **stable identifiers, not an order**. This table is the order.
 | M2.5 | **Execution hardening + latency baseline**: concurrent WS post, account stream, mandatory `cloid`, dead-man policy, stream watchdog, tick-to-order instrumentation, sign/submit benchmarks | SPEC-0002 §17 | ⏳ next | M2 |
 | **M3** | **Market-data recorder + opportunity research → ADR-0002** | **SPEC-0008** | ⏳ **now** (runs in parallel with M2.5) | M1 |
 | M4 | Engine + risk + persistence; **funding-carry pilot** at small size | SPEC-0003 (A), SPEC-0004 | planned | M2.5, M3 recorder |
-| M5 | **First arb strategy**, the one chosen by ADR-0002 | SPEC-0009 (written after ADR-0002) | planned | M3 gate, M4 |
+| M3.5 | **Own non-validator node in Tokyo**: fastest data, local EVM RPC, richer data (fills, order statuses, L4 book) | SPEC-0009 | later (starts when its §2 triggers fire) | M3 recorder in production |
+| M5 | **First strategy**, the one chosen by ADR-0002 (arb, or the options-informed family if it ranks higher) | new spec, next free number (SPEC-0010+), written after ADR-0002 | planned | M3 gate, M4 |
 | M6 | Market-making | SPEC-0003 (B) | only if research supports it | M4 |
-| M7 | HyperEVM sources + executor | SPEC-0005 | only if studies O4/O8 pass | M3 gate, M4 |
+| M7 | HyperEVM sources + executor | SPEC-0005 | only if studies O4/O8 pass | M3 gate, M4, M3.5 (EVM RPC) |
 | M8 | Production ops: deploy, alerting, backups | SPEC-0006 | runs alongside M4+ | — |
 
 **Why M3 comes before the funding strategy:** recorded data builds up over
@@ -138,15 +159,18 @@ The recorder depends only on M1 (market data), so it can start immediately.
 
 1. **SPEC-0008 Phase V and Phase R.** Verify facts, then build the recorder
    and deploy it to a low-latency host.
-2. **SPEC-0002 §17** (M2.5 hardening), in parallel.
-3. Then SPEC-0008 Phases P and S (research toolkit and studies), which end in
+2. **SPEC-0008 lane F** (options & equities: V-9…V-12, F-1, R-11…R-13), early.
+   Study O9 needs weeks of forward-collected options data, so its clock
+   should start as soon as possible.
+3. **SPEC-0002 §17** (M2.5 hardening), in parallel.
+4. Then SPEC-0008 Phases P and S (research toolkit and studies), which end in
    ADR-0002.
 
 ## 9. Decision gates
 
 | Gate | Question | Evidence required | Recorded in |
 |---|---|---|---|
-| G1 (end of M3) | Which arb do we build first, or none? | SPEC-0008 study reports + `RANKING.md` covering ≥ 14 days of data | ADR-0002 |
+| G1 (end of M3) | Which strategy do we build first, or none? | SPEC-0008 study reports + `RANKING.md` covering ≥ 14 days of data | ADR-0002 |
 | G2 (before any `live`) | Is the stack safe **and fast** with real money? | Testnet round-trip, kill-switch drill, risk property tests, pilot in `simulate`, measured tick-to-order within the §5.2 budget | SPEC-0004/0006 checklists |
 | G3 (before scaling size) | Does realized edge match researched edge? | ≥ 7 days live at small size; realized vs expected within tolerance | Strategy spec |
 
@@ -164,3 +188,8 @@ The recorder depends only on M1 (market data), so it can start immediately.
 | Leg / legging risk | One side of a multi-market trade; the risk that one leg fills and the other doesn't. |
 | `observe` / `simulate` / `live` | Execution modes: no orders / signed but never sent / real orders. |
 | Recorder | The M3 process that stores raw market data for research and replay (SPEC-0008). |
+| HIP-3 stock perp | A perp on a builder-deployed dex that tracks a stock or index (e.g. `xyz:TSLA`). Trades 24/7; the real stock doesn't. |
+| Options positioning | What the options market is betting on: put/call volume and OI balance, skew, strikes with large OI ("walls"), implied volatility. |
+| finsnap | The owner's separate project (`../finsnap`) that collects options chains and computes positioning. A data source for this bot. |
+| Non-validator node | Our own copy of the Hyperliquid chain that follows the network without validating (SPEC-0009). |
+| PASS / MARGINAL / FAIL | Study verdicts against the APR target/floor and quality checks (SPEC-0008 §13.6). |

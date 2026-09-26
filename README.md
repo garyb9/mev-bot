@@ -2,8 +2,10 @@
 
 A **low-latency arbitrage / MEV-style trading system for Hyperliquid**, written
 in Rust (HyperCore first, HyperEVM where it pays). Which arb we build is
-decided by recorded data, not preference. The original Ethereum Uniswap V2 bot
-is retired under [`legacy/`](legacy/).
+decided by recorded data, not preference. A second, slower strategy family
+uses options-market positioning to trade HIP-3 tokenized-stock perps and
+crypto bluechips. The original Ethereum Uniswap V2 bot is retired under
+[`legacy/`](legacy/).
 
 **Start here:**
 
@@ -32,6 +34,7 @@ build order is the roadmap in [`docs/GOAL.md`](docs/GOAL.md). See [`specs/`](spe
 | [SPEC-0006](specs/SPEC-0006-deployment-observability-runbooks.md) | Deployment, observability & runbooks |
 | [SPEC-0007](specs/SPEC-0007-polymarket-parked.md) | Polymarket (parked) |
 | [SPEC-0008](specs/SPEC-0008-recorder-and-opportunity-research.md) | Market-data recorder & opportunity research (M3) |
+| [SPEC-0009](specs/SPEC-0009-own-node.md) | Own Hyperliquid non-validator node (M3.5, later) |
 
 ## Workspace
 
