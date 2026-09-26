@@ -13,8 +13,8 @@ use mev_core::error::{Error, Result};
 use smallvec::SmallVec;
 
 use crate::types::{
-    AssetCtxLite, BOOK_DEPTH, BookSnapshot, CoinId, CoinRegistry, ConnId, Level, MarketUpdate,
-    Side, Stamp, Trade,
+    AccountUpdate, AssetCtxLite, BOOK_DEPTH, BookSnapshot, Cloid, CoinId, CoinRegistry, ConnId,
+    Level, MarketUpdate, Side, Stamp, Trade, VenueOrderStatus,
 };
 
 /// The set of coins an ingest connection is responsible for.
@@ -260,6 +260,196 @@ fn decode_ctx(text: &str, coins: &IngestCoins, stamp: Stamp) -> Result<Option<Ma
     }))
 }
 
+/// Decode one account-channel text frame into [`AccountUpdate`]s.
+///
+/// Yields zero or more updates: `orderUpdates` and `userEvents.fills` are
+/// batches, while a `userFills` snapshot produces one update per fill. Channels
+/// the engine does not model here (non-user cancels, liquidations) are counted
+/// but otherwise skipped; E-8 decides how to route them.
+pub fn decode_account(text: &str, coins: &IngestCoins, stamp: Stamp) -> Result<Vec<AccountUpdate>> {
+    let tag: ChannelTag<'_> =
+        serde_json::from_str(text).map_err(|e| Error::Decode(e.to_string()))?;
+    match tag.channel {
+        "orderUpdates" => {
+            let frame: OrderUpdatesFrame<'_> =
+                serde_json::from_str(text).map_err(|e| Error::Decode(e.to_string()))?;
+            Ok(frame
+                .data
+                .iter()
+                .filter_map(|order| order_update(order, coins, stamp))
+                .collect())
+        }
+        "userFills" => {
+            let frame: UserFillsFrame =
+                serde_json::from_str(text).map_err(|e| Error::Decode(e.to_string()))?;
+            Ok(frame
+                .data
+                .fills
+                .iter()
+                .filter_map(|fill| fill_update(fill, coins, stamp))
+                .collect())
+        }
+        "user" => {
+            let frame: UserEventFrame =
+                serde_json::from_str(text).map_err(|e| Error::Decode(e.to_string()))?;
+            let mut out = Vec::new();
+            if let Some(fills) = &frame.data.fills {
+                out.extend(
+                    fills
+                        .iter()
+                        .filter_map(|fill| fill_update(fill, coins, stamp)),
+                );
+            }
+            if let Some(funding) = &frame.data.funding
+                && let Some(coin) = coins.id(&funding.coin)
+            {
+                out.push(AccountUpdate::Funding {
+                    stamp,
+                    coin,
+                    usdc: funding.usdc,
+                });
+            }
+            Ok(out)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OrderUpdatesFrame<'a> {
+    #[serde(borrow)]
+    data: Vec<WireWsOrder<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireWsOrder<'a> {
+    #[serde(borrow)]
+    order: WireBasicOrder<'a>,
+    #[serde(borrow)]
+    status: &'a str,
+    #[serde(default)]
+    status_timestamp: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireBasicOrder<'a> {
+    #[serde(borrow)]
+    coin: &'a str,
+    /// Side (`B`/`A`); parsed by E-5's order manager, ignored here.
+    #[serde(borrow)]
+    _side: &'a str,
+    limit_px: rust_decimal::Decimal,
+    sz: rust_decimal::Decimal,
+    oid: u64,
+    orig_sz: rust_decimal::Decimal,
+    #[serde(default)]
+    cloid: Option<&'a str>,
+}
+
+fn order_update(
+    order: &WireWsOrder<'_>,
+    coins: &IngestCoins,
+    stamp: Stamp,
+) -> Option<AccountUpdate> {
+    let coin = coins.id(order.order.coin)?;
+    let _ = coin; // CoinId is not carried on OrderUpdate; kept for validation.
+    let mut stamp = stamp;
+    stamp.ts_exch_ms = order.status_timestamp;
+    Some(AccountUpdate::OrderUpdate {
+        stamp,
+        cloid: order
+            .order
+            .cloid
+            .and_then(Cloid::from_hex)
+            .unwrap_or(Cloid([0; 16])),
+        oid: order.order.oid,
+        status: venue_status(order.status),
+        filled_sz: order.order.orig_sz - order.order.sz,
+        avg_px: order.order.limit_px,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct UserFillsFrame {
+    data: WireUserFills,
+}
+
+#[derive(serde::Deserialize)]
+struct WireUserFills {
+    #[serde(default)]
+    fills: Vec<WireFill>,
+}
+
+#[derive(serde::Deserialize)]
+struct UserEventFrame {
+    data: WireUserEvent,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireUserEvent {
+    #[serde(default)]
+    fills: Option<Vec<WireFill>>,
+    #[serde(default)]
+    funding: Option<WireFunding>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireFunding {
+    coin: String,
+    usdc: rust_decimal::Decimal,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireFill {
+    coin: String,
+    side: String,
+    px: rust_decimal::Decimal,
+    sz: rust_decimal::Decimal,
+    time: u64,
+    #[serde(default)]
+    oid: u64,
+    #[serde(default)]
+    fee: rust_decimal::Decimal,
+    #[serde(default)]
+    liquidation: Option<serde_json::Value>,
+}
+
+fn fill_update(fill: &WireFill, coins: &IngestCoins, stamp: Stamp) -> Option<AccountUpdate> {
+    let coin = coins.id(&fill.coin)?;
+    let mut stamp = stamp;
+    stamp.ts_exch_ms = fill.time;
+    Some(AccountUpdate::Fill {
+        stamp,
+        cloid: None,
+        oid: fill.oid,
+        coin,
+        side: parse_side(&fill.side),
+        px: fill.px,
+        sz: fill.sz,
+        fee: fill.fee,
+        liquidation: fill.liquidation.is_some(),
+    })
+}
+
+/// Map a venue order status string to a typed [`VenueOrderStatus`].
+pub fn venue_status(status: &str) -> VenueOrderStatus {
+    match status {
+        "open" | "resting" => VenueOrderStatus::Resting,
+        "filled" => VenueOrderStatus::Filled,
+        "partiallyFilled" => VenueOrderStatus::PartiallyFilled,
+        "canceled" | "scheduledCancel" => VenueOrderStatus::Cancelled,
+        "rejected" => VenueOrderStatus::Rejected,
+        _ if status.ends_with("Canceled") => VenueOrderStatus::Cancelled,
+        _ if status.ends_with("Rejected") => VenueOrderStatus::Rejected,
+        _ => VenueOrderStatus::Other,
+    }
+}
+
 /// Parse the venue side (`B`/`A`) into a [`Side`].
 pub fn parse_side(side: &str) -> Side {
     if side.eq_ignore_ascii_case("B") {
@@ -287,9 +477,14 @@ impl Ingest {
         }
     }
 
-    /// Decode a text frame at `stamp`.
+    /// Decode a market text frame at `stamp`.
     pub fn decode(&self, text: &str, stamp: Stamp) -> Result<Option<MarketUpdate>> {
         decode_market(text, &self.coins, self.conn, stamp)
+    }
+
+    /// Decode an account text frame into zero or more [`AccountUpdate`]s.
+    pub fn decode_account(&self, text: &str, stamp: Stamp) -> Result<Vec<AccountUpdate>> {
+        decode_account(text, &self.coins, stamp)
     }
 
     /// The coins this ingester resolves.
@@ -441,6 +636,86 @@ mod tests {
             ingester()
                 .decode(r#"{"channel":"error","data":"bad"}"#, Stamp::default())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn decodes_order_updates_into_account_events() {
+        let frame = r#"{"channel":"orderUpdates","data":[
+            {"order":{"coin":"BTC","side":"B","limitPx":"60000","sz":"0.5","oid":42,
+              "timestamp":1,"origSz":"1.0","cloid":"0x00000000deadbeef0000000000000001"},
+             "status":"open","statusTimestamp":99}]}"#;
+        let updates = ingester().decode_account(frame, Stamp::default()).unwrap();
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            AccountUpdate::OrderUpdate {
+                cloid,
+                oid,
+                status,
+                filled_sz,
+                ..
+            } => {
+                assert_eq!(oid, &42);
+                assert_eq!(status, &VenueOrderStatus::Resting);
+                assert_eq!(filled_sz, &ds("0.5")); // orig 1.0 - remaining 0.5
+                assert_eq!(cloid.to_hex(), "0x00000000deadbeef0000000000000001");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_user_fills_batch() {
+        let frame = r#"{"channel":"userFills","data":{"isSnapshot":false,"user":"0xabc","fills":[
+            {"coin":"BTC","px":"60000","sz":"0.01","side":"B","time":7,
+             "closedPnl":"0","oid":42,"crossed":true,"fee":"0.27","tid":7,"dir":"Open Long"}]}}"#;
+        let updates = ingester().decode_account(frame, Stamp::default()).unwrap();
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            AccountUpdate::Fill {
+                coin,
+                side,
+                px,
+                sz,
+                fee,
+                liquidation,
+                ..
+            } => {
+                assert_eq!(coin, &CoinId(0));
+                assert_eq!(side, &Side::Buy);
+                assert_eq!(px, &ds("60000"));
+                assert_eq!(sz, &ds("0.01"));
+                assert_eq!(fee, &ds("0.27"));
+                assert!(!liquidation);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_user_events_funding() {
+        let frame = r#"{"channel":"user","data":{"funding":{
+            "time":5,"coin":"ETH","usdc":"-0.5","szi":"2","fundingRate":"0.00001"}}}"#;
+        let updates = ingester().decode_account(frame, Stamp::default()).unwrap();
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            AccountUpdate::Funding { coin, usdc, .. } => {
+                assert_eq!(coin, &CoinId(1)); // ETH
+                assert_eq!(usdc, &ds("-0.5"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_coins_in_account_events_are_skipped() {
+        let frame = r#"{"channel":"userFills","data":{"fills":[
+            {"coin":"DOGE","px":"1","sz":"1","side":"B","time":1,"fee":"0","oid":1}]}}"#;
+        assert!(
+            ingester()
+                .decode_account(frame, Stamp::default())
+                .unwrap()
+                .is_empty()
         );
     }
 
