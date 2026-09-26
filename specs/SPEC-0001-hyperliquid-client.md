@@ -134,7 +134,7 @@ pub trait MarketStream {
 |---|---|---|
 | A | `hyperliquid_rust_sdk` 0.6 | Official; pulls deprecated `ethers 2.x` + `tokio-tungstenite 0.20` |
 | B | `mev-hl-client` custom | Alloy + `fastwebsockets` + `rmp-serde` |
-| C | Alloy-native community SDK | e.g. `hypersdk`; **optional, time-boxed** — only pursued if the custom path stalls |
+| C | Alloy-native community SDK | e.g. `hypersdk`; **included** — keep/drop decided post-evaluation on measured performance, data, and usability |
 
 **Method (`criterion` + a WS load harness, fixed hardware, ≥3 runs)**
 
@@ -144,7 +144,7 @@ pub trait MarketStream {
 4. **Reconnect:** time from forced socket drop to resumed fresh state.
 5. **Footprint:** binary size, `cargo tree` size, compile time, memory.
 
-**Decision rule:** any candidate that is incorrect (signature/rounding mismatch) is disqualified. Among correct candidates, pick the fastest p99 on (1)–(3); tie-break on dependency hygiene (no `ethers`) then maintenance. Result recorded in `specs/decisions/0001-hl-client-backend.md`.
+**Decision rule:** any candidate that is incorrect (signature/rounding mismatch) is disqualified. Among correct candidates, pick the fastest p99 on (1)–(3); tie-break on dependency hygiene (no `ethers`) then maintenance. All three candidates are benchmarked (integration time is not a constraint); whether to retain the community SDK is decided after the spike on measured performance, data quality, and usability. Result recorded in `specs/decisions/0001-hl-client-backend.md`.
 
 **Anti-goal:** don't optimize to a specific vendor prematurely — the trait boundary keeps the choice reversible.
 
@@ -174,6 +174,6 @@ Metrics: msgs/sec per channel, decode latency histogram, book staleness seconds,
 1. **Watchlist** — start with bluechips (`BTC`, `ETH`, `SOL`) and a persisted, CLI-editable watchlist; adding markets later is data-only. CLI supports list/search/select/watch/run (`observe` default).
 2. **Mark/funding source** — `activeAssetCtx` is the primary source of truth (it carries funding); `fastAssetCtxs` is an optional latency supplement for mark/mid only, added later if measured lag justifies it.
 3. **Heartbeat** — 30 s application ping + pong check, plus a per-feed data watchdog; record the observed server idle-close window in the decision log.
-4. **Benchmark candidates** — custom vs official is the core comparison; the Alloy-native community SDK is an optional, time-boxed third candidate.
+4. **Benchmark candidates** — all three are benchmarked (custom, official, Alloy-native community SDK); integration time is not a constraint. Retention of the community SDK is decided after the spike on measured performance, data, and usability.
 
 Remaining to verify empirically (no open product question): exact server idle-close interval and the `fastAssetCtxs` lag delta.
