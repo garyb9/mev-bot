@@ -732,8 +732,8 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | V-11 | Choose a real-time US equities data provider (owner approves) | T1 | S | — | ☐ |
 | V-12 | HIP-3 stock-perp mechanics (oracle in/out of hours, funding, fees, leverage, halts) | T1 | S | — | ☐ |
 | V-13 | Historical options data: vendors, coverage, cost; owner decides whether to buy | T3-data | S | V-9 | ☐ |
-| R-1 | `mev-recorder` crate skeleton + envelope types | T1 | S | — | ☐ |
-| R-2 | Segment writer (zstd, rotation, manifest, crash recovery, disk guard) | T1 | M | R-1 | ☐ |
+| R-1 | `mev-recorder` crate skeleton + envelope types | T1 | S | — | ✅ |
+| R-2 | Segment writer (zstd, rotation, manifest, crash recovery, disk guard) | T1 | M | R-1 | ✅ |
 | R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | **T0** | M | — | ✅ |
 | R-4 | Subscription planner + universe selectors | T1 | M | R-1 | ☐ |
 | R-5 | HL REST snapshotter with weight budget (incl. candle backfill) | T1 | M | R-1, R-2 | ☐ |
@@ -854,6 +854,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Do:** Implement `SegmentWriter`: a dedicated OS thread (same pattern as `mev_core::db::writer::DbWriter`) that receives envelopes over a bounded `sync_channel` (capacity configurable, default 65 536), writes `segment_open` first, compresses with `zstd` (add the `zstd` crate to workspace deps), flushes every ≤ 5 s, and rotates per §6 (hour boundary or 1 GiB raw). Finalize and write the manifest per §6. Crash recovery for `.partial` per §6. Disk guard per §6. Expose `try_send(env) -> bool`; on `false` the **caller** increments `hl_rec_dropped_total` and sends a `gap_start{reason:"drop"}` as soon as the channel accepts again.
 - **Tests (tempdir):** rotation at an hour boundary using an injected clock; rotation on size; the manifest line matches the file; a `.partial` left from a simulated crash becomes `.crashed` on restart; records written ≡ records read back (with R-7's reader, or a minimal decoder in the test).
 - **Done when:** tests pass; a benchmark note in the commit message shows ≥ 50k envelopes/s written on the dev machine.
+- **Implemented (2026-09-27, R-1 + R-2):** `crates/mev-recorder` with `envelope.rs` (`Envelope`, `Kind`, `SegmentOpenMeta`, `EnvelopeClock`/`MonoClock`/`SystemEnvelopeClock`/`FixedEnvelopeClock`) and `segment.rs` (`SegmentWriter`, `SegmentConfig`, `DiskSpace`/`SystemDiskSpace` over `statvfs`). The writer is one OS thread per `(src, conn)` on a bounded `sync_channel` (default 65 536), zstd level 3, rotates on UTC hour or 1 GiB raw, finalizes/manifests/fsyncs, and recovers `.partial` → `.crashed`. Throughput measured in the test binary: ~295k envelopes/s (debug, 100k envelopes in 338.6 ms) ≥ the 50k target. New workspace deps: `zstd` (compression), `thiserror` (typed errors), `libc` (`statvfs` free space). Open questions recorded in §17 (#8–#10): writer-originated `seq`, `records`/`bytes_raw` scope relative to `segment_close`, and the disk guard being per-stream until R-6's multi-stream coordinator exists.
 
 #### R-3 — `RawWsConn`
 - **Do:** Implement §7.5 in `crates/mev-hl-client/src/raw_ws.rs`. Make the URL, subscribe payloads, and keepalive message pluggable via a small `Protocol` trait (HL / Binance / Bybit implementations come later; ship HL now). Rebuild `WsMarketStream` on top of `RawWsConn` (it decodes the `Text` events with the existing `decode`). Add `rand` for jitter if it's not already present.
@@ -999,3 +1000,6 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 5. **Maker-leg variants** (fill-probability modeling) are deferred until a taker-taker study looks promising.
 6. **Historical options data** (V-13). Buying past option chains lets O9a test years of history now. The owner decides after V-13 shows finsnap's existing coverage and vendor prices.
 7. **Directional risk limits.** O9/O10 Part B strategies carry market risk that the arb strategies don't; if one passes, SPEC-0004 needs per-strategy stop-loss and volatility-scaled sizing before it goes live.
+8. **Writer-originated `seq` (R-1/R-2).** §5.1 defines `seq` as the per-`conn` data counter, but `segment_open`/`segment_close` are produced by the writer, not the caller. The writer currently stamps `segment_open.seq` from the first data envelope and `segment_close.seq` from the last, so a naive hole detector sees no downward jump. Confirm this is the intended reading.
+9. **`records`/`bytes_raw` scope (R-2).** §6 lists `records`/`bytes_raw` without saying whether they include the `segment_close` line. Current choice: `segment_close.meta` counts lines **before** close; the manifest's `records` counts **total file lines including close** (so `records` equals the decoded line count).
+10. **Per-stream disk guard (R-2).** §6 says stop the "lowest-priority streams"; with one `SegmentWriter` per `(src, conn)` the guard stops only its own stream and emits `gap_start{reason:"disk"}`. A cross-stream coordinator (priority ordering) lands with R-6.

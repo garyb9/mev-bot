@@ -7,6 +7,7 @@ members = [
     "crates/mev-hl-client",
     "crates/mev-hyperevm",
     "crates/mev-metrics",
+    "crates/mev-recorder",
     "crates/mev-risk",
     "crates/mev-strategy",
 ]
@@ -24,6 +25,7 @@ mev-engine = { path = "crates/mev-engine" }
 mev-hl-client = { path = "crates/mev-hl-client" }
 mev-hyperevm = { path = "crates/mev-hyperevm" }
 mev-metrics = { path = "crates/mev-metrics" }
+mev-recorder = { path = "crates/mev-recorder" }
 mev-risk = { path = "crates/mev-risk" }
 mev-strategy = { path = "crates/mev-strategy" }
 
@@ -34,6 +36,9 @@ alloy-sol-types = "1"
 k256 = "0.13"
 rmp-serde = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
+thiserror = "2"
+libc = "0.2"
+zstd = "0.13"
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
