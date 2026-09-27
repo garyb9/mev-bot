@@ -252,21 +252,21 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
                 None
             };
             let records_on_disk = if exists {
-                Some(read_envelopes(&path)?.len() as u64)
+                let envelopes = read_envelopes(&path)?;
+                let acc = coverage
+                    .entry((entry.src.clone(), entry.conn.clone()))
+                    .or_default();
+                acc.start_segment();
+                for env in &envelopes {
+                    acc.observe(env);
+                }
+                acc.end_segment();
+                Some(envelopes.len() as u64)
             } else {
                 None
             };
             let size_ok = bytes_zst_on_disk == Some(entry.bytes_zst);
             let records_ok = entry.crashed || records_on_disk == Some(entry.records);
-
-            if exists {
-                let acc = coverage
-                    .entry((entry.src.clone(), entry.conn.clone()))
-                    .or_default();
-                for env in read_envelopes(&path)? {
-                    acc.observe(&env);
-                }
-            }
 
             report.files.push(FileCheck {
                 file: entry.file,
@@ -385,16 +385,42 @@ fn channel_of(env: &Envelope) -> String {
 
 #[derive(Default)]
 struct CoverageAcc {
+    /// `[first_t_ns, last_t_ns]` of every segment file observed for the stream.
+    ///
+    /// Coverage is the union of these intervals (SPEC-0008 §5.3): the time
+    /// between two segments is *not* covered, so a crash and a restart hours
+    /// later show as an outage. A segment that lacks `segment_close` (a crash)
+    /// simply ends its interval at its last record.
+    segments: Vec<(i64, i64)>,
+    /// Paired `gap_start`/`gap_end` intervals, across segment files.
+    gaps: Vec<(i64, i64)>,
+    /// A `gap_start` still awaiting its `gap_end`.
+    open_gap: Option<i64>,
+    /// Bounds of the records in the segment file currently being read.
+    seg_min: Option<i64>,
+    seg_max: Option<i64>,
+    /// Bounds over every record, used to close an unpaired gap conservatively.
     min_t_ns: Option<i64>,
     max_t_ns: Option<i64>,
-    open_gap: Option<i64>,
-    gaps: Vec<(i64, i64)>,
 }
 
 impl CoverageAcc {
+    /// Begin observing a new segment file.
+    fn start_segment(&mut self) {
+        self.seg_min = None;
+        self.seg_max = None;
+    }
+
+    /// Record one envelope of the current segment file.
     fn observe(&mut self, env: &Envelope) {
         self.min_t_ns = Some(self.min_t_ns.map_or(env.t_ns, |t| t.min(env.t_ns)));
         self.max_t_ns = Some(self.max_t_ns.map_or(env.t_ns, |t| t.max(env.t_ns)));
+        // The writer's own bookkeeping lines are not coverage; only the records
+        // a source produced (frames, REST bodies, gaps, …) define the span.
+        if !matches!(env.kind, Kind::SegmentOpen | Kind::SegmentClose) {
+            self.seg_min = Some(self.seg_min.map_or(env.t_ns, |t| t.min(env.t_ns)));
+            self.seg_max = Some(self.seg_max.map_or(env.t_ns, |t| t.max(env.t_ns)));
+        }
         match env.kind {
             Kind::GapStart => self.open_gap = Some(env.t_ns),
             Kind::GapEnd => {
@@ -406,16 +432,24 @@ impl CoverageAcc {
         }
     }
 
+    /// Close the current segment file, adding its interval to the union.
+    fn end_segment(&mut self) {
+        if let Some(interval) = self.seg_min.zip(self.seg_max) {
+            self.segments.push(interval);
+        }
+    }
+
     fn covered_ms(&mut self, day_start: i64, day_end: i64) -> u64 {
+        // An unpaired `gap_start` is closed conservatively at the last record
+        // seen on the stream. How a `drop` gap ends has no specified rule yet
+        // (SPEC-0008 §17 open question); until then, marking the remainder
+        // missing is the safe reading.
         if let Some(start) = self.open_gap.take()
             && let Some(max) = self.max_t_ns
         {
             self.gaps.push((start, max));
         }
-        let Some((min, max)) = self.min_t_ns.zip(self.max_t_ns) else {
-            return 0;
-        };
-        let spans = clip(vec![(min, max)], day_start, day_end);
+        let spans = clip(std::mem::take(&mut self.segments), day_start, day_end);
         let gaps = clip(std::mem::take(&mut self.gaps), day_start, day_end);
         let covered: i64 = subtract(&spans, &gaps)
             .into_iter()
@@ -503,7 +537,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::envelope::{Envelope, FixedEnvelopeClock};
-    use crate::segment::{SegmentConfig, SegmentWriter};
+    use crate::segment::{ManifestEntry, SegmentConfig, SegmentWriter};
 
     use super::*;
 
@@ -532,6 +566,65 @@ mod tests {
         (0..10)
             .map(|i| Envelope::frame(&clock, "hl-ws", "hl-ws-01", i, format!("payload-{i}")))
             .collect()
+    }
+
+    /// Write a synthetic `.jsonl.zst` (or `.crashed`) segment and its manifest
+    /// line, so `verify` has something to inspect without a running writer.
+    #[allow(clippy::too_many_arguments)]
+    fn write_segment(
+        out_dir: &Path,
+        src: &str,
+        conn: &str,
+        date: &str,
+        start_t_ns: i64,
+        envelopes: &[Envelope],
+        crashed: bool,
+    ) {
+        let dir = out_dir.join("testnet").join(src).join(date).join("00");
+        fs::create_dir_all(&dir).unwrap();
+        let ext = if crashed {
+            "jsonl.zst.crashed"
+        } else {
+            "jsonl.zst"
+        };
+        let path = dir.join(format!("{conn}-{start_t_ns}.{ext}"));
+        let lines: Vec<String> = envelopes
+            .iter()
+            .map(|env| serde_json::to_string(env).unwrap())
+            .collect();
+        let bytes = zstd_frame(&lines);
+        fs::write(&path, &bytes).unwrap();
+
+        let entry = ManifestEntry {
+            file: path
+                .strip_prefix(out_dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/"),
+            src: src.into(),
+            conn: conn.into(),
+            first_t_ns: start_t_ns,
+            last_t_ns: envelopes.last().map(|env| env.t_ns).unwrap_or(start_t_ns),
+            records: if crashed { 0 } else { envelopes.len() as u64 },
+            bytes_raw: 0,
+            bytes_zst: bytes.len() as u64,
+            crashed,
+        };
+        let manifest = out_dir
+            .join("testnet")
+            .join(src)
+            .join(date)
+            .join("manifest.jsonl");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let mut text = serde_json::to_string(&entry).unwrap();
+        text.push('\n');
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&manifest)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
     }
 
     #[test]
@@ -676,6 +769,105 @@ mod tests {
         assert_eq!(file.records_manifest, 22);
         assert_eq!(report.coverage.len(), 1);
         assert!(report.coverage[0].coverage_pct > 0.0);
+    }
+
+    #[test]
+    fn coverage_shows_crash_and_late_restart_as_missing() {
+        let dir = temp_dir("coverage-crash");
+        let base = 1_767_227_400_000_000_000i64; // 2026-01-01T00:30:00Z
+        let clock = FixedEnvelopeClock::new(base, 0);
+
+        // A crashed segment covering 60 s, then a clean segment starting 3 h
+        // later. The 3 h in between must not count as covered.
+        clock.set_t_ns(base);
+        let crashed_first = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "a");
+        clock.set_t_ns(base + 60_000_000_000);
+        let crashed_last = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "b");
+
+        let restart = base + 3 * 3_600_000_000_000;
+        clock.set_t_ns(restart);
+        let clean_first = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "c");
+        clock.set_t_ns(restart + 60_000_000_000);
+        let clean_last = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "d");
+
+        write_segment(
+            &dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            base,
+            &[crashed_first, crashed_last],
+            true,
+        );
+        write_segment(
+            &dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            restart,
+            &[clean_first, clean_last],
+            false,
+        );
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir,
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert_eq!(report.coverage.len(), 1);
+        // 60 s before the crash + 60 s after the restart, not the whole 4 minutes.
+        assert_eq!(report.coverage[0].covered_ms, 120_000);
+        assert!(
+            report.coverage[0].coverage_pct < 1.0,
+            "outage was counted as covered"
+        );
+    }
+
+    #[test]
+    fn back_to_back_clean_segments_show_full_coverage() {
+        let dir = temp_dir("coverage-full");
+        let (day_start, day_end) = day_bounds("2026-01-01").unwrap();
+        let mid = day_start + 43_200_000_000_000; // 12:00:00Z
+        let clock = FixedEnvelopeClock::new(day_start, 0);
+
+        clock.set_t_ns(day_start);
+        let a_first = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "a");
+        clock.set_t_ns(mid);
+        let a_last = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "b");
+        clock.set_t_ns(mid);
+        let b_first = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "c");
+        clock.set_t_ns(day_end);
+        let b_last = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "d");
+
+        write_segment(
+            &dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            day_start,
+            &[a_first, a_last],
+            false,
+        );
+        write_segment(
+            &dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            mid,
+            &[b_first, b_last],
+            false,
+        );
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir,
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert_eq!(report.coverage.len(), 1);
+        assert_eq!(report.coverage[0].covered_ms, report.coverage[0].day_ms);
+        assert_eq!(report.coverage[0].coverage_pct, 100.0);
     }
 
     #[test]
