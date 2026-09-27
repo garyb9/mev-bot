@@ -129,6 +129,10 @@ Reads (via `InfoApi`): `clearinghouseState` (positions/margin), `spotClearinghou
 
 - Reconcile on startup and periodically; the executor never assumes a fill without either a stream `orderUpdates`/`userFills` event or an `orderStatus` check.
 - Open orders and positions are the source of truth for risk (SPEC-0004).
+- **Verified 2026-09-27** ([Info endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint), [WS subscriptions](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions)):
+  - `userFills` returns at most **2000** most recent fills; only the **10000** most recent are queryable. The WS `userFills` first message is a snapshot (`isSnapshot: true`) and later messages stream. The engine's seen-`tid` bound (8192) holds a full snapshot with margin (task A).
+  - A wire fill (`WsFill`) carries **no `cloid`** in the official schema, only `oid` and `tid`; fills are therefore mapped to orders by `oid` (task A). An optional `cloid` appears on some SDK types but cannot be relied on.
+  - `tid` is the unique venue trade id (a 50-bit hash of the buyer/seller order ids); `(block_time, coin, tid)` is globally unique, so `tid` is the de-duplication key.
 
 ## 12. Modes, autonomy & safety
 
@@ -145,6 +149,10 @@ Orthogonal to the mode above; applies only in `live`.
 - `HL_AUTONOMY=auto` (**default**): the engine submits trades on its own once risk checks pass. Required for an unattended trading/MEV bot.
 - `HL_AUTONOMY=confirm`: the engine emits a proposed trade and waits for explicit human approval (CLI/TTY or an approval channel) before submitting. For supervised/manual runs and debugging.
 - Every decision/approval is logged with the sizing rationale; `auto` never bypasses risk limits (SPEC-0004).
+
+### `expiresAfter`
+
+**Verified 2026-09-27** ([Exchange endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint)): some L1 actions accept an optional `expiresAfter` (timestamp in **milliseconds**) after which the action is rejected; user-signed actions (e.g. Core USDC transfer) do not. An action rejected because `expiresAfter` went stale consumes **5x** the usual address-based rate limit. `hl` does not set it yet: `WriteCore::with_expires_after` takes one fixed absolute value applied to every action, so it needs a per-action TTL (prepared-at + TTL) before use — recorded as §18 item 3.
 
 ### Dead-man's switch (`scheduleCancel`)
 
@@ -225,3 +233,4 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 
 1. H-4 default TTL (120 s) vs strategy needs; market-making may want a shorter TTL with more budget.
 2. ~~`OrderStatusResponse` … must correct the type …~~ **Resolved by H-2 (2026-09-26):** the type is now nested (`OrderStatusOrder`) and exposes `resolution() -> OrderResolution` with `Resting`/`Filled`/`Triggered`/`Cancelled`/`Rejected`/`NotFound`/`Other`.
+3. **Per-action `expiresAfter` for a definitive "not placed".** `hl` currently bounds `orderStatus` retries with capped backoff and then resolves a never-seen order as `Rejected` (task B). Setting a per-action `expiresAfter` (prepared-at + TTL) would make "not found after `expiresAfter` + margin" definitive; the current `WriteCore::with_expires_after` cannot (one fixed absolute value per client). Needs a TTL surface in `WriteCore`/config. Semantics are verified in §12 (2026-09-27).
