@@ -366,7 +366,7 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 | E-4 | Strategy API v2 (sync) + port `FundingBasis` and `MarketMaker` | M | E-3 | ✅ |
 | E-5 | Order manager + state machine (§10), cloid assignment, in-flight exposure | M | E-3 | ✅ |
 | E-6 | Build/batch/sign on the engine thread + `WsExec` backend (§12) incl. `TCP_NODELAY`, aggressive-price rule, rate budgets | M | E-5, SPEC-0002 H-1, H-2 | 🔄 |
-| E-7 | `PaperExec` backend + `hl replay` over recorder segments; determinism test | M | E-5, SPEC-0008 R-7 | 🔄 |
+| E-7 | `PaperExec` backend + `hl replay` over recorder segments; determinism test | M | E-5, SPEC-0008 R-7 | ✅ |
 | E-8 | Account stream + reconciler integration; delete `account_poller` | M | E-5, SPEC-0002 H-3 | 🔄 |
 | E-9 | Hot-path risk integration (§11) with SPEC-0004 K-tasks | M | E-5, SPEC-0004 K-1, K-2, K-3 | ✅ |
 | E-10 | Latency stamps, histograms, benches incl. zero-alloc (§17) | M | E-6 | ✅ |
@@ -422,7 +422,34 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 
 **E-7 implemented, part 1 (2026-09-26) — `PaperExec` + latency + determinism.** `mev-engine/src/paper_exec.rs`: `PaperOrder`, `PaperConfig` (`latency_ms` default 20, `maker_fills` default true), and `PaperExec`, which matches takers at their `now_ms + latency_ms` deadline and fills resting ALO orders only after a later book crosses their limit (also latency-delayed), emitting `AccountUpdate::OrderUpdate`/`Fill` exactly as the live account stream would. `paper_orders_from_post`/`paper_cancels_from_post` convert a built `UnsignedPost` into paper orders/cancels (it takes the `AssetTable` because `OrderWire` carries numeric asset ids, not coins). A determinism test drives `MarketMaker` + `PaperExec` twice over a fixed, clock-free, random-free sequence and asserts identical action logs and account updates (FNV-1a fingerprint); latency-model tests cover the taker deadline, the resting cross, post-only rejection, and cancel.
 
-**E-7 blocked half (2026-09-26).** The `hl replay`-over-recorder-segments half and its "byte-identical action log from a fixture segment" done-when **depend on SPEC-0008 R-7 (`mev-recorder` segment reader), whose dependencies R-1 and R-2 are also unstarted and whose crate does not exist**. Per AGENTS.md §4 this dependency is unmet, so the segment-replay path and the `hl replay --from…--to…` CLI are not built here. Once R-1/R-2/R-7 land, E-7 part 2 wires the same ingest decoders and `PaperExec` over the reader with a `ReplayClock` (SPEC-0010 §13/§14). Until then, deterministic replay of the SQLite `Event` log remains available via the legacy `mev-bot` replay path.
+**E-7 implemented, part 2 (2026-09-27) — `hl replay` over recorder segments.**
+- `mev-engine/src/clock.rs`: `EngineClock` with `LiveClock` and `ReplayClock`;
+  injected into `StrategyDispatcher` and `EngineLoop` (`with_clock`). All engine
+  time (paper latency, risk rate budget) now goes through it, and a dirty coin
+  is dispatched with the stamp of the update that marked it dirty, so
+  `ctx.now.t_recv_ns` is the real event time (it was always 0 before).
+- `CloidAssigner::with_prefix` pins the cloid prefix for `simulate`/`replay`
+  (G-6); live keeps the random default.
+- Interest-driven repeating timers: `Interests::timers_ms` is now scheduled on
+  the loop's heap at the first iteration, routed to the owning strategy via
+  `Dispatcher::on_timer_registered`, and re-armed at the next period after now.
+- `mev-engine/src/journal.rs`: an optional `ActionSink` records every
+  risk-approved action and every fill; `SharedSink` is the inspectable sink.
+  Live leaves it `None`.
+- `mev-recorder::reader::segments_for` enumerates `.jsonl.zst` (and `.crashed`)
+  files for an inclusive UTC date range.
+- `mev-bot/src/replay.rs` + `hl replay --from/--to/--rec-dir/--out` drive
+  `EngineLoop<StrategyDispatcher>` + `PaperExec` over the merged segments with a
+  `ReplayClock`; `gap_start`/`gap_end` map to `MarketUpdate::Gap`. The SQLite
+  session path stays when `--from` is absent.
+- *Done when, verified:* `replay::tests::segment_replay_is_byte_identical_across_runs`
+  replays a fixture `l2Book` segment twice and asserts the journal files are
+  byte-identical; `dispatch::tests::replay_is_independent_of_wall_clock_delays`
+  drives the same event timeline twice, once with a wall-clock stall between
+  iterations, and asserts identical journals (the property that lets `simulate`
+  over live data and `replay` over the same window agree). The strict live
+  `FundingBasis`-vs-replay comparison still needs the recorder deployed (R-10)
+  to have a window recorded by a live `simulate` run.
 
 **E-8 — Account stream + reconciler.** Wire H-3 and the §15 reconciler. Delete `account_poller`. *Done when:* tests cover drift detection and correction, the account-gap halt/resume, and `Unknown` resolution through a mocked `orderStatus`.
 
@@ -463,7 +490,7 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 **E-13 remaining (post-E-13 review, 2026-09-27; items 1–2 are now T0).**
 1. **H-2 regression — T0 ([`docs/GOAL.md`](../docs/GOAL.md) §2.2 row 8), *fixed (2026-09-27, task B)*.** `submit_post` classifies a definitive failure (`Error::Exchange`/`NotSent`/local config) as `PostResult::Rejected` (terminal) and only `UnknownOutcome` as `Unknown`. A lost reply is reconciled by `cloid` with capped `orderStatus` retries in a spawned task; a found answer is applied only while the order is `Unknown` (via `AccountUpdate::ResolveUnknown` → `reconcile::resolve_unknown`), and a never-seen order is resolved `Rejected` after the bound (`AccountUpdate::UnknownExpired`). The `exec_error` breaker clears when no `Unknown` remains. No path resends an order.
 2. **H-3 account stream not wired in `hl` — T0 ([`docs/GOAL.md`](../docs/GOAL.md) §2.2 row 11).** The REST reconciler is the wired backstop and `AccountUpdate::Reconcile` carries only `account_value`/`margin_used`; positions and order-state drift are not applied. Live cancels without per-order statuses leave orders tracked as working until H-3 lands (SPEC-0002 H-3 / SPEC-0010 E-8).
-3. **Replay of new sessions** records market/reconcile events but no `Timer` events, so `hl replay` over a fresh session yields no intents; the v2 replay driver is E-7 part 2 (blocked on SPEC-0008 R-7).
+3. **Replay of new sessions** records market/reconcile events but no `Timer` events, so `hl replay` over a fresh session yielded no intents. *Fixed (2026-09-27, E-7 part 2):* the v2 driver replays recorder segments and the loop schedules `Interests::timers_ms` as repeating timers, so strategy timers fire on event time too. The SQLite `Event`-log replay path still carries only a `timer` row per decision cycle and is legacy.
 4. **Exec writer stalls — T0 ([`docs/GOAL.md`](../docs/GOAL.md) §2.2 row 9), *fixed (2026-09-27, task C)*.** `WsExchange` exposes a split `enqueue` (sign + write the frame in call order, return a `ReplyHandle`) and the `hl` exec writer polls a `FuturesUnordered` in `select!` alongside `rx.recv()`. Posts are signed and enqueued in order as they arrive; only the reply wait is concurrent, and a lost reply's recovery is a spawned task. A post arriving during an in-flight reply is enqueued immediately (measured ~2 ms by the mock-writer test, sub-ms in practice; `hl_exec_queue_seconds`) instead of waiting a round trip, and a lost reply no longer stalls later posts or the kill-switch cancel-all.
 5. **No kill-switch trigger — T0 ([`docs/GOAL.md`](../docs/GOAL.md) §2.2 row 10).** *Fixed (2026-09-27):* `hl run` has a 250 ms control task (SIGUSR1/SIGUSR2 + flag-file poll) that sends `Control::KillSwitch`/`Resume`; `hl panic`/`hl resume` maintain the flag file (`data/KILL`, `HL_KILL_FILE`). See SPEC-0004 K-3 part 2.
 6. **H-2 re-wire and H-3 stream (2026-09-27).** *Fixed in tasks A and B:* fills come from `userFills` only, are de-duplicated by `tid` (first-connect snapshot recorded but not applied, reconnect snapshot applies unseen tids), and map to their order by `oid` so they reach the owner (row 12); definitive post errors are terminal and a never-seen order resolves `Rejected` after bounded retries (row 13, item 1 above). **Still open:** the account-gap halt on the reconnect path (`AccountStreamState::on_gap` is not yet driven from `hl`) and applying position/open-order drift from the REST reconcile snapshot (E-8 remaining below).
@@ -511,7 +538,7 @@ row additionally needs a testnet round-trip; no host row is fabricated here.
 4. **Q-Layering (answered in E-4).** §8 puts the `Strategy` trait in `mev-strategy`, but its `Ctx`/`Action` name engine types (`CoinId`, `Cloid`, `MarketSlot`, `AccountState`) and `mev-engine` depends on `mev-strategy`. Resolved by putting the trait and the ported strategies in `mev-engine`; `mev-strategy` stays the venue-agnostic library. Revisit only if a non-engine consumer needs the trait.
 5. **Q-Sign-Placement (E-6).** Does signing happen on the engine thread (§12, engine-owned `NonceManager`, agent signer inside `mev-engine`) or in the exec layer (part 1, keeps the key out of the engine crate)? Decision inputs: the sign budget (p50 ≤ 150 µs, §17), the AGENTS rule that only SPEC-0002 code holds the signer, and §23 Q3 (a second pinned signing thread). Decide in E-10 once sign latency is measured.
 6. **Q-BatchModify (E-6).** Exact `batchModify` wire fields need a source; until then `Action::Modify` is dropped by the builder (E-6 open item 2) and MM cannot re-quote on the new engine.
-7. **Q-Replay-Gap (E-7).** E-7's recorder-segment replay needs SPEC-0008 R-7 (blocked on R-1/R-2, crate absent). Sequence the recorder tasks before E-7 part 2, or accept the interim SQLite-log replay.
+7. **Q-Replay-Gap (E-7) — resolved 2026-09-27.** R-1/R-2/R-7 landed, so E-7 part 2 built the recorder-segment driver and `hl replay --from … --to … --out actions.jsonl` (see the E-7 note above). The SQLite-log replay remains for recorded `simulate`/`live` sessions.
 8. **Q-Group-Risk (E-9).** SPEC-0004 K-2's group-worst-single-leg exposure rule and the SPEC-0011 `on_kill` residual path need the multi-leg group types, which do not exist yet; `RiskGate` returns `GroupUnsupported` for `Action::PlaceGroup`. Implement with SPEC-0011 L-tasks.
 9. **Q-Decode-Alloc (E-10).** The engine-side `Bbo` apply is 0 alloc/event (G-3 satisfied for the apply path), but `Ingest::decode` allocates 1×/event: `decode_market` pre-parses a borrowed channel tag, and `serde_json`'s ignored-value handling allocates once for the nested `data` shape. Fix by dispatching from one typed borrowed envelope or scanning the tag without `serde_json`. Also `replay_throughput` is ~649 k events/s (vs ≥1 M); both are E-12/E-11 inputs.
 10. **Q-Loop-Instrumentation (E-10/E-12).** `run.rs` now owns a `LatencyRecorder` and `StrategyDispatcher` fills the engine-side `Stamps` (decode/queue/decide/risk/sign spans) and records each iteration. `t_written`/`t_ack` (handoff/`tick_to_order`/`submit_ack`) stay unset until the exec layer reports them back (signing is off-thread, E-6), so those histograms are not yet emitted; the exec ack path fills them when the live exec writer lands (E-13).

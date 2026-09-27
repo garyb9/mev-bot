@@ -89,10 +89,10 @@ is open and its dependencies are met, the agent does it before any T1 task.
 
 Order: 6 (quick) and 1 + 2 first (small, and they touch the same files);
 then 3 → 4 → 5; 7 in parallel. Rows 8–13 were added in the post-E-13 reviews
-(2026-09-27). Rows 8 and 11 come first (a real order can be invisible to
+(2026-09-27). Rows 8 and 11 came first (a real order can be invisible to
 risk), then **12 and 13** (fills and stuck-`Unknown` orders), then 9, then
-10; **all before any testnet or live run**. New defects found in later
-reviews are added here.
+10. **All 13 rows are ✅ (2026-09-27)**, so the T0 lane is clear; new defects
+found in later reviews are added here.
 
 Strategy code for any tier waits for gate G1, or an owner-approved G1.5 pilot.
 The funding pilot (M4) is a stack-prover, not a tier. Strategy code, including
@@ -200,7 +200,7 @@ Spec numbers are **stable identifiers, not an order**. This table is the order.
 | M2 | Execution: signing, nonce, order builder, transports, dead-man switch | SPEC-0002 | ✅ done (testnet round-trip open) | M1 |
 | M2.5 | **Execution hardening + latency baseline**: concurrent WS post, account stream, mandatory `cloid`, dead-man policy, stream watchdog, tick-to-order instrumentation, sign/submit benchmarks | SPEC-0002 §17 | 🔄 H-1…H-4, H-9 ✅; H-5…H-8 open; H-10 (testnet round-trip) open | M2 |
 | **M3** | **Market-data recorder + opportunity research → ADR-0002** | **SPEC-0008** | ⏳ **now** (runs in parallel with M2.5) | M1 |
-| M4 | **Event-driven engine** + risk hardening + multi-leg execution; **funding-carry pilot** at small size | SPEC-0010, SPEC-0004 §16, SPEC-0011, SPEC-0003 (A) | 🔄 v2 event engine runs `hl` (E-13); E-6/E-7/E-8 remainders, K-tasks, SPEC-0011 open | M2.5, M3 recorder (for replay) |
+| M4 | **Event-driven engine** + risk hardening + multi-leg execution; **funding-carry pilot** at small size | SPEC-0010, SPEC-0004 §16, SPEC-0011, SPEC-0003 (A) | 🔄 v2 event engine runs `hl` (E-13); `hl replay` over recorder segments done (E-7); E-6/E-8 remainders, K-tasks, SPEC-0011 open | M2.5, M3 recorder (for replay) |
 | M3.5 | **Own non-validator node in Tokyo**: fastest data, local EVM RPC, richer data (fills, order statuses, L4 book) | SPEC-0009 | later (starts when its §2 triggers fire) | M3 recorder in production |
 | M5 | **First strategy**, the one chosen by ADR-0002 (arb, or the options-informed family if it ranks higher) | new spec, next free number (SPEC-0010+), written after ADR-0002 | planned | M3 gate, M4 |
 | M6 | Market-making | SPEC-0003 (B) | only if research supports it | M4 |
@@ -215,17 +215,17 @@ The recorder depends only on M1 (market data), so it can start immediately.
 
 Follow the tiers (§2.1):
 
-0. **T0 fix-first (§2.2), before anything else:** the four defects added in
-   the post-E-13 review (rows 8–11), then SPEC-0002 H-10 (testnet round-trip).
-   No testnet or live run until every §2.2 item is ✅.
-1. **T1: SPEC-0008 recorder** (R-4…R-7, then V-4/V-7, R-10) deployed to a
+0. **T0 fix-first (§2.2) is clear (2026-09-27).** Rows 1–13 are ✅; the only
+   remaining §2.2-adjacent item is SPEC-0002 H-10 (testnet round-trip, no
+   longer blocked by T0 but needs an owner-provided testnet key).
+1. **T1: SPEC-0008 recorder** (R-1…R-7 done; now V-4/V-7, R-10) deployed to a
    low-latency host, **and SPEC-0002 §17** remainder (H-5…H-8), in parallel.
    The recorder is the evidence pipeline and the clock for gate G1 (≥ 14 days
    of data).
 2. **T3-data, small and early:** V-9, V-10, V-13, R-11, R-12. Options
    history needs calendar time, so start its clock now.
-3. **T1 engine:** SPEC-0010 E-6/E-7/E-8 remainders, then SPEC-0011 L-tasks and
-   SPEC-0004 K-tasks. SPEC-0000 C-tasks are small and can run any time.
+3. **T1 engine:** SPEC-0010 E-6/E-8 remainders (E-7 done), then SPEC-0011 L-tasks
+   and SPEC-0004 K-tasks. SPEC-0000 C-tasks are small and can run any time.
 4. **T1 research:** P-1…P-5, then studies O1, O2, O3, O5, O8 (desk), O10
    A+D, O11 A.
 5. **T2** studies, then **T3** research once its gate opens. Everything ends
