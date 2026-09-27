@@ -142,7 +142,7 @@ Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path in
 |---|---|---|---|---|---|
 | K-1 | Fail-closed defaults: `live` refuses to start without explicit finite limits; conservative defaults for `simulate` | **T0** | S | — | ✅ |
 | K-2 | Exposure incl. in-flight orders (worst case), and group worst-single-leg exposure (SPEC-0011 §9) | T1 | M | SPEC-0010 E-5 | 🔄 |
-| K-3 | Kill switch: `SIGUSR1`, flag file, `hl panic`; cancel-all + halt; SPEC-0011 `on_kill` for residuals; sticky until cleared | T1 | M | SPEC-0010 E-3 | 🔄 |
+| K-3 | Kill switch: `SIGUSR1`, flag file, `hl panic`; cancel-all + halt; SPEC-0011 `on_kill` for residuals; sticky until cleared | T1 | M | SPEC-0010 E-3 | ✅ |
 | K-4 | Circuit breakers: daily loss, drawdown, reject-rate spike, nonce errors, stale feeds, reconciliation drift, exec backpressure | T1 | M | K-3, SPEC-0010 E-8 | 🔄 |
 | K-5 | Rate budgets as risk inputs: IP weight + address budget (`userRateLimit`); cancels always allowed above a hard floor | T1 | S | SPEC-0010 E-6 | ✅ |
 | K-6 | PnL & attribution: realized (fills, fees, funding, rebates), unrealized (mark), per strategy / coin / group, written via `DbWriter` | T1 | M | SPEC-0010 E-8, SPEC-0011 L-9 | ☐ |
@@ -159,7 +159,9 @@ Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path in
 
 **K-3 implemented, part 1 (2026-09-26, via SPEC-0010 E-9).** `mev-risk/src/kill.rs` ships the sticky `KillSwitch` (set/clear/is_active), the `check_flag_file(path)` helper (so a control task can poll `HL_KILL_FILE` off the hot path), and `cancel_all_cloids(&OrderManager)`; `RiskGate` checks the kill flag first and refuses all new places in one iteration. **Remaining (part 1):** the `SIGUSR1` handler and `hl panic`/`hl resume` CLI wiring, the 250 ms control-task file poll, and the `simulate` end-to-end test — scheduled with E-13's `mev-bot` cleanup.
 
-**K-3 implemented, part 2 (2026-09-27, `hl` wiring).** The 250 ms control task is live in `hl run`: it polls `config.kill_file` (default `data/KILL`, `HL_KILL_FILE` override), handles `SIGUSR1` (trip) and `SIGUSR2` (resume), and feeds `Control::KillSwitch`/`Control::Resume` through the lossless account channel. `hl panic` writes the flag file and `hl resume` removes it. **Remaining:** the `simulate` end-to-end test (all orders cancelled within one iteration of each trigger) and the SPEC-0011 `on_kill` residual path.
+**K-3 implemented, part 2 (2026-09-27, `hl` wiring).** The 250 ms control task is live in `hl run`: it polls `config.kill_file` (default `data/KILL`, `HL_KILL_FILE` override), handles `SIGUSR1` (trip) and `SIGUSR2` (resume), and feeds `Control::KillSwitch`/`Control::Resume` through the lossless account channel. `hl panic` writes the flag file and `hl resume` removes it. **Remaining:** the SPEC-0011 `on_kill` residual path.
+
+**K-3 done (2026-09-27, task D).** The control task, the account stream, and the exec writer moved to `crates/mev-bot/src/live.rs` with tests: a mock-WS account frame decodes to the expected `AccountUpdate`; creating the flag file sends `Control::KillSwitch`; `hl panic`/`hl resume` create/remove the file. The `simulate` end-to-end test (`dispatch::tests::simulate_kill_switch_cancels_all_and_places_none`) shows a kill cancels every working order and places nothing new within one iteration (the queued paper updates apply even while dispatch is halted).
 
 **K-4:** Each breaker has a threshold in config, a metric (`hl_breaker_trips_total{breaker}`), and a sticky state shown on `/healthz`. Default action: halt new places (cancels allowed). *Done when:* each breaker has a test that trips it.
 

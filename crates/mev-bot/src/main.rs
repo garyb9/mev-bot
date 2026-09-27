@@ -15,20 +15,19 @@ use std::{
 };
 
 mod engine;
+mod live;
 mod record;
 
 use anyhow::{Context as _, Result};
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
-use futures_util::{StreamExt, stream::FuturesUnordered};
 use mev_core::{
     clock::{Clock, SystemClock},
     config::{Config, ConfigOverrides, Mode, Network},
     db::{Db, writer::DbWriter},
 };
 use mev_engine::{
-    AccountUpdate, Cloid, CoinRegistry, Control, MarketUpdate, OrderAck, PostResult, Stamp,
-    StrategyDispatcher, VenueOrderStatus,
+    AccountUpdate, CoinRegistry, Control, MarketUpdate, Stamp, StrategyDispatcher,
     builder::AssetTable,
     channels::{
         ACCOUNT_CHANNEL_CAP, InputHandles, MARKET_CHANNEL_CAP, MarketSend, inputs, outbound,
@@ -43,14 +42,13 @@ use mev_engine::{
 };
 use mev_hl_client::{
     Action, AgentSigner, AssetMap, DeadMansSwitch, ExchangeApi, HlProtocol, HttpInfo, InfoApi,
-    Market, MarketKind, MarketSelector, MarketState, MarketStream, OrderParams, OrderStatus,
-    RawEvent, RawWsConn, StreamEvent, Subscription, Tif, Tolerance, WsExchange, WsMarketStream,
+    Market, MarketKind, MarketSelector, MarketState, MarketStream, OrderParams, RawEvent,
+    RawWsConn, StreamEvent, Subscription, Tif, Tolerance, WsExchange, WsMarketStream,
     build_order_wire, build_request, now_ms,
 };
 use mev_metrics::{health::Health, prometheus::PrometheusHandle};
 use mev_strategy::{AccountView, FeeRates, Instrument};
 use rust_decimal::Decimal;
-use smallvec::SmallVec;
 use tokio::signal;
 use tracing::{error, info};
 
@@ -346,29 +344,14 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
     }
 }
 
-/// Write (`trip`) or remove (`clear`) the kill-switch flag file (SPEC-0004 K-3).
+/// Resolve the configured kill-switch flag file and write/remove it
+/// (SPEC-0004 K-3).
 fn set_kill_switch(network: Option<NetworkArg>, trip: bool) -> Result<()> {
     let config = Config::load(ConfigOverrides {
         network: network.map(Into::into),
         ..Default::default()
     })?;
-    let path = &config.kill_file;
-    if trip {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::write(path, b"kill\n").with_context(|| format!("writing {}", path.display()))?;
-        println!("kill switch tripped: {}", path.display());
-    } else if path.exists() {
-        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
-        println!("kill switch flag removed: {}", path.display());
-    } else {
-        println!("kill switch flag already absent: {}", path.display());
-    }
-    Ok(())
+    live::set_kill_switch(&config.kill_file, trip)
 }
 
 fn resolve_network(network: Option<NetworkArg>) -> Result<Network> {
@@ -474,7 +457,7 @@ async fn run(
                 .clone()
                 .context("live mode requires a configured exchange")?;
             let (out, posts) = outbound::<UnsignedPost>(ACCOUNT_CHANNEL_CAP);
-            exec_writer = Some(spawn_exec_writer(
+            exec_writer = Some(live::spawn_exec_writer(
                 posts,
                 exchange,
                 info.clone(),
@@ -567,7 +550,7 @@ async fn run(
         ))
     });
     let account_stream_task = config.account_address.as_ref().map(|address| {
-        tokio::spawn(account_stream(
+        tokio::spawn(live::account_stream(
             handles.clone(),
             vec![
                 Subscription::OrderUpdates {
@@ -584,7 +567,7 @@ async fn run(
             config.network,
         ))
     });
-    let control_task = tokio::spawn(control(handles.clone(), config.kill_file.clone()));
+    let control_task = tokio::spawn(live::control(handles.clone(), config.kill_file.clone()));
     let deadman_task = exchange.clone().map(|exchange| {
         tokio::spawn(deadman(
             exchange,
@@ -623,210 +606,6 @@ async fn run(
     }
     info!("shutdown complete");
     Ok(())
-}
-
-/// Bridge the engine's synchronous exec channel to the async WS writer.
-///
-/// The engine hands [`UnsignedPost`]s to the crossbeam `Receiver` off the engine
-/// thread; a small std thread moves them onto a tokio channel. The writer loop
-/// **signs and enqueues** each post in receive order (cancels before places, per
-/// the builder) and pushes only the reply wait into a [`FuturesUnordered`], so
-/// the loop keeps taking posts while earlier replies are in flight: a post
-/// arriving during a slow reply no longer waits a round trip, and a lost reply
-/// cannot stall later posts or the kill switch (SPEC-0002 H-1, SPEC-0010 §12).
-fn spawn_exec_writer(
-    posts: crossbeam_channel::Receiver<UnsignedPost>,
-    exchange: Arc<dyn ExchangeApi>,
-    info: Arc<dyn InfoApi>,
-    address: Option<String>,
-    handles: InputHandles,
-) -> tokio::task::JoinHandle<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UnsignedPost>();
-    let _ = std::thread::Builder::new()
-        .name("mev-exec-bridge".to_string())
-        .spawn(move || {
-            while let Ok(post) = posts.recv() {
-                if tx.send(post).is_err() {
-                    break;
-                }
-            }
-        });
-
-    tokio::spawn(async move {
-        let mut inflight = FuturesUnordered::new();
-        loop {
-            tokio::select! {
-                maybe = rx.recv() => {
-                    let Some(post) = maybe else { break };
-                    let queued = Instant::now();
-                    // Sign and enqueue now, in order; only the reply is awaited
-                    // later. No lock is held across this await.
-                    match exchange.enqueue(&post.action).await {
-                        Ok(handle) => {
-                            metrics::histogram!(mev_metrics::names::EXEC_QUEUE_SECONDS)
-                                .record(queued.elapsed().as_secs_f64());
-                            inflight.push(finish_post(
-                                handle,
-                                info.clone(),
-                                address.clone(),
-                                handles.clone(),
-                                post,
-                            ));
-                        }
-                        Err(err) => {
-                            // A pre-send failure: the orders are terminal.
-                            let result = mev_engine::exec::post_result_from_error(&err);
-                            let _ = handles.send_account(AccountUpdate::PostAck {
-                                stamp: engine::now_stamp(),
-                                req_id: post.req_id,
-                                result,
-                            });
-                        }
-                    }
-                }
-                Some(_) = inflight.next(), if !inflight.is_empty() => {}
-            }
-        }
-        // Drain any replies still in flight before the task exits.
-        while inflight.next().await.is_some() {}
-    })
-}
-
-/// Await one enqueued post's reply and report it to the engine.
-///
-/// A successful reply becomes a [`PostResult::Statuses`]. A definitive failure
-/// becomes [`PostResult::Rejected`] (terminal); a sent request with no reliable
-/// answer becomes [`PostResult::Error`] (`Unknown`), and its `orderStatus`
-/// reconciliation is spawned so it cannot delay the writer (SPEC-0002 H-2,
-/// SPEC-0010 §10/§16). Never resends.
-async fn finish_post(
-    handle: mev_hl_client::ReplyHandle,
-    info: Arc<dyn InfoApi>,
-    address: Option<String>,
-    handles: InputHandles,
-    post: UnsignedPost,
-) {
-    let req_id = post.req_id;
-    let (result, unknown) = match handle.wait().await {
-        Ok(response) => {
-            let result = match response.order_response() {
-                Ok(orders) => PostResult::Statuses(
-                    orders
-                        .statuses
-                        .iter()
-                        .zip(orders.oids.iter())
-                        .map(|(status, oid)| OrderAck {
-                            status: map_venue_status(status),
-                            oid: *oid,
-                        })
-                        .collect(),
-                ),
-                // Non-order actions (cancels) carry no per-order statuses; their
-                // outcome arrives on the account stream.
-                Err(_) => PostResult::Statuses(SmallVec::new()),
-            };
-            (result, false)
-        }
-        Err(err) => {
-            let result = mev_engine::exec::post_result_from_error(&err);
-            let unknown = matches!(result, PostResult::Error(_));
-            (result, unknown)
-        }
-    };
-    let update = AccountUpdate::PostAck {
-        stamp: engine::now_stamp(),
-        req_id,
-        result,
-    };
-    if !handles.send_account(update) {
-        return;
-    }
-    // A lost reply is reconciled by cloid off the writer's critical path: the
-    // dispatcher has already marked the orders `Unknown` (the PostAck is ahead
-    // of these on the same FIFO account channel).
-    if unknown
-        && let Some(address) = address
-        && !post.cloids.is_empty()
-    {
-        tokio::spawn(recover_unknown(
-            info,
-            address,
-            handles,
-            post.cloids,
-            RecoveryPolicy::default(),
-        ));
-    }
-}
-
-/// Bounded `orderStatus` retry policy for `Unknown` orders (SPEC-0002 H-2).
-#[derive(Debug, Clone, Copy)]
-struct RecoveryPolicy {
-    /// Number of `orderStatus` queries per cloid before giving up.
-    attempts: usize,
-    /// First backoff delay; doubles per attempt, capped.
-    base_delay: Duration,
-}
-
-impl Default for RecoveryPolicy {
-    fn default() -> Self {
-        Self {
-            attempts: 5,
-            base_delay: Duration::from_millis(250),
-        }
-    }
-}
-
-/// Resolve `Unknown` orders by `cloid` through `orderStatus`, with capped
-/// backoff.
-///
-/// A found order is applied only while the engine still holds it `Unknown`
-/// (through [`AccountUpdate::ResolveUnknown`]); after the retry bound an order
-/// the venue never saw is resolved as `Rejected`
-/// ([`AccountUpdate::UnknownExpired`]). Never resends an order.
-async fn recover_unknown(
-    info: Arc<dyn InfoApi>,
-    address: String,
-    handles: InputHandles,
-    cloids: SmallVec<[Cloid; 8]>,
-    policy: RecoveryPolicy,
-) {
-    for cloid in cloids {
-        let mut resolved = false;
-        for attempt in 0..policy.attempts {
-            if let Ok(status) = info.order_status_by_cloid(&address, &cloid.to_hex()).await
-                && status.is_found()
-            {
-                resolved = handles.send_account(AccountUpdate::ResolveUnknown {
-                    stamp: engine::now_stamp(),
-                    cloid,
-                    status,
-                });
-                break;
-            }
-            if attempt + 1 < policy.attempts {
-                let shift = attempt.min(3) as u32;
-                tokio::time::sleep(policy.base_delay * (1u32 << shift)).await;
-            }
-        }
-        if !resolved
-            && !handles.send_account(AccountUpdate::UnknownExpired {
-                stamp: engine::now_stamp(),
-                cloid,
-            })
-        {
-            return;
-        }
-    }
-}
-
-/// Map a wire per-order status to the engine's typed status.
-fn map_venue_status(status: &OrderStatus) -> VenueOrderStatus {
-    match status {
-        OrderStatus::Resting => VenueOrderStatus::Resting,
-        OrderStatus::Filled => VenueOrderStatus::Filled,
-        OrderStatus::Rejected(_) => VenueOrderStatus::Rejected,
-        OrderStatus::Other(_) => VenueOrderStatus::Other,
-    }
 }
 
 /// Merge the watchlist feeds with any strategy-required feeds, de-duplicated.
@@ -1102,152 +881,6 @@ async fn recording_sidecar(
             }
             if let Ok(mut guard) = health_state.write() {
                 guard.apply(&event);
-            }
-        }
-    }
-}
-
-/// Consume the H-3 account channels into lossless [`AccountUpdate`]s.
-///
-/// Runs on its own connection, separate from market data, and is never lossy:
-/// the engine resolves live cancels, fills, and order state from this stream
-/// (SPEC-0010 §15, SPEC-0002 H-3). On a reconnect the venue's `userFills`
-/// snapshot resyncs state; the REST reconciler is the 30 s backstop.
-async fn account_stream(
-    handles: InputHandles,
-    subscriptions: Vec<Subscription>,
-    registry: CoinRegistry,
-    network: Network,
-) {
-    let ingester = Ingest::new(ConnId(1), registry);
-    let planned: Vec<String> = subscriptions
-        .iter()
-        .map(|sub| serde_json::to_string(sub).unwrap_or_default())
-        .collect();
-    let mut backoff = Duration::from_secs(1);
-
-    loop {
-        match RawWsConn::connect(Box::new(HlProtocol::new(network)), planned.clone()).await {
-            Ok(mut conn) => {
-                info!("account stream connected");
-                loop {
-                    match conn.next().await {
-                        Ok(RawEvent::Text {
-                            t_ns,
-                            mono_ns,
-                            text,
-                        }) => {
-                            let stamp = Stamp {
-                                t_recv_ns: t_ns.saturating_mul(1_000_000),
-                                mono_ns,
-                                ts_exch_ms: 0,
-                            };
-                            match ingester.decode_account(&text, stamp) {
-                                Ok(updates) => {
-                                    for update in updates {
-                                        if !handles.send_account(update) {
-                                            return;
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    tracing::debug!(error = %err, "undecodable account frame");
-                                }
-                            }
-                        }
-                        Ok(RawEvent::Gap { reason, detail }) => {
-                            tracing::warn!(reason, detail, "account feed gap");
-                            if reason == "shutdown" {
-                                return;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            tracing::warn!(error = %err, "account stream ended");
-                            return;
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "account stream connect failed");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-            }
-        }
-    }
-}
-
-/// Poll the kill-switch triggers and drive [`Control`] into the engine.
-///
-/// Triggers (SPEC-0004 K-3): `SIGUSR1`, the kill flag file, and `hl panic`
-/// (which writes that file). `SIGUSR2` sends `Control::Resume`; clearing also
-/// needs the file removed (the two-key rule), so a poll re-trips otherwise.
-#[cfg(unix)]
-async fn control(handles: InputHandles, kill_file: PathBuf) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut sigusr1 = match signal(SignalKind::user_defined1()) {
-        Ok(sig) => sig,
-        Err(err) => {
-            error!(error = %err, "failed to register SIGUSR1");
-            return;
-        }
-    };
-    let mut sigusr2 = match signal(SignalKind::user_defined2()) {
-        Ok(sig) => sig,
-        Err(err) => {
-            error!(error = %err, "failed to register SIGUSR2");
-            return;
-        }
-    };
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
-    let mut killed = false;
-    loop {
-        tokio::select! {
-            _ = shutdown_signal() => break,
-            _ = sigusr1.recv() => {
-                if !killed {
-                    if !handles.send_account(AccountUpdate::Control(Control::KillSwitch)) {
-                        break;
-                    }
-                    killed = true;
-                }
-            }
-            _ = sigusr2.recv() => {
-                if killed {
-                    if !handles.send_account(AccountUpdate::Control(Control::Resume)) {
-                        break;
-                    }
-                    killed = false;
-                }
-            }
-            _ = tick.tick() => {
-                if !killed && mev_risk::kill::check_flag_file(&kill_file) {
-                    if !handles.send_account(AccountUpdate::Control(Control::KillSwitch)) {
-                        break;
-                    }
-                    killed = true;
-                }
-            }
-        }
-    }
-}
-
-/// Poll the kill-switch flag file on platforms without `SIGUSR1`/`SIGUSR2`.
-#[cfg(not(unix))]
-async fn control(handles: InputHandles, kill_file: PathBuf) {
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
-    let mut killed = false;
-    loop {
-        tokio::select! {
-            _ = shutdown_signal() => break,
-            _ = tick.tick() => {
-                if !killed && mev_risk::kill::check_flag_file(&kill_file) {
-                    if !handles.send_account(AccountUpdate::Control(Control::KillSwitch)) {
-                        break;
-                    }
-                    killed = true;
-                }
             }
         }
     }
@@ -1720,7 +1353,7 @@ async fn render_metrics(State(state): State<AppState>) -> String {
     state.metrics.render()
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c().await.expect("failed to listen for ctrl-c");
     };
@@ -1755,282 +1388,5 @@ mod tests {
             };
             assert!(live_exchange(&config).unwrap().is_none(), "{mode:?}");
         }
-    }
-
-    /// A tiny policy so the recovery tests don't sleep for seconds.
-    fn fast_policy() -> RecoveryPolicy {
-        RecoveryPolicy {
-            attempts: 2,
-            base_delay: Duration::from_millis(1),
-        }
-    }
-
-    fn cloid_with(byte: u8) -> Cloid {
-        Cloid([byte; 16])
-    }
-
-    fn one(cloid: Cloid) -> SmallVec<[Cloid; 8]> {
-        let mut out = SmallVec::new();
-        out.push(cloid);
-        out
-    }
-
-    #[tokio::test]
-    async fn recovery_bounds_a_never_seen_order_to_expired() {
-        use wiremock::{
-            Mock, MockServer, ResponseTemplate,
-            matchers::{method, path},
-        };
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/info"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"status":"unknownOid"}"#))
-            .mount(&server)
-            .await;
-
-        let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::with_base_url(server.uri()));
-        let (handles, inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
-        let cloid = cloid_with(1);
-        recover_unknown(info, "0xabc".into(), handles, one(cloid), fast_policy()).await;
-
-        match inputs.account.try_recv() {
-            Ok(AccountUpdate::UnknownExpired { cloid: got, .. }) => assert_eq!(got, cloid),
-            other => panic!("expected UnknownExpired, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn recovery_applies_a_found_order_status() {
-        use wiremock::{
-            Mock, MockServer, ResponseTemplate,
-            matchers::{method, path},
-        };
-
-        let body = r#"{"status":"order","order":{"order":{"coin":"BTC","side":"B","limitPx":"100","sz":"1","oid":7,"timestamp":0,"origSz":"1","reduceOnly":false},"status":"open","statusTimestamp":0}}"#;
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/info"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(body))
-            .mount(&server)
-            .await;
-
-        let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::with_base_url(server.uri()));
-        let (handles, inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
-        let cloid = cloid_with(2);
-        recover_unknown(info, "0xabc".into(), handles, one(cloid), fast_policy()).await;
-
-        match inputs.account.try_recv() {
-            Ok(AccountUpdate::ResolveUnknown { cloid: got, .. }) => assert_eq!(got, cloid),
-            other => panic!("expected ResolveUnknown, got {other:?}"),
-        }
-    }
-
-    /// One scripted reply for [`MockExchange`].
-    #[derive(Clone, Copy)]
-    struct Outcome {
-        delay: Duration,
-        fail: bool,
-    }
-
-    /// An [`ExchangeApi`] whose `enqueue` records order and returns a scripted
-    /// reply handle, so the writer's split enqueue/await can be tested.
-    struct MockExchange {
-        enqueued: Arc<Mutex<Vec<mev_hl_client::Action>>>,
-        outcomes: Arc<Mutex<std::collections::VecDeque<Outcome>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl ExchangeApi for MockExchange {
-        async fn submit(
-            &self,
-            action: &mev_hl_client::Action,
-        ) -> mev_core::error::Result<mev_hl_client::ActionResponse> {
-            self.enqueue(action).await?.wait().await
-        }
-
-        async fn enqueue(
-            &self,
-            action: &mev_hl_client::Action,
-        ) -> mev_core::error::Result<mev_hl_client::ReplyHandle> {
-            self.enqueued.lock().unwrap().push(action.clone());
-            let outcome = self
-                .outcomes
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(Outcome {
-                    delay: Duration::ZERO,
-                    fail: false,
-                });
-            Ok(mev_hl_client::ReplyHandle::new(async move {
-                tokio::time::sleep(outcome.delay).await;
-                if outcome.fail {
-                    Err(mev_core::error::Error::UnknownOutcome("lost reply".into()))
-                } else {
-                    Ok(mev_hl_client::ActionResponse {
-                        value: serde_json::json!({"data": {"statuses": ["resting"]}}),
-                    })
-                }
-            }))
-        }
-    }
-
-    fn mock_exchange(outcomes: Vec<Outcome>) -> Arc<MockExchange> {
-        Arc::new(MockExchange {
-            enqueued: Arc::new(Mutex::new(Vec::new())),
-            outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
-        })
-    }
-
-    fn test_post(req_id: u64, action: mev_hl_client::Action) -> UnsignedPost {
-        UnsignedPost {
-            req_id,
-            action,
-            cloids: SmallVec::new(),
-        }
-    }
-
-    /// A never-dialing info client; recovery calls just fail and retry.
-    fn dead_info() -> Arc<dyn InfoApi> {
-        Arc::new(HttpInfo::with_base_url("http://127.0.0.1:1"))
-    }
-
-    #[tokio::test]
-    async fn a_post_during_a_slow_reply_is_enqueued_immediately() {
-        use mev_hl_client::{Action as VenueAction, Grouping};
-
-        let exchange = mock_exchange(vec![
-            Outcome {
-                delay: Duration::from_secs(5),
-                fail: false,
-            },
-            Outcome {
-                delay: Duration::ZERO,
-                fail: false,
-            },
-        ]);
-        let (handles, _inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let writer = spawn_exec_writer(rx, exchange.clone(), dead_info(), None, handles);
-
-        tx.send(test_post(1, VenueAction::CancelByCloid { cancels: vec![] }))
-            .unwrap();
-        let started = Instant::now();
-        tx.send(test_post(
-            2,
-            VenueAction::Order {
-                orders: vec![],
-                grouping: Grouping::Na,
-            },
-        ))
-        .unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while exchange.enqueued.lock().unwrap().len() < 2 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let queue_to_socket = started.elapsed();
-        assert_eq!(
-            exchange.enqueued.lock().unwrap().len(),
-            2,
-            "the second post must reach the socket while the first reply is pending"
-        );
-        assert!(
-            queue_to_socket < Duration::from_secs(1),
-            "queue-to-socket took {queue_to_socket:?}"
-        );
-
-        drop(tx);
-        writer.abort();
-    }
-
-    #[tokio::test]
-    async fn a_cancel_is_enqueued_before_a_place_in_a_batch() {
-        use mev_hl_client::{Action as VenueAction, Grouping};
-
-        let exchange = mock_exchange(vec![]);
-        let (handles, _inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let writer = spawn_exec_writer(rx, exchange.clone(), dead_info(), None, handles);
-
-        tx.send(test_post(1, VenueAction::CancelByCloid { cancels: vec![] }))
-            .unwrap();
-        tx.send(test_post(
-            2,
-            VenueAction::Order {
-                orders: vec![],
-                grouping: Grouping::Na,
-            },
-        ))
-        .unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while exchange.enqueued.lock().unwrap().len() < 2 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let enqueued = exchange.enqueued.lock().unwrap();
-        assert_eq!(enqueued.len(), 2);
-        assert!(
-            matches!(enqueued[0], VenueAction::CancelByCloid { .. }),
-            "the cancel goes first"
-        );
-        assert!(
-            matches!(enqueued[1], VenueAction::Order { .. }),
-            "the place goes second"
-        );
-
-        drop(tx);
-        writer.abort();
-    }
-
-    #[tokio::test]
-    async fn a_lost_reply_and_its_recovery_do_not_delay_the_next_post() {
-        use mev_hl_client::{Action as VenueAction, Grouping};
-
-        let exchange = mock_exchange(vec![
-            Outcome {
-                delay: Duration::from_millis(200),
-                fail: true,
-            },
-            Outcome {
-                delay: Duration::ZERO,
-                fail: false,
-            },
-        ]);
-        let (handles, _inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let writer = spawn_exec_writer(
-            rx,
-            exchange.clone(),
-            dead_info(),
-            Some("0xabc".into()),
-            handles,
-        );
-
-        let mut first = test_post(1, VenueAction::CancelByCloid { cancels: vec![] });
-        first.cloids.push(cloid_with(7));
-        tx.send(first).unwrap();
-        tx.send(test_post(
-            2,
-            VenueAction::Order {
-                orders: vec![],
-                grouping: Grouping::Na,
-            },
-        ))
-        .unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while exchange.enqueued.lock().unwrap().len() < 2 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_eq!(
-            exchange.enqueued.lock().unwrap().len(),
-            2,
-            "recovery must not delay the next post"
-        );
-
-        drop(tx);
-        writer.abort();
     }
 }

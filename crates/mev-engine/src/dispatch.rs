@@ -334,6 +334,10 @@ impl StrategyDispatcher {
     }
 
     fn dispatch_coin(&mut self, coin: CoinId, stamp: Stamp, state: &EngineState) {
+        // Apply any paper updates queued by a prior iteration (notably the
+        // kill-switch cancels) even while halted, so `simulate` reflects the
+        // cancellation within one iteration.
+        self.tick_paper(state);
         if self.halted {
             return;
         }
@@ -363,6 +367,7 @@ impl StrategyDispatcher {
     }
 
     fn dispatch_timer(&mut self, id: HeapTimerId, stamp: Stamp, state: &EngineState) {
+        self.tick_paper(state);
         if self.halted {
             return;
         }
@@ -2129,6 +2134,69 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == OrderEventKind::Fill),
             "the owning strategy should receive the fill"
+        );
+    }
+
+    /// SPEC-0004 K-3 end-to-end in `simulate`: a kill-switch trigger cancels
+    /// every working order and places nothing new within one iteration.
+    #[test]
+    fn simulate_kill_switch_cancels_all_and_places_none() {
+        use mev_strategy::{AccountView, FeeRates, Instrument};
+
+        use crate::paper_exec::{PaperConfig, PaperExec};
+
+        // A resting Gtc buy: its limit is below the bid, so it does not cross.
+        let mut buy = intent("BTC", Side::Buy);
+        buy.limit_px = Some(ds("99"));
+        buy.tif = mev_strategy::TimeInForce::Gtc;
+        let strategy = Recording::new("test", CoinId(0)).with_script(vec![Action::Place(buy)]);
+
+        let mut instruments = BTreeMap::new();
+        instruments.insert("BTC".to_string(), Instrument::perp());
+        let paper = PaperExec::new(
+            PaperConfig {
+                latency_ms: 20,
+                maker_fills: true,
+            },
+            AccountView {
+                account_value: ds("1000"),
+                ..Default::default()
+            },
+            instruments,
+            FeeRates::PERP,
+            FeeRates::SPOT,
+        );
+        let mut dispatcher = StrategyDispatcher::new(
+            vec![Box::new(strategy)],
+            registry(),
+            table(),
+            RiskGate::default(),
+            None,
+            DispatcherConfig::default(),
+        )
+        .with_paper(paper);
+        let state = state_with("100", "101");
+
+        // One iteration places one order (still pending in the paper backend).
+        dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+        assert_eq!(dispatcher.orders.working().count(), 1, "one order placed");
+
+        // Trigger: kill switch. One further iteration applies the paper cancel.
+        dispatcher.on_account_state(&AccountUpdate::Control(Control::KillSwitch), &state);
+        dispatcher.on_coin_state(CoinId(0), stamp(20), &state);
+        assert_eq!(
+            dispatcher.orders.working().count(),
+            0,
+            "all orders cancelled within one iteration"
+        );
+
+        // And nothing new is placed while killed.
+        let before = dispatcher.orders.len();
+        dispatcher.on_coin_state(CoinId(0), stamp(30), &state);
+        assert_eq!(
+            dispatcher.orders.len(),
+            before,
+            "no new places while killed"
         );
     }
 
