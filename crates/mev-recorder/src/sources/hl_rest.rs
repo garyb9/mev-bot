@@ -173,13 +173,19 @@ impl WeightBucket {
 /// not its maximum. On restart the page is fetched again, so a crash before the
 /// segment writer flushed (or a dropped envelope) cannot leave a permanent
 /// hole. The overlap is deliberate: P-1 must de-duplicate it when normalizing.
+///
+/// State written by the pre-page-start format (a bare `funding_last_ms` /
+/// `candle_last_ms` cursor) is intentionally ignored: its cursor pointed at a
+/// page maximum that may never have reached disk, so resuming from it could
+/// skip the very tail this design protects. The backfill restarts from the
+/// configured start instead.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotterState {
     /// Resume time for `fundingHistory`, per coin (ms since the epoch).
-    #[serde(default, alias = "funding_last_ms")]
+    #[serde(default)]
     pub funding_resume_ms: BTreeMap<String, u64>,
     /// Resume time for `candleSnapshot`, keyed by `coin|interval` (ms).
-    #[serde(default, alias = "candle_last_ms")]
+    #[serde(default)]
     pub candle_resume_ms: BTreeMap<String, u64>,
 }
 
@@ -1019,5 +1025,20 @@ mod tests {
         assert_eq!(state.funding_start_ms("BTC", 0), 1000);
         assert_eq!(state.candle_start_ms("BTC", "1m", 0), 2000);
         assert_eq!(state.funding_start_ms("ETH", 7), 7);
+    }
+
+    #[test]
+    fn legacy_state_format_is_ignored() {
+        let dir = temp_dir("legacy-state");
+        let path = dir.join("hl-rest-state.json");
+        std::fs::write(
+            &path,
+            r#"{"funding_last_ms":{"BTC":5000},"candle_last_ms":{"BTC|1m":2000}}"#,
+        )
+        .unwrap();
+        let state = SnapshotterState::load(&path).unwrap();
+        assert!(state.funding_resume_ms.is_empty());
+        assert!(state.candle_resume_ms.is_empty());
+        assert_eq!(state.funding_start_ms("BTC", 7), 7);
     }
 }
