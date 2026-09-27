@@ -26,8 +26,8 @@ use mev_core::{
     db::{Db, writer::DbWriter},
 };
 use mev_engine::{
-    AccountUpdate, CoinRegistry, Control, MarketUpdate, PostResult, Stamp, StrategyDispatcher,
-    VenueOrderStatus,
+    AccountUpdate, Cloid, CoinRegistry, Control, MarketUpdate, OrderAck, PostResult, Stamp,
+    StrategyDispatcher, VenueOrderStatus,
     builder::AssetTable,
     channels::{
         ACCOUNT_CHANNEL_CAP, InputHandles, MARKET_CHANNEL_CAP, MarketSend, inputs, outbound,
@@ -680,9 +680,12 @@ fn spawn_exec_writer(
 
 /// Sign, send, and report one built post.
 ///
-/// A successful reply becomes a [`PostResult::Statuses`]; a lost reply marks the
-/// post's orders `Unknown` and then reconciles each by `cloid` via `orderStatus`
-/// (SPEC-0002 H-2, SPEC-0010 §10/§16). Never resends.
+/// A successful reply becomes a [`PostResult::Statuses`]. A definitive failure
+/// (venue said no, or the frame never reached the socket) becomes
+/// [`PostResult::Rejected`] (terminal); only a sent request with no reliable
+/// answer becomes [`PostResult::Error`] (`Unknown`). The unknown-outcome
+/// `orderStatus` reconciliation runs in its own spawned task, so it never
+/// delays the exec writer (SPEC-0002 H-2, SPEC-0010 §10/§16). Never resends.
 async fn submit_post(
     exchange: Arc<dyn ExchangeApi>,
     info: Arc<dyn InfoApi>,
@@ -692,56 +695,108 @@ async fn submit_post(
 ) {
     let result = match exchange.submit(&post.action).await {
         Ok(response) => match response.order_response() {
-            Ok(orders) => {
-                PostResult::Statuses(orders.statuses.iter().map(map_venue_status).collect())
-            }
+            Ok(orders) => PostResult::Statuses(
+                orders
+                    .statuses
+                    .iter()
+                    .zip(orders.oids.iter())
+                    .map(|(status, oid)| OrderAck {
+                        status: map_venue_status(status),
+                        oid: *oid,
+                    })
+                    .collect(),
+            ),
             // Non-order actions (cancels) carry no per-order statuses; their
             // outcome arrives on the account stream.
             Err(_) => PostResult::Statuses(SmallVec::new()),
         },
-        Err(err) => {
-            // Fail closed first: mark the post's orders `Unknown` before any
-            // reconciliation, so a genuinely resting order is never invisible.
-            let fail = AccountUpdate::PostAck {
-                stamp: engine::now_stamp(),
-                req_id: post.req_id,
-                result: PostResult::Error(err.to_string()),
-            };
-            if !handles.send_account(fail) {
-                return;
-            }
-            let Some(address) = address.as_deref() else {
-                return;
-            };
-            for cloid in &post.cloids {
-                let Ok(status) = info.order_status_by_cloid(address, &cloid.to_hex()).await else {
-                    continue;
-                };
-                let Some((status, filled_sz)) = mev_engine::reconcile::order_status_update(&status)
-                else {
-                    continue;
-                };
-                let update = AccountUpdate::OrderUpdate {
-                    stamp: engine::now_stamp(),
-                    cloid: *cloid,
-                    oid: 0,
-                    status,
-                    filled_sz,
-                    avg_px: Decimal::ZERO,
-                };
-                if !handles.send_account(update) {
-                    return;
-                }
-            }
-            return;
-        }
+        Err(err) => mev_engine::exec::post_result_from_error(&err),
     };
+    let unknown = matches!(result, PostResult::Error(_));
     let update = AccountUpdate::PostAck {
         stamp: engine::now_stamp(),
         req_id: post.req_id,
         result,
     };
-    let _ = handles.send_account(update);
+    if !handles.send_account(update) {
+        return;
+    }
+    // A lost reply is reconciled by cloid off the writer's critical path: the
+    // dispatcher has already marked the orders `Unknown` (the PostAck is ahead
+    // of these on the same FIFO account channel).
+    if unknown
+        && let Some(address) = address
+        && !post.cloids.is_empty()
+    {
+        tokio::spawn(recover_unknown(
+            info,
+            address,
+            handles,
+            post.cloids,
+            RecoveryPolicy::default(),
+        ));
+    }
+}
+
+/// Bounded `orderStatus` retry policy for `Unknown` orders (SPEC-0002 H-2).
+#[derive(Debug, Clone, Copy)]
+struct RecoveryPolicy {
+    /// Number of `orderStatus` queries per cloid before giving up.
+    attempts: usize,
+    /// First backoff delay; doubles per attempt, capped.
+    base_delay: Duration,
+}
+
+impl Default for RecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 5,
+            base_delay: Duration::from_millis(250),
+        }
+    }
+}
+
+/// Resolve `Unknown` orders by `cloid` through `orderStatus`, with capped
+/// backoff.
+///
+/// A found order is applied only while the engine still holds it `Unknown`
+/// (through [`AccountUpdate::ResolveUnknown`]); after the retry bound an order
+/// the venue never saw is resolved as `Rejected`
+/// ([`AccountUpdate::UnknownExpired`]). Never resends an order.
+async fn recover_unknown(
+    info: Arc<dyn InfoApi>,
+    address: String,
+    handles: InputHandles,
+    cloids: SmallVec<[Cloid; 8]>,
+    policy: RecoveryPolicy,
+) {
+    for cloid in cloids {
+        let mut resolved = false;
+        for attempt in 0..policy.attempts {
+            if let Ok(status) = info.order_status_by_cloid(&address, &cloid.to_hex()).await
+                && status.is_found()
+            {
+                resolved = handles.send_account(AccountUpdate::ResolveUnknown {
+                    stamp: engine::now_stamp(),
+                    cloid,
+                    status,
+                });
+                break;
+            }
+            if attempt + 1 < policy.attempts {
+                let shift = attempt.min(3) as u32;
+                tokio::time::sleep(policy.base_delay * (1u32 << shift)).await;
+            }
+        }
+        if !resolved
+            && !handles.send_account(AccountUpdate::UnknownExpired {
+                stamp: engine::now_stamp(),
+                cloid,
+            })
+        {
+            return;
+        }
+    }
 }
 
 /// Map a wire per-order status to the engine's typed status.
@@ -1679,6 +1734,75 @@ mod tests {
                 ..Config::default()
             };
             assert!(live_exchange(&config).unwrap().is_none(), "{mode:?}");
+        }
+    }
+
+    /// A tiny policy so the recovery tests don't sleep for seconds.
+    fn fast_policy() -> RecoveryPolicy {
+        RecoveryPolicy {
+            attempts: 2,
+            base_delay: Duration::from_millis(1),
+        }
+    }
+
+    fn cloid_with(byte: u8) -> Cloid {
+        Cloid([byte; 16])
+    }
+
+    fn one(cloid: Cloid) -> SmallVec<[Cloid; 8]> {
+        let mut out = SmallVec::new();
+        out.push(cloid);
+        out
+    }
+
+    #[tokio::test]
+    async fn recovery_bounds_a_never_seen_order_to_expired() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"status":"unknownOid"}"#))
+            .mount(&server)
+            .await;
+
+        let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::with_base_url(server.uri()));
+        let (handles, inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
+        let cloid = cloid_with(1);
+        recover_unknown(info, "0xabc".into(), handles, one(cloid), fast_policy()).await;
+
+        match inputs.account.try_recv() {
+            Ok(AccountUpdate::UnknownExpired { cloid: got, .. }) => assert_eq!(got, cloid),
+            other => panic!("expected UnknownExpired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_applies_a_found_order_status() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let body = r#"{"status":"order","order":{"order":{"coin":"BTC","side":"B","limitPx":"100","sz":"1","oid":7,"timestamp":0,"origSz":"1","reduceOnly":false},"status":"open","statusTimestamp":0}}"#;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::with_base_url(server.uri()));
+        let (handles, inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
+        let cloid = cloid_with(2);
+        recover_unknown(info, "0xabc".into(), handles, one(cloid), fast_policy()).await;
+
+        match inputs.account.try_recv() {
+            Ok(AccountUpdate::ResolveUnknown { cloid: got, .. }) => assert_eq!(got, cloid),
+            other => panic!("expected ResolveUnknown, got {other:?}"),
         }
     }
 }

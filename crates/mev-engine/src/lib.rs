@@ -52,6 +52,6 @@ pub use strategy::{
 };
 pub use types::{
     AccountSnapshot, AccountUpdate, AssetCtxLite, AssetMetaLite, BOOK_DEPTH, BookSnapshot, Cloid,
-    CoinId, CoinRegistry, ConnId, Control, FillData, Level, MarketUpdate, PostResult, Px, Side,
-    Stamp, Sz, Trade, VenueOrderStatus,
+    CoinId, CoinRegistry, ConnId, Control, FillData, Level, MarketUpdate, OrderAck, PostResult, Px,
+    Side, Stamp, Sz, Trade, VenueOrderStatus,
 };

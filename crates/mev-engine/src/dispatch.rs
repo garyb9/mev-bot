@@ -462,6 +462,30 @@ impl StrategyDispatcher {
                     self.fills.first_snapshot = true;
                 }
             }
+            AccountUpdate::ResolveUnknown { cloid, status, .. } => {
+                // Apply the venue's answer only while the order is still
+                // `Unknown`: a stale answer after a newer stream update must not
+                // move the order backwards (SPEC-0002 H-2).
+                if self
+                    .orders
+                    .get(*cloid)
+                    .is_some_and(|order| order.state.is_unknown())
+                {
+                    let _ = crate::reconcile::resolve_unknown(&mut self.orders, *cloid, status);
+                }
+            }
+            AccountUpdate::UnknownExpired { cloid, .. } => {
+                // The bounded `orderStatus` retries never resolved the order and
+                // it can no longer land: resolve it as not placed.
+                if self
+                    .orders
+                    .get(*cloid)
+                    .is_some_and(|order| order.state.is_unknown())
+                {
+                    self.orders
+                        .set_state(*cloid, OrderState::Rejected(RejectReason::Unknown));
+                }
+            }
             AccountUpdate::PostAck { req_id, result, .. } => {
                 self.handle_post_ack(*req_id, result, stamp, state);
             }
@@ -584,20 +608,20 @@ impl StrategyDispatcher {
         state: &EngineState,
     ) {
         match result {
-            PostResult::Statuses(statuses) => {
+            PostResult::Statuses(acks) => {
                 let cloids = self.req_cloids.remove(&req_id);
                 apply_post_ack(&mut self.orders, req_id, result);
                 let Some(cloids) = cloids else {
                     return;
                 };
-                for (cloid, status) in cloids.iter().zip(statuses.iter()) {
+                for (cloid, ack) in cloids.iter().zip(acks.iter()) {
                     let event = self.orders.get(*cloid).map(|order| {
                         (
                             order.strategy.clone(),
                             OrderEvent {
                                 stamp,
                                 cloid: Some(*cloid),
-                                oid: 0,
+                                oid: ack.oid.unwrap_or(0),
                                 coin: order.coin,
                                 side: strat_side(order.side),
                                 px: Decimal::ZERO,
@@ -605,7 +629,7 @@ impl StrategyDispatcher {
                                 fee: Decimal::ZERO,
                                 maker: false,
                                 reduce_only: order.reduce_only,
-                                kind: OrderEventKind::Status(*status),
+                                kind: OrderEventKind::Status(ack.status),
                             },
                         )
                     });
@@ -613,6 +637,16 @@ impl StrategyDispatcher {
                         self.deliver_to(&owner, &event, state);
                     }
                 }
+            }
+            PostResult::Rejected(reason) => {
+                // The venue said no (or the post was never sent): the orders are
+                // terminal `Rejected`, not `Unknown`, so the breaker clears.
+                tracing::debug!(
+                    req_id,
+                    %reason,
+                    "post rejected before/at the venue; orders terminal"
+                );
+                self.reject_requests(&[req_id]);
             }
             PostResult::Error(reason) => {
                 // A lost reply does not mean the order was rejected: it may be
@@ -1041,6 +1075,8 @@ fn account_stamp(update: &AccountUpdate) -> Stamp {
         AccountUpdate::OrderUpdate { stamp, .. }
         | AccountUpdate::Fill { stamp, .. }
         | AccountUpdate::Fills { stamp, .. }
+        | AccountUpdate::ResolveUnknown { stamp, .. }
+        | AccountUpdate::UnknownExpired { stamp, .. }
         | AccountUpdate::PostAck { stamp, .. }
         | AccountUpdate::Reconcile { stamp, .. }
         | AccountUpdate::Funding { stamp, .. } => *stamp,
@@ -1707,8 +1743,14 @@ mod tests {
                 stamp: stamp(30),
                 req_id,
                 result: PostResult::Statuses(smallvec::smallvec![
-                    VenueOrderStatus::Resting,
-                    VenueOrderStatus::Filled,
+                    crate::types::OrderAck {
+                        status: VenueOrderStatus::Resting,
+                        oid: None,
+                    },
+                    crate::types::OrderAck {
+                        status: VenueOrderStatus::Filled,
+                        oid: None,
+                    },
                 ]),
             },
             &state,
@@ -1794,6 +1836,173 @@ mod tests {
             OrderState::Resting
         );
         assert!(!h.dispatcher.risk.breakers().is_tripped());
+    }
+
+    fn order_status_response(status: &str) -> mev_hl_client::OrderStatusResponse {
+        mev_hl_client::OrderStatusResponse {
+            status: "order".into(),
+            order: Some(mev_hl_client::OrderStatusOrder {
+                order: Some(mev_hl_client::OpenOrder {
+                    coin: "BTC".into(),
+                    oid: 7,
+                    side: "B".into(),
+                    limit_px: ds("100"),
+                    sz: ds("1"),
+                    orig_sz: ds("1"),
+                    timestamp: 0,
+                    cloid: None,
+                    reduce_only: false,
+                }),
+                status: status.into(),
+                status_timestamp: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn rejected_post_ack_marks_orders_rejected_and_leaves_the_breaker_clear() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+        let state = state_with("100", "101");
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+
+        let (req_id, cloids) = {
+            let post = h.posts.lock().unwrap().first().unwrap().clone();
+            (post.req_id, post.cloids.clone())
+        };
+        h.dispatcher.on_account_state(
+            &AccountUpdate::PostAck {
+                stamp: stamp(30),
+                req_id,
+                result: PostResult::Rejected("rate limited".into()),
+            },
+            &state,
+        );
+        // A definitive failure is terminal, not Unknown.
+        assert!(matches!(
+            h.dispatcher.orders.get(cloids[0]).unwrap().state,
+            OrderState::Rejected(_)
+        ));
+        assert!(!h.dispatcher.orders.has_unknown());
+        assert!(!h.dispatcher.risk.breakers().is_tripped());
+    }
+
+    #[test]
+    fn resolve_unknown_via_order_status_clears_the_breaker() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+        let state = state_with("100", "101");
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+
+        let (req_id, cloids) = {
+            let post = h.posts.lock().unwrap().first().unwrap().clone();
+            (post.req_id, post.cloids.clone())
+        };
+        h.dispatcher.on_account_state(
+            &AccountUpdate::PostAck {
+                stamp: stamp(30),
+                req_id,
+                result: PostResult::Error("lost reply".into()),
+            },
+            &state,
+        );
+        assert!(h.dispatcher.risk.breakers().is_tripped());
+
+        h.dispatcher.on_account_state(
+            &AccountUpdate::ResolveUnknown {
+                stamp: stamp(40),
+                cloid: cloids[0],
+                status: order_status_response("open"),
+            },
+            &state,
+        );
+        assert_eq!(
+            h.dispatcher.orders.get(cloids[0]).unwrap().state,
+            OrderState::Resting
+        );
+        assert!(!h.dispatcher.risk.breakers().is_tripped());
+    }
+
+    #[test]
+    fn unknown_expired_marks_rejected_and_clears_the_breaker() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+        let state = state_with("100", "101");
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+
+        let (req_id, cloids) = {
+            let post = h.posts.lock().unwrap().first().unwrap().clone();
+            (post.req_id, post.cloids.clone())
+        };
+        h.dispatcher.on_account_state(
+            &AccountUpdate::PostAck {
+                stamp: stamp(30),
+                req_id,
+                result: PostResult::Error("lost reply".into()),
+            },
+            &state,
+        );
+        assert!(h.dispatcher.orders.has_unknown());
+
+        // The bounded `orderStatus` retries found nothing: terminal now.
+        h.dispatcher.on_account_state(
+            &AccountUpdate::UnknownExpired {
+                stamp: stamp(50),
+                cloid: cloids[0],
+            },
+            &state,
+        );
+        assert!(matches!(
+            h.dispatcher.orders.get(cloids[0]).unwrap().state,
+            OrderState::Rejected(_)
+        ));
+        assert!(!h.dispatcher.orders.has_unknown());
+        assert!(!h.dispatcher.risk.breakers().is_tripped());
+    }
+
+    #[test]
+    fn stale_order_status_after_a_stream_update_is_ignored() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+        let state = state_with("100", "101");
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+        let placed = *h
+            .dispatcher
+            .orders
+            .iter()
+            .next()
+            .map(|order| &order.cloid)
+            .unwrap();
+
+        // A stream update already resolved the order to Resting.
+        h.dispatcher.on_account_state(
+            &AccountUpdate::OrderUpdate {
+                stamp: stamp(20),
+                cloid: placed,
+                oid: 7,
+                status: VenueOrderStatus::Resting,
+                filled_sz: Decimal::ZERO,
+                avg_px: Decimal::ZERO,
+            },
+            &state,
+        );
+        // A stale `orderStatus` answer saying it was canceled must not apply.
+        h.dispatcher.on_account_state(
+            &AccountUpdate::ResolveUnknown {
+                stamp: stamp(30),
+                cloid: placed,
+                status: order_status_response("canceled"),
+            },
+            &state,
+        );
+        assert_eq!(
+            h.dispatcher.orders.get(placed).unwrap().state,
+            OrderState::Resting
+        );
     }
 
     #[test]

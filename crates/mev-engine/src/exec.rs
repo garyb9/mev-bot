@@ -169,14 +169,34 @@ pub fn dispatch_batch<B: ExecBackend>(
     }
 }
 
-/// Route a `PostAck`'s per-order statuses to the cloids it was built for.
+/// Route a `PostAck`'s per-order results to the cloids it was built for.
 ///
-/// `PostResult::Error` carries no per-order statuses, so it only clears the
-/// request mapping for the caller to resolve (E-8/E-9 handle unknown outcomes).
+/// `PostResult::Error`/`Rejected` carry no per-order statuses, so they only
+/// clear the request mapping for the caller to resolve.
 pub fn apply_post_ack(orders: &mut OrderManager, req_id: u64, result: &PostResult) {
     match result {
-        PostResult::Statuses(statuses) => orders.on_post_ack(req_id, statuses),
-        PostResult::Error(_) => {}
+        PostResult::Statuses(acks) => orders.on_post_ack(req_id, acks),
+        PostResult::Error(_) | PostResult::Rejected(_) => {}
+    }
+}
+
+/// Classify a submit error into the orders' outcome (SPEC-0002 H-2).
+///
+/// A definitive failure — the venue said no (`Error::Exchange`), or the frame
+/// never reached the socket (dial, closed socket, serialisation, a local
+/// pre-send config error) — resolves the post's orders as `Rejected`. Anything
+/// else (a sent request with no reliable answer) stays `Unknown` for
+/// `orderStatus` reconciliation.
+pub fn post_result_from_error(err: &mev_core::error::Error) -> PostResult {
+    use mev_core::error::Error;
+    match err {
+        Error::Exchange(message) => PostResult::Rejected(message.clone()),
+        Error::NotSent(message) => PostResult::Rejected(message.clone()),
+        Error::Config(message) => PostResult::Rejected(message.clone()),
+        Error::Unimplemented(what) => PostResult::Rejected((*what).to_string()),
+        Error::Http(_) | Error::Decode(_) | Error::UnknownOutcome(_) => {
+            PostResult::Error(err.to_string())
+        }
     }
 }
 
@@ -190,12 +210,16 @@ mod tests {
     use super::*;
     use crate::builder::BuiltBatch;
     use crate::orders::{LiveOrder, OrderState};
-    use crate::types::{CoinId, Side, VenueOrderStatus};
+    use crate::types::{CoinId, OrderAck, Side, VenueOrderStatus};
 
     fn cloid(n: u8) -> Cloid {
         let mut bytes = [0u8; 16];
         bytes[0] = n;
         Cloid(bytes)
+    }
+
+    fn ack(status: VenueOrderStatus) -> OrderAck {
+        OrderAck { status, oid: None }
     }
 
     fn live(cloid: Cloid, state: OrderState) -> LiveOrder {
@@ -244,13 +268,58 @@ mod tests {
         orders.assign_req(3, &[c1, c2]);
 
         let result = PostResult::Statuses(smallvec![
-            VenueOrderStatus::Resting,
-            VenueOrderStatus::Filled,
+            ack(VenueOrderStatus::Resting),
+            ack(VenueOrderStatus::Filled)
         ]);
         apply_post_ack(&mut orders, 3, &result);
 
         assert_eq!(orders.get(c1).unwrap().state, OrderState::Resting);
         assert_eq!(orders.get(c2).unwrap().state, OrderState::Filled);
+    }
+
+    #[test]
+    fn post_ack_records_the_venue_oid_for_fill_mapping() {
+        let mut orders = OrderManager::new(1);
+        let c1 = cloid(1);
+        orders.insert(live(c1, OrderState::PendingNew));
+        orders.assign_req(3, &[c1]);
+        let result = PostResult::Statuses(smallvec![OrderAck {
+            status: VenueOrderStatus::Resting,
+            oid: Some(777),
+        }]);
+        apply_post_ack(&mut orders, 3, &result);
+        assert_eq!(orders.cloid_for_oid(777), Some(c1));
+        assert_eq!(orders.get(c1).unwrap().oid, Some(777));
+    }
+
+    #[test]
+    fn classifies_definitive_failures_as_rejected() {
+        use mev_core::error::Error;
+        for (err, rejected) in [
+            (Error::Exchange("rate limited".into()), true),
+            (Error::NotSent("dial failed".into()), true),
+            (Error::Config("no signer".into()), true),
+            (Error::UnknownOutcome("no reply".into()), false),
+            (Error::Http("500".into()), false),
+        ] {
+            let result = post_result_from_error(&err);
+            match (rejected, &result) {
+                (true, PostResult::Rejected(_)) | (false, PostResult::Error(_)) => {}
+                other => panic!("unexpected classification for {err:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_post_ack_is_ignored_by_the_order_manager() {
+        let mut orders = OrderManager::new(1);
+        let c1 = cloid(1);
+        orders.insert(live(c1, OrderState::PendingNew));
+        orders.assign_req(3, &[c1]);
+        apply_post_ack(&mut orders, 3, &PostResult::Rejected("boom".into()));
+        // The dispatcher marks the orders terminal; the manager itself leaves
+        // them for the caller (matching the Error path).
+        assert_eq!(orders.get(c1).unwrap().state, OrderState::PendingNew);
     }
 
     #[test]

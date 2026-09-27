@@ -16,6 +16,10 @@ pub enum Error {
     Decode(String),
     /// The exchange rejected a signed action (`status: "err"`).
     Exchange(String),
+    /// The action was definitively **not** sent: a dial failed, the socket was
+    /// closed before the frame was written, or request serialisation failed.
+    /// The caller may treat the orders as `Rejected` (SPEC-0002 H-2).
+    NotSent(String),
     /// An action was sent but no definitive reply was received (socket loss or
     /// timeout). The order's state is unknown and must be reconciled — never
     /// resent blindly (SPEC-0002 H-1/H-2).
@@ -31,6 +35,7 @@ impl fmt::Display for Error {
             Error::Http(msg) => write!(f, "http error: {msg}"),
             Error::Decode(msg) => write!(f, "decode error: {msg}"),
             Error::Exchange(msg) => write!(f, "exchange error: {msg}"),
+            Error::NotSent(msg) => write!(f, "not sent: {msg}"),
             Error::UnknownOutcome(msg) => write!(f, "unknown outcome: {msg}"),
             Error::Unimplemented(what) => write!(f, "not implemented: {what}"),
         }

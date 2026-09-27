@@ -18,7 +18,7 @@ use mev_strategy::StrategyId;
 use rust_decimal::Decimal;
 use smallvec::SmallVec;
 
-use crate::types::{Cloid, CoinId, Px, Side, Sz, VenueOrderStatus};
+use crate::types::{Cloid, CoinId, OrderAck, Px, Side, Sz, VenueOrderStatus};
 
 /// The lifecycle state of a live order (SPEC-0010 §10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,16 +379,20 @@ impl OrderManager {
         self.by_req.insert(req_id, cloids.iter().copied().collect());
     }
 
-    /// Apply a post ack's per-order statuses to the request's cloids in order.
+    /// Apply a post ack's per-order results to the request's cloids in order.
     ///
-    /// The request entry is removed once resolved. Statuses beyond the
-    /// registered cloids (or a missing request) are ignored.
-    pub fn on_post_ack(&mut self, req_id: u64, statuses: &[VenueOrderStatus]) {
+    /// The request entry is removed once resolved. Results beyond the
+    /// registered cloids (or a missing request) are ignored. A result that
+    /// carries the venue oid records it for fill mapping.
+    pub fn on_post_ack(&mut self, req_id: u64, acks: &[OrderAck]) {
         let Some(cloids) = self.by_req.remove(&req_id) else {
             return;
         };
-        for (cloid, status) in cloids.iter().zip(statuses.iter()) {
-            self.apply_status(*cloid, *status, None);
+        for (cloid, ack) in cloids.iter().zip(acks.iter()) {
+            if let Some(oid) = ack.oid {
+                self.record_oid(oid, *cloid);
+            }
+            self.apply_status(*cloid, ack.status, None);
         }
     }
 
@@ -589,6 +593,10 @@ mod tests {
         Cloid(bytes)
     }
 
+    fn ack(status: VenueOrderStatus) -> OrderAck {
+        OrderAck { status, oid: None }
+    }
+
     fn live(cloid: Cloid, coin: u16, px: &str, sz: &str, state: OrderState) -> LiveOrder {
         LiveOrder {
             cloid,
@@ -700,7 +708,7 @@ mod tests {
             OrderState::PartiallyFilled
         );
         // A stale `resting` ack must not downgrade the fill.
-        manager.on_post_ack(9, &[VenueOrderStatus::Resting]);
+        manager.on_post_ack(9, &[ack(VenueOrderStatus::Resting)]);
         assert_eq!(
             manager.get(partial).unwrap().state,
             OrderState::PartiallyFilled
@@ -711,7 +719,7 @@ mod tests {
         manager.assign_req(10, &[full]);
         manager.on_fill(Some(full), ds("2"));
         assert_eq!(manager.get(full).unwrap().state, OrderState::Filled);
-        manager.on_post_ack(10, &[VenueOrderStatus::Resting]);
+        manager.on_post_ack(10, &[ack(VenueOrderStatus::Resting)]);
         assert_eq!(manager.get(full).unwrap().state, OrderState::Filled);
     }
 
@@ -792,11 +800,17 @@ mod tests {
         manager.insert(live(c2, 0, "10", "4", OrderState::PendingNew));
 
         // Only the assigned request carries cloids; an unknown req is ignored.
-        manager.on_post_ack(7, &[VenueOrderStatus::Resting]);
+        manager.on_post_ack(7, &[ack(VenueOrderStatus::Resting)]);
         assert_eq!(manager.get(c1).unwrap().state, OrderState::PendingNew);
 
         manager.assign_req(8, &[c1, c2]);
-        manager.on_post_ack(8, &[VenueOrderStatus::Resting, VenueOrderStatus::Filled]);
+        manager.on_post_ack(
+            8,
+            &[
+                ack(VenueOrderStatus::Resting),
+                ack(VenueOrderStatus::Filled),
+            ],
+        );
         assert_eq!(manager.get(c1).unwrap().state, OrderState::Resting);
         assert_eq!(manager.get(c2).unwrap().state, OrderState::Filled);
         assert_eq!(manager.get(c2).unwrap().filled_sz, ds("4"));
@@ -813,13 +827,19 @@ mod tests {
         manager.insert(live(c3, 0, "10", "1", OrderState::PendingNew));
         manager.assign_req(1, &[c1, c2]);
 
-        manager.on_post_ack(1, &[VenueOrderStatus::Resting, VenueOrderStatus::Resting]);
+        manager.on_post_ack(
+            1,
+            &[
+                ack(VenueOrderStatus::Resting),
+                ack(VenueOrderStatus::Resting),
+            ],
+        );
         // The dead-man count includes every working order: c1/c2 resting and c3
         // still pending.
         assert_eq!(manager.resting_count(), 3);
 
         // c3 never got a request; a repeated ack is a no-op.
-        manager.on_post_ack(1, &[VenueOrderStatus::Resting]);
+        manager.on_post_ack(1, &[ack(VenueOrderStatus::Resting)]);
         assert_eq!(manager.resting_count(), 3);
 
         // A partially filled order is still working, a filled one is terminal.

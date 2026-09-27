@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use mev_hl_client::{AssetMap, MarketKind};
+use mev_hl_client::{AssetMap, MarketKind, OrderStatusResponse};
 use rust_decimal::Decimal;
 use smallvec::SmallVec;
 
@@ -273,12 +273,26 @@ pub enum VenueOrderStatus {
     Other,
 }
 
+/// One per-order outcome in a post ack, with the venue oid when the reply
+/// carried one (`resting`/`filled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderAck {
+    /// The venue status.
+    pub status: VenueOrderStatus,
+    /// The venue order id, if the reply carried one.
+    pub oid: Option<u64>,
+}
+
 /// Outcome of a posted action, as routed back from the exec backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostResult {
     /// Per-order statuses, in request order.
-    Statuses(SmallVec<[VenueOrderStatus; 8]>),
-    /// The post failed; the text is the venue or transport error.
+    Statuses(SmallVec<[OrderAck; 8]>),
+    /// The venue definitively refused the post, or it was never sent. The
+    /// orders are terminal `Rejected` (SPEC-0002 H-2). The text is the reason.
+    Rejected(String),
+    /// The post was sent but no definitive reply arrived; the orders are
+    /// `Unknown` and are reconciled by `cloid` (SPEC-0002 H-1/H-2).
     Error(String),
 }
 
@@ -420,6 +434,26 @@ pub enum AccountUpdate {
         stamp: Stamp,
         /// The snapshot's fills.
         fills: Vec<FillData>,
+    },
+    /// An `Unknown` order resolved by an `orderStatus` query (SPEC-0002 H-2).
+    ///
+    /// Applied only while the order is still `Unknown`, so a stale answer that
+    /// arrives after a newer stream update cannot move the order backwards.
+    ResolveUnknown {
+        /// Receive stamp.
+        stamp: Stamp,
+        /// Client order id.
+        cloid: Cloid,
+        /// The venue's `orderStatus` answer.
+        status: OrderStatusResponse,
+    },
+    /// An `orderStatus` retry bound expired with the order still `Unknown`:
+    /// resolve it as not placed (`Rejected`) and let the breaker clear.
+    UnknownExpired {
+        /// Receive stamp.
+        stamp: Stamp,
+        /// Client order id.
+        cloid: Cloid,
     },
     /// A posted action's result.
     PostAck {

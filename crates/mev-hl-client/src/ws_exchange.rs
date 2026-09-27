@@ -163,7 +163,7 @@ impl WsExchange {
         ensure_crypto_provider();
         let (socket, _resp) = connect_async(url)
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(|e| Error::NotSent(format!("websocket dial failed: {e}")))?;
         set_tcp_nodelay(socket.get_ref())?;
         Ok(socket)
     }
@@ -212,7 +212,7 @@ impl WsExchange {
                 payload: request,
             },
         })
-        .map_err(|e| Error::Decode(e.to_string()))?;
+        .map_err(|e| Error::NotSent(format!("request serialisation failed: {e}")))?;
 
         // Cap simultaneous posts at the venue limit.
         let _permit = self
@@ -220,13 +220,14 @@ impl WsExchange {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| Error::Http("websocket closed before send".into()))?;
+            .map_err(|_| Error::NotSent("websocket closed before send".into()))?;
 
         let (tx, rx) = oneshot::channel();
         let send_tx = self.register_pending(id, tx).await?;
         if send_tx.send(Message::Text(frame.into())).await.is_err() {
             self.remove_pending(id);
-            return Err(Error::UnknownOutcome("websocket send failed".into()));
+            // The frame never entered the writer queue, so it was not sent.
+            return Err(Error::NotSent("websocket send failed".into()));
         }
 
         match tokio::time::timeout(self.request_timeout, rx).await {
@@ -358,8 +359,10 @@ impl WsExchange {
         match reply.get("type").and_then(Value::as_str) {
             Some("action") => {
                 let payload = reply.get("payload").cloned().unwrap_or(Value::Null);
-                let response: ExchangeResponse =
-                    serde_json::from_value(payload).map_err(|e| Error::Decode(e.to_string()))?;
+                // The reply was received but could not be parsed: the order's
+                // outcome is ambiguous, so reconcile rather than reject.
+                let response: ExchangeResponse = serde_json::from_value(payload)
+                    .map_err(|e| Error::UnknownOutcome(format!("undecodable post reply: {e}")))?;
                 if !response.is_ok() {
                     let message = response
                         .error_message()
@@ -378,7 +381,9 @@ impl WsExchange {
                     .to_string();
                 Err(Error::Exchange(message))
             }
-            _ => Err(Error::Decode(format!("unexpected post reply: {reply}"))),
+            _ => Err(Error::UnknownOutcome(format!(
+                "unexpected post reply: {reply}"
+            ))),
         }
     }
 }
@@ -792,8 +797,8 @@ mod tests {
         let exchange =
             WsExchange::with_url("ws://127.0.0.1:1", Mode::Live, Some(signer())).unwrap();
         match tokio::time::timeout(Duration::from_secs(5), exchange.warm()).await {
-            Ok(Err(Error::Http(_))) => {}
-            Ok(other) => panic!("expected Http error, got {other:?}"),
+            Ok(Err(Error::NotSent(_))) => {}
+            Ok(other) => panic!("expected NotSent error, got {other:?}"),
             Err(_) => panic!("warm hung instead of failing fast"),
         }
         assert!(!exchange.is_connected());

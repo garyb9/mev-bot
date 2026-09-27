@@ -157,6 +157,10 @@ impl RejectReason {
 pub struct OrderResponse {
     /// Per-order statuses, in request order.
     pub statuses: Vec<OrderStatus>,
+    /// Per-order venue `oid`s, in request order (`None` when the reply carried
+    /// none, e.g. a string status or an error). Used to map later fills to
+    /// their orders (SPEC-0002 H-2/H-3).
+    pub oids: Vec<Option<u64>>,
 }
 
 impl OrderResponse {
@@ -168,12 +172,21 @@ impl OrderResponse {
             .and_then(Value::as_array)
             .ok_or_else(|| Error::Decode("order response missing data.statuses".into()))?;
 
-        let statuses = entries
-            .iter()
-            .map(|entry| match entry {
-                Value::String(s) => OrderStatus::parse(s),
+        let mut statuses = Vec::with_capacity(entries.len());
+        let mut oids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry {
+                Value::String(s) => {
+                    statuses.push(OrderStatus::parse(s));
+                    oids.push(None);
+                }
                 Value::Object(map) => {
-                    if map.contains_key("resting") {
+                    let oid = map
+                        .get("resting")
+                        .and_then(|resting| resting.get("oid"))
+                        .or_else(|| map.get("filled").and_then(|filled| filled.get("oid")))
+                        .and_then(Value::as_u64);
+                    let status = if map.contains_key("resting") {
                         OrderStatus::Resting
                     } else if map.get("filled").is_some() {
                         OrderStatus::Filled
@@ -181,13 +194,18 @@ impl OrderResponse {
                         OrderStatus::parse(error)
                     } else {
                         OrderStatus::Other(entry.to_string())
-                    }
+                    };
+                    statuses.push(status);
+                    oids.push(oid);
                 }
-                _ => OrderStatus::Other(entry.to_string()),
-            })
-            .collect();
+                _ => {
+                    statuses.push(OrderStatus::Other(entry.to_string()));
+                    oids.push(None);
+                }
+            }
+        }
 
-        Ok(OrderResponse { statuses })
+        Ok(OrderResponse { statuses, oids })
     }
 }
 
@@ -546,10 +564,11 @@ impl HttpExchange {
             return Err(Error::Http(format!("POST /exchange -> {status}: {text}")));
         }
 
+        // The response arrived but could not be parsed: reconcile, don't reject.
         let response: ExchangeResponse = resp
             .json()
             .await
-            .map_err(|e| Error::Decode(e.to_string()))?;
+            .map_err(|e| Error::UnknownOutcome(format!("undecodable post reply: {e}")))?;
 
         if !response.is_ok() {
             let message = response
