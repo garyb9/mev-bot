@@ -305,6 +305,75 @@ pub fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, ReaderError> {
     SegmentReader::open(path)?.collect()
 }
 
+/// Enumerate every segment file under `out_dir/{network}` for the inclusive
+/// UTC date range `[from, to]`, across all sources, sorted by path.
+///
+/// Includes `.crashed` segments (their readable prefix is still replay/verify
+/// input) and never returns manifest files. A missing root yields an empty
+/// list, so replay over a not-yet-recorded range is a clean no-op.
+pub fn segments_for(
+    out_dir: &Path,
+    network: &str,
+    from: &str,
+    to: &str,
+) -> Result<Vec<PathBuf>, ReaderError> {
+    let (from_start, _) =
+        day_bounds(from).ok_or_else(|| ReaderError::InvalidDate(from.to_string()))?;
+    let (to_start, _) = day_bounds(to).ok_or_else(|| ReaderError::InvalidDate(to.to_string()))?;
+    if from_start > to_start {
+        return Ok(Vec::new());
+    }
+
+    let root = out_dir.join(network);
+    let mut files = Vec::new();
+    let src_dirs = match fs::read_dir(&root) {
+        Ok(dirs) => dirs,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(files),
+        Err(err) => return Err(err.into()),
+    };
+    for src in src_dirs {
+        let src_path = src?.path();
+        let date_dirs = match fs::read_dir(&src_path) {
+            Ok(dirs) => dirs,
+            Err(_) => continue,
+        };
+        for date in date_dirs {
+            let date_path = date?.path();
+            if !date_path.is_dir() {
+                continue;
+            }
+            let Some(name) = date_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            match day_bounds(name) {
+                Some((day_start, _)) if day_start >= from_start && day_start <= to_start => {}
+                _ => continue,
+            }
+            collect_segments(&date_path, &mut files)?;
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Recursively collect `.jsonl.zst`/`.jsonl.zst.crashed` files under `dir`.
+fn collect_segments(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), ReaderError> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_segments(&path, files)?;
+        } else if is_segment(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_segment(path: &Path) -> bool {
+    let name = path.to_string_lossy();
+    name.ends_with(".jsonl.zst") || name.ends_with(".jsonl.zst.crashed")
+}
+
 /// Lazily merge segment files by `(t_ns, conn, seq)`.
 pub fn merge_segments_iter(paths: &[PathBuf]) -> Result<MergeIter, ReaderError> {
     MergeIter::new(paths)
@@ -1239,6 +1308,47 @@ mod tests {
         assert_eq!(report.coverage.len(), 1);
         assert_eq!(report.coverage[0].covered_ms, report.coverage[0].day_ms);
         assert_eq!(report.coverage[0].coverage_pct, 100.0);
+    }
+
+    #[test]
+    fn segments_for_enumerates_a_date_range_and_skips_manifests() {
+        let dir = temp_dir("segments-for");
+        let clock = FixedEnvelopeClock::new(1_700_000_000_000_000_000, 0);
+        let one = |n: u64| vec![Envelope::frame(&clock, "hl-ws", "hl-ws-01", n, "x")];
+        write_segment(&dir, "hl-ws", "hl-ws-01", "2026-01-01", 0, &one(0), false);
+        write_segment(&dir, "hl-ws", "hl-ws-01", "2026-01-02", 0, &one(1), true);
+        write_segment(
+            &dir,
+            "binance-usdm",
+            "binance-usdm-01",
+            "2026-01-03",
+            0,
+            &one(2),
+            false,
+        );
+        write_segment(&dir, "hl-ws", "hl-ws-01", "2026-02-01", 0, &one(3), false);
+
+        let got = segments_for(&dir, "testnet", "2026-01-01", "2026-01-02").unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(
+            got.iter()
+                .all(|path| !path.to_string_lossy().contains("manifest"))
+        );
+        assert!(
+            got.iter()
+                .any(|path| path.to_string_lossy().ends_with(".crashed"))
+        );
+
+        let wide = segments_for(&dir, "testnet", "2026-01-01", "2026-02-01").unwrap();
+        assert_eq!(wide.len(), 4, "{wide:?}");
+
+        let empty = temp_dir("segments-for-empty");
+        assert!(
+            segments_for(&empty, "testnet", "2026-01-01", "2026-01-01")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(segments_for(&dir, "testnet", "2026-13-01", "2026-01-02").is_err());
     }
 
     #[test]

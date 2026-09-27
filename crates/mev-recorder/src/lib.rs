@@ -23,7 +23,7 @@ pub use planner::{
 };
 pub use reader::{
     FileCheck, InspectReport, MergeIter, MissingSeqs, ReaderError, SegmentReader, SeqHoles,
-    SeqRange, StreamCoverage, VerifyConfig, VerifyReport,
+    SeqRange, StreamCoverage, VerifyConfig, VerifyReport, segments_for,
 };
 pub use segment::{
     DiskSpace, ManifestEntry, SegmentConfig, SegmentError, SegmentWriter, SystemDiskSpace,
