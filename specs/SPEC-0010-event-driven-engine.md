@@ -371,7 +371,7 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 | E-10 | Latency stamps, histograms, benches incl. zero-alloc (§17) | M | E-6 | ✅ |
 | E-11 | Fixed-point `Px`/`Sz` (**only if** E-10 shows decode/eval over budget) | L | E-10 | ✅ |
 | E-12 | Performance checklist (§18), results recorded | M | E-10 | ✅ |
-| E-13 | Remove the tick engine; update SPEC-0003 status; update RUNBOOK | S | E-4, E-6, E-7, E-8 | ✅ |
+| E-13 | Remove the tick engine; update SPEC-0003 status; update RUNBOOK | S | E-4, E-5 | ✅ |
 
 ### Task details
 
@@ -455,39 +455,14 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 - **Gap handling wired:** a feed gap/stream end sends `MarketUpdate::Gap{open:true}` and a (re)connect sends `open:false`; the loop marks all coins stale on open and clears a coin on its next fresh update, so the §11 stale-coin rejection is no longer inert (`run.rs` test `gap_marks_coins_stale_until_fresh_data_arrives`).
 - Done-when verified: `grep -rn "interval(Duration::from_secs(1))" crates/mev-bot` finds only the 1 s dead-man tick and the 1 s staleness monitor — **no decision loop**; all tests pass.
 
-**E-13 remaining (recorded, not done).**
-1. **H-2 regression.** The deleted `Engine::reconcile_unknown` (`orderStatus`-by-cloid, SPEC-0002 H-2) is not re-wired; exec errors now surface as `PostResult::Error` (fail-closed breaker) instead of being reconciled. Re-wire via `reconcile::Reconciler::resolve_unknown` in the live path.
-2. **H-3 account stream not wired in `hl`.** The REST reconciler is the wired backstop and `AccountUpdate::Reconcile` carries only `account_value`/`margin_used`; positions and order-state drift are not applied. Live cancels without per-order statuses leave orders tracked as working until H-3 lands (SPEC-0002 H-3 / SPEC-0010 E-8).
+**E-13 remaining (post-E-13 review, 2026-09-27; items 1–2 are now T0).**
+1. **H-2 regression — T0 ([`docs/GOAL.md`](../docs/GOAL.md) §2.2 row 8).** The deleted `Engine::reconcile_unknown` (`orderStatus`-by-cloid, SPEC-0002 H-2) is not re-wired; exec errors now surface as `PostResult::Error` (fail-closed breaker) and the dispatcher marks every order in the post `Rejected` (a terminal state) instead of `Unknown`. A lost reply can leave a resting order invisible to exposure and to the dead-man resting count. Re-wire via `reconcile::Reconciler::resolve_unknown` in the live path.
+2. **H-3 account stream not wired in `hl` — T0 ([`docs/GOAL.md`](../docs/GOAL.md) §2.2 row 11).** The REST reconciler is the wired backstop and `AccountUpdate::Reconcile` carries only `account_value`/`margin_used`; positions and order-state drift are not applied. Live cancels without per-order statuses leave orders tracked as working until H-3 lands (SPEC-0002 H-3 / SPEC-0010 E-8).
 3. **Replay of new sessions** records market/reconcile events but no `Timer` events, so `hl replay` over a fresh session yields no intents; the v2 replay driver is E-7 part 2 (blocked on SPEC-0008 R-7).
+4. **Single-post exec writer — T0 ([`docs/GOAL.md`](../docs/GOAL.md) §2.2 row 9).** The `hl` exec writer awaits each `exchange.submit` in turn, so only one post is ever in flight (undoes H-1, E-6). Restore concurrent posts.
+5. **No kill-switch trigger — T0 ([`docs/GOAL.md`](../docs/GOAL.md) §2.2 row 10).** `hl` has no `SIGUSR1` handler, no flag-file poll, and no `hl panic`/`hl resume` command, so the §16 kill switch cannot be tripped. K-3 owns the primitive; the triggers land in the E-13 wiring.
 
-**E-13 blocked (2026-09-27) — do not remove any code yet.**
-
-*What E-13 requires.* Delete the legacy tick engine `crates/mev-bot/src/engine.rs` (all ~1606 lines: `Engine`/`EngineBuild`/`build`, `Engine::run`/`step`, the `interval(Duration::from_secs(1))` decision tick, the `AccountView`/`MarketView` clone-per-tick `step`, the `Recorder`/`replay` paths, and the `Arc<RwLock<MarketState>>` plumbing), move `mev-bot`'s orchestration onto the v2 `mev_engine::EngineLoop`, then update SPEC-0003 §16 / `RUNBOOK.md` / `AGENTS.md`. Its done-when is `grep -r "interval(Duration::from_secs(1))" crates/mev-bot` finds no **decision loop**, plus all tests pass.
-
-*Why it cannot be done now.* `mev-bot` still runs the legacy engine as its only trading path:
-- `crates/mev-bot/src/main.rs:14` (`mod engine;`), `:298` (`engine::build`), `:335-361` (`engine::Engine::new` + `tokio::spawn(engine.run(...))`), `:348-355` (`engine::account_reconciler`), and `:838` (`engine::replay`). `mev-bot` depends on `mev-engine` (Cargo.toml:26) only *through* `engine.rs` (`use mev_engine::{…}` at `engine.rs:13,72,95,117,120,1480`), which drives the E-4 `Strategy` v2 trait synchronously.
-- `crates/mev-bot/src/engine.rs:386` (`pub async fn run`) is the decision loop; `:391` is `tokio::time::interval(Duration::from_secs(1))`; `:400` (`async fn step`) clones `MarketView`/`AccountView` every tick under `RwLock`.
-- Deleting `engine.rs` leaves `main.rs` with no implementation of its `run`/`replay` commands and no consumer of the v2 `Strategy` trait — the binary would not compile. So the code removal is blocked until the v2 engine *replaces* it in `mev-bot`.
-
-The v2 engine cannot yet replace it:
-- **E-8 part 1 only, and not loop-driven.** `mev-engine/src/reconcile.rs` and `state.rs` are a tested library (E-8 note above), but the v2 `EngineLoop` (`mev-engine/src/run.rs:69`) does not own a `Reconciler`/`AccountStreamState` — it routes account updates through the E-3 `Dispatcher` seam (`run.rs:23-35`) and does not enforce the account-gap halt on the v2 place path. `mev-bot` is currently the *only* consumer of `Reconciler` (via `main.rs:348`).
-- **E-5's dispatch replacement is outstanding.** `EngineLoop` still uses the E-3 `Dispatcher` seam; per-strategy dispatch built from `interests()` (E-5) has not landed, so the loop has no real strategy consumer to take over from `engine.rs` (also §23 Q-Loop-Instrumentation).
-- **E-6 / E-7 are part-1 only.** E-6 keeps signing in the exec layer and drops `Action::Modify` (`batchModify` unverified, E-6 open item 2), so `MarketMaker` can still not re-quote on the new engine; E-7's recorder-segment replay half is blocked on SPEC-0008 R-7, and only the SQLite-log replay in the legacy `engine.rs` exists.
-- Consequence: E-13's dependencies E-6, E-7, E-8 are 🔄 (part 1), not ✅, so per AGENTS.md §4/§5 E-13 may not start.
-
-*Unblock checklist (ordered).*
-1. **E-5** — replace the `Dispatcher` seam in `run.rs` with per-strategy dispatch built from `interests()`, and give `EngineLoop` the `OrderManager` (already in `orders.rs`) as its consumer. This is the prerequisite for E-13.
-2. **E-8 part 2** — move the `Reconciler` + `AccountStreamState` (reconcile.rs/state.rs) under `EngineLoop`: the loop owns the H-3 account consumers, the §15 reconcile cadence, and the account-gap halt on the place path.
-3. Wire the **risk gate** (`risk.rs`, E-9) and the **exec backend** (`exec.rs` `ExecBackend`/`WsExec`; `paper_exec.rs` for `simulate`) into the loop, plus the E-10 `LatencyRecorder`/`Stamps` hooks (§23 Q-Loop-Instrumentation) — the current `main.rs` risk/halt/reconciler wiring (`main.rs:335-390`) moves here.
-4. **Build orchestration on the loop.** In `mev-bot/src/main.rs`, replace `engine::build`/`Engine::new`/`engine.run` (`main.rs:298,335-361`), the `engine`-based reconcile task (`main.rs:348-355`), and `engine::replay` (`main.rs:838`) with `mev_engine` entry points; remove `mod engine;` (`main.rs:14`).
-5. **Delete** `crates/mev-bot/src/engine.rs` and the `Arc<RwLock<MarketState>>` plumbing it exists to feed.
-6. **Docs.** Update SPEC-0003 §16, `RUNBOOK.md`, and the `AGENTS.md` §3 repo map (exact list below).
-7. Verify `grep -r "interval(Duration::from_secs(1))" crates/mev-bot` finds no **decision loop** (the `:595` monitor and `:488` dead-man intervals are not decision loops; confirm each remaining hit is not a trading decision), then run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
-
-*Doc edits E-13 will need once unblocked (not made now).*
-- **SPEC-0003 §16** (`specs/SPEC-0003-strategy-engine.md:147`): retarget "the tick engine is deleted in E-13" from `mev-bot/src/engine.rs` to `mev-engine`; also revisit `:151` (`paper.rs` "fills only on the tick" → `PaperExec`, §14), `:153` (recording moves off `engine.rs::Recorder`), `:154` (replay moves off `engine.rs::replay_events`).
-- **RUNBOOK.md**: `:80` ("refreshed on a 1s heartbeat"), `:102` (`hl panic` _(pending)_ — the CLI has no `panic` command; see `main.rs:47`), and `:125-141` ("Replay a recorded session" — "the 1 s decision tick" and the `engine.rs` SQLite `events` replay path).
-- **AGENTS.md §3**: the `crates/mev-bot` row ("`src/engine.rs` is the legacy tick engine (being replaced per SPEC-0010 …)") becomes misleading once it is deleted; drop the clause.
+*Historical note.* An earlier revision of this spec recorded E-13 as blocked (2026-09-27). E-5b (`StrategyDispatcher`) and the `hl` port then landed, so that block is superseded by the *E-13 implemented* note above; its unblock checklist and doc edits are done, and no code was reverted. Its dependency cell was corrected to the real prerequisites (E-4, E-5b) at the same time; the E-6/E-7/E-8 remainders are tracked as *E-13 remaining* above and as [`docs/GOAL.md`](../docs/GOAL.md) §2.2 rows 8–11.
 
 ## 21. Measured results (filled in by E-10 / E-12)
 
@@ -533,4 +508,4 @@ row additionally needs a testnet round-trip; no host row is fabricated here.
 9. **Q-Decode-Alloc (E-10).** The engine-side `Bbo` apply is 0 alloc/event (G-3 satisfied for the apply path), but `Ingest::decode` allocates 1×/event: `decode_market` pre-parses a borrowed channel tag, and `serde_json`'s ignored-value handling allocates once for the nested `data` shape. Fix by dispatching from one typed borrowed envelope or scanning the tag without `serde_json`. Also `replay_throughput` is ~649 k events/s (vs ≥1 M); both are E-12/E-11 inputs.
 10. **Q-Loop-Instrumentation (E-10/E-12).** `run.rs` now owns a `LatencyRecorder` and `StrategyDispatcher` fills the engine-side `Stamps` (decode/queue/decide/risk/sign spans) and records each iteration. `t_written`/`t_ack` (handoff/`tick_to_order`/`submit_ack`) stay unset until the exec layer reports them back (signing is off-thread, E-6), so those histograms are not yet emitted; the exec ack path fills them when the live exec writer lands (E-13).
 11. **Q-E12-Reference-Host (E-12).** No production/reference host (SPEC-0008 V-4) exists yet, so the following are decided but unmeasured here and wait on it. **§18 rows:** (a) `core_affinity` pinning — bench p99 with/without + VPS steal time; (b) `spin_us` sweep 0/20/50/100/250 µs, p99 vs CPU%; (c) `mimalloc` — bench hot-path vs system allocator; (d) warm standby exec — measure forced-drop reconnect gap; (e) thin-vs-fat LTO — bench `bbo_to_action`/`replay_throughput`. **§21 rows:** all dev-host rows (`bbo_to_action`, handoff, sign, allocations/event, replay throughput, `drain_1000`) must be re-measured on the reference host under `lto = "fat"`; `hl_submit_ack_seconds` needs a testnet round-trip. Run the same criterion benches from `crates/mev-bot/benches/engine.rs` (and `mev-engine/tests/zero_alloc.rs`) on that host and fill the before/after table.
-11. **Q-E13-Unblock (E-13, resolved).** E-5b's `StrategyDispatcher` and the `mev-bot` port landed, so the legacy 1 s tick engine is removed and `hl` runs `EngineLoop<StrategyDispatcher>` (E-13 note above). Follow-ups from the port are tracked as E-13 "remaining": the H-2 `reconcile_unknown` re-wire, the H-3 account stream, and the v2 replay driver (E-7 part 2).
+12. **Q-E13-Unblock (E-13, resolved).** E-5b's `StrategyDispatcher` and the `mev-bot` port landed, so the legacy 1 s tick engine is removed and `hl` runs `EngineLoop<StrategyDispatcher>` (E-13 note above). Follow-ups from the port are tracked as E-13 "remaining": the H-2 `reconcile_unknown` re-wire, the H-3 account stream, and the v2 replay driver (E-7 part 2).
