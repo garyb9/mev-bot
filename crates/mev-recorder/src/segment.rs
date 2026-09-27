@@ -477,17 +477,26 @@ struct FinishedSegment {
 }
 
 /// One line of a day's `manifest.jsonl` (SPEC-0008 §6).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ManifestEntry {
-    file: String,
-    src: String,
-    conn: String,
-    first_t_ns: i64,
-    last_t_ns: i64,
-    records: u64,
-    bytes_raw: u64,
-    bytes_zst: u64,
-    crashed: bool,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    /// Path of the finished segment, relative to `out_dir`.
+    pub file: String,
+    /// Source id.
+    pub src: String,
+    /// Connection id within the source.
+    pub conn: String,
+    /// First record's wall-clock time, ns since the epoch.
+    pub first_t_ns: i64,
+    /// Last record's wall-clock time, ns since the epoch.
+    pub last_t_ns: i64,
+    /// Number of lines in the file (including `segment_close` when clean).
+    pub records: u64,
+    /// Uncompressed bytes written.
+    pub bytes_raw: u64,
+    /// Compressed file size.
+    pub bytes_zst: u64,
+    /// Whether the segment was recovered from a crash.
+    pub crashed: bool,
 }
 
 fn recover_crashed(config: &SegmentConfig) -> Result<(), SegmentError> {

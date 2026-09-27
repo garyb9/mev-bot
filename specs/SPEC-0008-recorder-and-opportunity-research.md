@@ -735,10 +735,10 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | R-1 | `mev-recorder` crate skeleton + envelope types | T1 | S | — | ✅ |
 | R-2 | Segment writer (zstd, rotation, manifest, crash recovery, disk guard) | T1 | M | R-1 | ✅ |
 | R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | **T0** | M | — | ✅ |
-| R-4 | Subscription planner + universe selectors | T1 | M | R-1 | ☐ |
-| R-5 | HL REST snapshotter with weight budget (incl. candle backfill) | T1 | M | R-1, R-2 | ☐ |
+| R-4 | Subscription planner + universe selectors | T1 | M | R-1 | ✅ |
+| R-5 | HL REST snapshotter with weight budget (incl. candle backfill) | T1 | M | R-1, R-2 | ✅ |
 | R-6 | `hl record` / `record plan` / `probe latency` CLI, profiles, metrics, health | T1 | M | R-2, R-3, R-4, R-5 | ☐ |
-| R-7 | Segment reader + `hl record inspect` / `verify` | T1 | S | R-2 | ☐ |
+| R-7 | Segment reader + `hl record inspect` / `verify` | T1 | S | R-2 | ✅ |
 | R-8 | Binance/Bybit sources | T1 | S | R-3, R-6, V-2 | ☐ |
 | R-9 | HyperEVM pool source | T2 | L | R-6, V-5, V-6 (+ SPEC-0009 node or a provider) | ☐ |
 | R-10 | Deploy recorder (systemd, chrony, runbook, optional shipping) | T1 | M | R-6, R-7, V-4 | ☐ |
@@ -881,7 +881,9 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Do:** `crates/mev-recorder/src/reader.rs`: iterate the envelopes of a file (tolerates a truncated tail in `.crashed` files); merge several files by `(t_ns, conn, seq)`. Implement the `hl record inspect` and `hl record verify` outputs from §12.1.
 - **Tests:** a truncated file reads up to the last full line; merge order; `seq` hole detection.
 - **Done when:** tests pass.
-- **Blocks:** SPEC-0010 **E-7 part 2** (`hl replay` over recorder segments). E-7 part 1 (`PaperExec` + latency + determinism) is done; the segment replay is waiting on R-7 (and R-1/R-2). See SPEC-0010 §23 Q-Replay-Gap.
+- **Blocks:** SPEC-0010 **E-7 part 2** (`hl replay` over recorder segments). E-7 part 1 (`PaperExec` + latency + determinism) is done; R-7's reader now exists in `mev-recorder`, so the replay driver can be wired next. See SPEC-0010 §23 Q-Replay-Gap.
+
+**R-4 / R-5 / R-7 implemented (2026-09-27).** `planner.rs` ships the §7.3 selectors and the §7.4 algorithm (`plan`, `Plan`/`Connection`/`Pacer`/`VolumeIndex`, deterministic golden plans, over-budget drop order, `l2Book` isolation). `sources/hl_rest.rs` ships `RestSnapshotter` with the 300/min weight bucket, raw-body `rest` envelopes, and persisted `fundingHistory`/`candleSnapshot` paging; because `HttpInfo` discards the raw text, R-5 uses a local `RawInfoClient` (reqwest) rather than changing `mev-hl-client`. `reader.rs` ships `read_envelopes` (truncated-tail tolerant), `merge_segments`, and the pure `inspect`/`verify` analyses. The `hl record` CLI, profiles, metrics, and health are **R-6**, still open. Open questions recorded in §17 (#11–#17).
 
 #### R-8 — CEX sources
 - **Do:** `Protocol` implementations for `binance-usdm`, `binance-spot`, `bybit-linear` per §9 (confirmed by V-2). Add a `[cex]` section to the profile. Each venue gets its own `src` directory.
@@ -1003,3 +1005,10 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 8. **Writer-originated `seq` (R-1/R-2).** §5.1 defines `seq` as the per-`conn` data counter, but `segment_open`/`segment_close` are produced by the writer, not the caller. The writer currently stamps `segment_open.seq` from the first data envelope and `segment_close.seq` from the last, so a naive hole detector sees no downward jump. Confirm this is the intended reading.
 9. **`records`/`bytes_raw` scope (R-2).** §6 lists `records`/`bytes_raw` without saying whether they include the `segment_close` line. Current choice: `segment_close.meta` counts lines **before** close; the manifest's `records` counts **total file lines including close** (so `records` equals the decoded line count).
 10. **Per-stream disk guard (R-2).** §6 says stop the "lowest-priority streams"; with one `SegmentWriter` per `(src, conn)` the guard stops only its own stream and emits `gap_start{reason:"disk"}`. A cross-stream coordinator (priority ordering) lands with R-6.
+11. **`*:top:N` volume source (R-4).** Perps rank from a caller-built `VolumeIndex` (positional `meta.universe`↔`asset_ctxs`); the `spotMetaAndAssetCtxs` row alignment is unverified, so spot volume uses `VolumeIndex::insert` and missing volume ranks last (ties by canonical coin). Confirm the shape with V-1.
+12. **`spot:quotes` needs `SpotMeta` (R-4).** `AssetMap` does not expose token indices, so `spot:quotes` requires the caller to pass `SpotMeta` (else `PlannerError::MissingSpotMeta`). Confirm this is acceptable for R-6.
+13. **`fundingHistory` paging shape (R-5).** Assumed a JSON array with a ms `time` field; next `startTime = max_time + 1`; "caught up" at `now − 60 s`; the per-item weight surcharge is unverified (flat weight 20 used). Verify with V-1.
+14. **`candleSnapshot` paging (R-5).** Window fixed at 6 h; weight `20 + 20·(candles/60)`; response field `t` assumed. Verify with V-1.
+15. **`predictedFundings` (R-5)** is recorded raw but not parsed (shape ⚠ V-1).
+16. **`inspect` gap duration (R-7)** counts paired `gap_start`/`gap_end` only; an open gap (crashed tail, no `gap_end`) increments the gap count but contributes no duration (`crashed_files` is reported separately).
+17. **`verify` coverage (R-7)** is the single recorded span `[min_t_ns, max_t_ns]` per `(src,conn)` minus explicit gaps, clipped to the day; unmarked holes between segments can read as covered. Union per-segment intervals when R-6 produces real data.

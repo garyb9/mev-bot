@@ -2438,10 +2438,15 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "mev-core",
+ "mev-hl-client",
+ "reqwest",
+ "rust_decimal",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
+ "wiremock",
  "zstd",
 ]
 

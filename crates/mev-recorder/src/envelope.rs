@@ -40,6 +40,24 @@ pub enum Kind {
     SegmentClose,
 }
 
+impl Kind {
+    /// The stable wire name of this kind (matches the serialized JSON).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Frame => "frame",
+            Kind::FrameBin => "frame_bin",
+            Kind::Rest => "rest",
+            Kind::Sub => "sub",
+            Kind::ConnOpen => "conn_open",
+            Kind::GapStart => "gap_start",
+            Kind::GapEnd => "gap_end",
+            Kind::Clock => "clock",
+            Kind::SegmentOpen => "segment_open",
+            Kind::SegmentClose => "segment_close",
+        }
+    }
+}
+
 /// Metadata written as the first line of every segment (SPEC-0008 §5.3).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentOpenMeta {

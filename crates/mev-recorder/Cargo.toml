@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 mev-core.workspace = true
+mev-hl-client.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
@@ -16,3 +17,10 @@ thiserror.workspace = true
 tracing.workspace = true
 zstd.workspace = true
 libc.workspace = true
+rust_decimal.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+wiremock.workspace = true
