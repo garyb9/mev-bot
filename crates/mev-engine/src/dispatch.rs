@@ -239,6 +239,13 @@ impl StrategyDispatcher {
         self
     }
 
+    /// Pin the cloid prefix so simulate/replay are byte-identical (SPEC-0010
+    /// G-6). Live must keep the random default.
+    pub fn with_cloid_prefix(mut self, prefix: u64) -> Self {
+        self.assigner = CloidAssigner::with_prefix(prefix);
+        self
+    }
+
     /// The engine clock (introspection / driver sharing).
     pub fn clock(&self) -> &SharedClock {
         &self.clock
@@ -2343,6 +2350,79 @@ mod tests {
                 .iter()
                 .any(|entry| matches!(entry, JournalEntry::Fill { .. })),
             "the fill is journaled: {entries:?}"
+        );
+    }
+
+    /// The same event timeline produces the same journal whether or not the
+    /// caller stalls between iterations. This is the property that makes
+    /// `simulate` over live data and `replay` over the same recorded window
+    /// agree (SPEC-0010 E-7 done-when): decisions use event time, not the wall
+    /// clock. The clock is advanced to the *same* event times in both runs; only
+    /// the real-time gap differs.
+    #[test]
+    fn replay_is_independent_of_wall_clock_delays() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use mev_strategy::{AccountView, FeeRates, Instrument};
+
+        use crate::clock::ReplayClock;
+        use crate::journal::{JournalEntry, SharedSink};
+        use crate::paper_exec::{PaperConfig, PaperExec};
+
+        fn run_with_delay(delay: bool) -> Vec<JournalEntry> {
+            let mut buy = intent("BTC", Side::Buy);
+            buy.limit_px = Some(ds("101"));
+            buy.tif = TimeInForce::Gtc;
+            let strategy = Recording::new("test", CoinId(0)).with_script(vec![Action::Place(buy)]);
+
+            let mut instruments = BTreeMap::new();
+            instruments.insert("BTC".to_string(), Instrument::perp());
+            let paper = PaperExec::new(
+                PaperConfig {
+                    latency_ms: 20,
+                    maker_fills: true,
+                },
+                AccountView {
+                    account_value: ds("1000"),
+                    ..Default::default()
+                },
+                instruments,
+                FeeRates::PERP,
+                FeeRates::SPOT,
+            );
+            let sink = SharedSink::new();
+            let clock = Arc::new(ReplayClock::new());
+            clock.set_ms(1_000_000, 0);
+            let mut dispatcher = StrategyDispatcher::new(
+                vec![Box::new(strategy)],
+                registry(),
+                table(),
+                RiskGate::default(),
+                None,
+                DispatcherConfig::default(),
+            )
+            .with_paper(paper)
+            .with_clock(clock.clone())
+            .with_cloid_prefix(0)
+            .with_journal(Box::new(sink.clone()));
+
+            let state = state_with("100", "100");
+            dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+            if delay {
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            clock.set_ms(21_000_000, 20_000_000);
+            dispatcher.on_coin_state(CoinId(0), stamp(30), &state);
+            sink.entries()
+        }
+
+        let without_delay = run_with_delay(false);
+        let with_delay = run_with_delay(true);
+        assert!(!without_delay.is_empty(), "the run should journal actions");
+        assert_eq!(
+            without_delay, with_delay,
+            "wall-clock stalls must not change the journal"
         );
     }
 

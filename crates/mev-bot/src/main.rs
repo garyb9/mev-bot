@@ -7,6 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     path::PathBuf,
+    str::FromStr,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -17,6 +18,7 @@ use std::{
 mod engine;
 mod live;
 mod record;
+mod replay;
 
 use anyhow::{Context as _, Result};
 use axum::{Router, extract::State, http::StatusCode, routing::get};
@@ -129,15 +131,9 @@ enum Command {
         #[arg(long)]
         remove: Vec<String>,
     },
-    /// Deterministically replay a recorded session (SPEC-0003 §10).
-    Replay {
-        /// Session id to replay (default: the most recent).
-        #[arg(long)]
-        session: Option<i64>,
-        /// SQLite database path override.
-        #[arg(long)]
-        db: Option<PathBuf>,
-    },
+    /// Deterministically replay a recorded session (SPEC-0003 §10) or recorder
+    /// segments through the v2 engine (SPEC-0010 §14, E-7).
+    Replay(ReplayArgs),
     /// Trip the kill switch: write the flag file the running bot polls
     /// (SPEC-0004 K-3). Does not touch the network.
     Panic,
@@ -220,6 +216,42 @@ struct OrderArgs {
     /// Optional client order id (`0x` + 32 hex chars).
     #[arg(long)]
     cloid: Option<String>,
+}
+
+/// Arguments for `hl replay` (SPEC-0010 §14).
+#[derive(clap::Args)]
+struct ReplayArgs {
+    /// Session id to replay (SQLite path; default: the most recent).
+    #[arg(long)]
+    session: Option<i64>,
+    /// SQLite database path override.
+    #[arg(long)]
+    db: Option<PathBuf>,
+    /// Replay recorder segments from this UTC date (`YYYY-MM-DD`); requires
+    /// `--to`. Selects the segment driver instead of the SQLite session.
+    #[arg(long)]
+    from: Option<String>,
+    /// Inclusive UTC end date for `--from` (`YYYY-MM-DD`).
+    #[arg(long)]
+    to: Option<String>,
+    /// Recorder output root for `--from`/`--to`.
+    #[arg(long, default_value = "data/rec")]
+    rec_dir: PathBuf,
+    /// Write the action journal here as JSONL.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Strategy ids to run (comma-separated; default: config `enabled`).
+    #[arg(long, value_delimiter = ',')]
+    strategies: Vec<String>,
+    /// Simulated one-way paper latency in milliseconds.
+    #[arg(long, default_value_t = 20)]
+    latency_ms: u64,
+    /// Deterministic cloid prefix for replay.
+    #[arg(long, default_value_t = 0)]
+    cloid_prefix: u64,
+    /// Starting paper account value (USD).
+    #[arg(long, default_value = "100000")]
+    account_value: String,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -319,7 +351,7 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
         Command::Order(args) => order(network, args).await,
         Command::Account { address } => account(network, address).await,
         Command::Select { coins, add, remove } => select(network, coins, add, remove).await,
-        Command::Replay { session, db } => replay(network, session, db).await,
+        Command::Replay(args) => replay(network, args).await,
         Command::Panic => set_kill_switch(network, true),
         Command::Resume => set_kill_switch(network, false),
         Command::Record {
@@ -1126,22 +1158,43 @@ async fn account(network: Option<NetworkArg>, address: String) -> Result<()> {
     Ok(())
 }
 
-/// Deterministically replay a recorded session and print its fingerprint.
-async fn replay(
-    network: Option<NetworkArg>,
-    session: Option<i64>,
-    db: Option<PathBuf>,
-) -> Result<()> {
+/// Deterministically replay a recorded session (SQLite) or recorder segments.
+async fn replay(network: Option<NetworkArg>, args: ReplayArgs) -> Result<()> {
     let network = resolve_network(network)?;
     let overrides = ConfigOverrides {
         network: Some(network),
-        db_path: db,
+        db_path: args.db.clone(),
         ..Default::default()
     };
-    let config = Config::load(overrides)?;
-    let selector = selector_for(config.network, &config.watchlist).await?;
+    let mut config = Config::load(overrides)?;
 
-    let outcome = engine::replay(&config, &selector, session, &config.db_path).await?;
+    // `--from`/`--to` select the recorder-segment driver (SPEC-0010 E-7).
+    if let (Some(from), Some(to)) = (args.from.clone(), args.to.clone()) {
+        if !args.strategies.is_empty() {
+            config.strategy.enabled = args.strategies.clone();
+        }
+        let selector = selector_for(config.network, &config.watchlist).await?;
+        let account_value = Decimal::from_str(&args.account_value)
+            .with_context(|| format!("parsing --account-value `{}`", args.account_value))?;
+        let request = replay::ReplayRequest {
+            out_dir: args.rec_dir.clone(),
+            from,
+            to,
+            out: args.out.clone(),
+            cloid_prefix: args.cloid_prefix,
+            latency_ms: args.latency_ms,
+            account_value,
+        };
+        let outcome = replay::replay_segments(&config, &selector, &request)?;
+        println!(
+            "replay: segments={} frames={} entries={} fingerprint=0x{:016x}",
+            outcome.segments, outcome.frames, outcome.entries, outcome.fingerprint
+        );
+        return Ok(());
+    }
+
+    let selector = selector_for(config.network, &config.watchlist).await?;
+    let outcome = engine::replay(&config, &selector, args.session, &config.db_path).await?;
     println!(
         "replay: events={} intents={} fingerprint=0x{:016x}",
         outcome.events, outcome.intents, outcome.fingerprint

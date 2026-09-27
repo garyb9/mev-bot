@@ -240,7 +240,7 @@ fn load_profile(
 }
 
 /// The directory name for a network (SPEC-0008 §6).
-fn network_dir(network: Network) -> &'static str {
+pub(crate) fn network_dir(network: Network) -> &'static str {
     match network {
         Network::Mainnet => "mainnet",
         Network::Testnet => "testnet",
