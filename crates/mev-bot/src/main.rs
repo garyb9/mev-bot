@@ -828,11 +828,17 @@ async fn ingest(
                                 }
                             }
                             // Off the engine path: decode again for the health
-                            // snapshot and the replay log on a sidecar task.
-                            let _ = side_tx.try_send(SideFrame {
-                                text,
-                                ts_ms: SystemClock.now_ms(),
-                            });
+                            // snapshot and the replay log on a sidecar task. A
+                            // full sidecar channel drops the frame (counted).
+                            if side_tx
+                                .try_send(SideFrame {
+                                    text,
+                                    ts_ms: SystemClock.now_ms(),
+                                })
+                                .is_err()
+                            {
+                                metrics::counter!(mev_metrics::names::SIDECAR_DROPS).increment(1);
+                            }
                         }
                         Ok(RawEvent::Gap { reason, detail }) => {
                             tracing::warn!(reason, detail, "market feed gap");

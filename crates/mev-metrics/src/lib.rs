@@ -22,6 +22,9 @@ pub mod names {
     pub const WS_RECONNECTS: &str = "hl_ws_reconnects_total";
     /// WebSocket frames that failed to decode.
     pub const WS_PARSE_ERRORS: &str = "hl_ws_parse_errors_total";
+
+    /// Frames dropped on the full ingest→health/recording sidecar channel.
+    pub const SIDECAR_DROPS: &str = "hl_sidecar_drops_total";
     /// Currently connected WebSocket sockets.
     pub const WS_CONNECTED: &str = "hl_ws_connected";
     /// Order submission latency histogram, tagged by transport.
