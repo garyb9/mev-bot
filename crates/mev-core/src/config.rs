@@ -265,6 +265,20 @@ impl RiskSettings {
     }
 }
 
+/// Event-engine settings (SPEC-0010 §19).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineConfig {
+    /// Busy-spin before blocking on the input channels, in microseconds
+    /// (`0` = never spin). SPEC-0010 §9.
+    pub spin_us: u64,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self { spin_us: 50 }
+    }
+}
+
 /// Resolved, validated configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -287,9 +301,15 @@ pub struct Config {
     /// Strategy engine settings.
     #[serde(default)]
     pub strategy: StrategyConfig,
+    /// Event-engine settings.
+    #[serde(default)]
+    pub engine: EngineConfig,
     /// Pre-trade risk limits.
     #[serde(default)]
     pub risk: RiskSettings,
+    /// Kill-switch flag file (SPEC-0004 K-3). Its existence halts new risk;
+    /// `hl panic` writes it and `hl resume` removes it.
+    pub kill_file: PathBuf,
     /// Master account address (required for `live`).
     pub account_address: Option<String>,
     /// Agent wallet private key (required for `live`); never serialized or logged.
@@ -309,7 +329,9 @@ impl Default for Config {
             schedule_cancel_ttl_ms: 120_000,
             http_port: 9090,
             strategy: StrategyConfig::default(),
+            engine: EngineConfig::default(),
             risk: RiskSettings::default(),
+            kill_file: PathBuf::from("data/KILL"),
             account_address: None,
             agent_private_key: None,
         }
@@ -471,6 +493,8 @@ impl Config {
              db_path: {db_path}\n\
              schedule_cancel_ttl_ms: {ttl}\n\
              http_port: {port}\n\
+             engine.spin_us: {spin_us}\n\
+             kill_file: {kill_file}\n\
              account_address: {account}\n\
              agent_private_key: {key_state}",
             network = self.network,
@@ -481,6 +505,8 @@ impl Config {
             db_path = self.db_path.display(),
             ttl = self.schedule_cancel_ttl_ms,
             port = self.http_port,
+            spin_us = self.engine.spin_us,
+            kill_file = self.kill_file.display(),
         )
     }
 }

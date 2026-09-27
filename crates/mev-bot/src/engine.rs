@@ -215,7 +215,10 @@ pub fn interests_to_subscriptions(
             continue;
         };
         let sub = match stream {
-            Stream::Book | Stream::Bbo => Subscription::L2Book {
+            Stream::Book => Subscription::L2Book {
+                coin: name.to_string(),
+            },
+            Stream::Bbo => Subscription::Bbo {
                 coin: name.to_string(),
             },
             Stream::Ctx => Subscription::ActiveAssetCtx {
@@ -764,5 +767,26 @@ mod tests {
 
         let posts = posts.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(posts.len(), 1, "one bulk order post from the loop");
+    }
+
+    #[test]
+    fn interests_map_bbo_to_bbo_and_book_to_l2book() {
+        use mev_engine::strategy::{Interests, Stream};
+        let registry = CoinRegistry::from_coins(&["BTC".to_string(), "ETH".to_string()]);
+        let interests = Interests {
+            coins: vec![(CoinId(0), Stream::Bbo), (CoinId(1), Stream::Book)],
+            ..Interests::default()
+        };
+        let subs = interests_to_subscriptions(&interests, &registry);
+        assert!(
+            subs.iter()
+                .any(|s| matches!(s, Subscription::Bbo { coin } if coin == "BTC")),
+            "a Bbo interest must subscribe to the bbo channel, not l2Book"
+        );
+        assert!(
+            subs.iter()
+                .any(|s| matches!(s, Subscription::L2Book { coin } if coin == "ETH")),
+            "a Book interest still subscribes to l2Book"
+        );
     }
 }

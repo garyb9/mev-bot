@@ -9,9 +9,16 @@ autonomy = "auto"
 watchlist = ["BTC", "ETH", "SOL"]
 
 db_path = "data/hlbot.db"
+# Kill-switch flag file (SPEC-0004 K-3); `hl panic` writes it, `hl resume` removes it.
+# Override with HL_KILL_FILE.
+kill_file = "data/KILL"
 # Dead-man's switch TTL (SPEC-0002 H-4); refreshed at half this.
 schedule_cancel_ttl_ms = 120000
 http_port = 9090
+
+[engine]
+# Busy-spin before blocking on the input channels, in microseconds (0 = never).
+spin_us = 50
 
 [strategy]
 # Enable market-making too with: enabled = ["funding_basis", "market_making"]

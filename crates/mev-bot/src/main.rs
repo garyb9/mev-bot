@@ -138,6 +138,12 @@ enum Command {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    /// Trip the kill switch: write the flag file the running bot polls
+    /// (SPEC-0004 K-3). Does not touch the network.
+    Panic,
+    /// Clear the kill switch: remove the flag file. The in-process flag stays
+    /// sticky until the bot is restarted or resumed (SPEC-0004 K-3).
+    Resume,
 }
 
 #[derive(Subcommand)]
@@ -269,7 +275,34 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
         Command::Account { address } => account(network, address).await,
         Command::Select { coins, add, remove } => select(network, coins, add, remove).await,
         Command::Replay { session, db } => replay(network, session, db).await,
+        Command::Panic => set_kill_switch(network, true),
+        Command::Resume => set_kill_switch(network, false),
     }
+}
+
+/// Write (`trip`) or remove (`clear`) the kill-switch flag file (SPEC-0004 K-3).
+fn set_kill_switch(network: Option<NetworkArg>, trip: bool) -> Result<()> {
+    let config = Config::load(ConfigOverrides {
+        network: network.map(Into::into),
+        ..Default::default()
+    })?;
+    let path = &config.kill_file;
+    if trip {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(path, b"kill\n").with_context(|| format!("writing {}", path.display()))?;
+        println!("kill switch tripped: {}", path.display());
+    } else if path.exists() {
+        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+        println!("kill switch flag removed: {}", path.display());
+    } else {
+        println!("kill switch flag already absent: {}", path.display());
+    }
+    Ok(())
 }
 
 fn resolve_network(network: Option<NetworkArg>) -> Result<Network> {
@@ -375,7 +408,13 @@ async fn run(
                 .clone()
                 .context("live mode requires a configured exchange")?;
             let (out, posts) = outbound::<UnsignedPost>(ACCOUNT_CHANNEL_CAP);
-            exec_writer = Some(spawn_exec_writer(posts, exchange, handles.clone()));
+            exec_writer = Some(spawn_exec_writer(
+                posts,
+                exchange,
+                info.clone(),
+                config.account_address.clone(),
+                handles.clone(),
+            ));
             Some(Box::new(out))
         }
         _ => None,
@@ -424,11 +463,12 @@ async fn run(
 
     // The loop is synchronous and owns all trading state: run it on its own
     // thread, stopped through the crossbeam channel on shutdown.
+    let spin_us = config.engine.spin_us;
     let engine_handle = std::thread::Builder::new()
         .name("mev-engine".to_string())
         .spawn(move || {
             let loop_config = LoopConfig {
-                spin_us: 50,
+                spin_us,
                 coin_count,
             };
             let engine = EngineLoop::with_dispatcher(inputs, dispatcher, loop_config, stop_rx);
@@ -437,18 +477,21 @@ async fn run(
         .context("spawning the engine thread")?;
 
     let heartbeat = tokio::spawn(heartbeat());
+    // The health snapshot and the SQLite replay log are off the engine path:
+    // the ingest task hands every raw frame to this sidecar and never waits.
+    let (side_tx, side_rx) = tokio::sync::mpsc::channel::<SideFrame>(SIDE_CHANNEL_CAP);
+    let sidecar_task = tokio::spawn(recording_sidecar(side_rx, health_state.clone(), recorder));
     let ingest_task = tokio::spawn(ingest(
         handles.clone(),
         subscriptions,
         registry.clone(),
         config.network,
-        health_state.clone(),
-        recorder,
+        side_tx,
         market_drops,
     ));
     let monitor_task = tokio::spawn(monitor(health_state, health.clone()));
-    // SPEC-0010 §15: the H-3 stream is not wired into `hl` yet; the REST
-    // reconciler is the wired backstop and feeds the account channel.
+    // SPEC-0010 §15: the H-3 account stream is the source of truth for own
+    // orders and fills; the REST reconciler is the 30 s backstop.
     let reconciler = config.account_address.clone().map(|address| {
         tokio::spawn(engine::account_reconciler(
             info.clone(),
@@ -457,6 +500,25 @@ async fn run(
             handles.clone(),
         ))
     });
+    let account_stream_task = config.account_address.as_ref().map(|address| {
+        tokio::spawn(account_stream(
+            handles.clone(),
+            vec![
+                Subscription::OrderUpdates {
+                    user: address.clone(),
+                },
+                Subscription::UserFills {
+                    user: address.clone(),
+                },
+                Subscription::UserEvents {
+                    user: address.clone(),
+                },
+            ],
+            registry.clone(),
+            config.network,
+        ))
+    });
+    let control_task = tokio::spawn(control(handles.clone(), config.kill_file.clone()));
     let deadman_task = exchange.clone().map(|exchange| {
         tokio::spawn(deadman(
             exchange,
@@ -475,8 +537,13 @@ async fn run(
     let _ = stop_tx.send(());
     let _ = engine_handle.join();
     ingest_task.abort();
+    sidecar_task.abort();
     monitor_task.abort();
     heartbeat.abort();
+    control_task.abort();
+    if let Some(account_stream) = account_stream_task {
+        account_stream.abort();
+    }
     if let Some(reconciler) = reconciler {
         reconciler.abort();
     }
@@ -495,12 +562,16 @@ async fn run(
 /// Bridge the engine's synchronous exec channel to the async WS writer.
 ///
 /// The engine hands [`UnsignedPost`]s to the crossbeam `Receiver` off the
-/// engine thread; a small std thread moves them onto a tokio channel, and the
-/// async task signs/sends them and pushes a [`PostResult`] back as a lossless
-/// account update (SPEC-0010 §12).
+/// engine thread; a small std thread moves them onto a tokio channel. The async
+/// task drains every post already queued, starts their submits **in order**
+/// (cancels before places, per the builder), and waits for the replies in
+/// parallel through `join_all`, so several posts are in flight at once (SPEC-0002
+/// H-1, SPEC-0010 §12).
 fn spawn_exec_writer(
     posts: crossbeam_channel::Receiver<UnsignedPost>,
     exchange: Arc<dyn ExchangeApi>,
+    info: Arc<dyn InfoApi>,
+    address: Option<String>,
     handles: InputHandles,
 ) -> tokio::task::JoinHandle<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UnsignedPost>();
@@ -515,28 +586,97 @@ fn spawn_exec_writer(
         });
 
     tokio::spawn(async move {
-        while let Some(post) = rx.recv().await {
-            let result = match exchange.submit(&post.action).await {
-                Ok(response) => match response.order_response() {
-                    Ok(orders) => {
-                        PostResult::Statuses(orders.statuses.iter().map(map_venue_status).collect())
-                    }
-                    // Non-order actions (cancels) carry no per-order statuses;
-                    // their outcome arrives on the account stream.
-                    Err(_) => PostResult::Statuses(SmallVec::new()),
-                },
-                Err(err) => PostResult::Error(err.to_string()),
-            };
-            let update = AccountUpdate::PostAck {
-                stamp: engine::now_stamp(),
-                req_id: post.req_id,
-                result,
-            };
-            if !handles.send_account(update) {
+        loop {
+            // Block for one post, then take everything already queued. A batch's
+            // cancel and place posts arrive here together and go out in order.
+            let Some(first) = rx.recv().await else {
                 break;
+            };
+            let mut run = vec![first];
+            while let Ok(post) = rx.try_recv() {
+                run.push(post);
             }
+            let submits: Vec<_> = run
+                .into_iter()
+                .map(|post| {
+                    submit_post(
+                        exchange.clone(),
+                        info.clone(),
+                        address.clone(),
+                        handles.clone(),
+                        post,
+                    )
+                })
+                .collect();
+            futures_util::future::join_all(submits).await;
         }
     })
+}
+
+/// Sign, send, and report one built post.
+///
+/// A successful reply becomes a [`PostResult::Statuses`]; a lost reply marks the
+/// post's orders `Unknown` and then reconciles each by `cloid` via `orderStatus`
+/// (SPEC-0002 H-2, SPEC-0010 §10/§16). Never resends.
+async fn submit_post(
+    exchange: Arc<dyn ExchangeApi>,
+    info: Arc<dyn InfoApi>,
+    address: Option<String>,
+    handles: InputHandles,
+    post: UnsignedPost,
+) {
+    let result = match exchange.submit(&post.action).await {
+        Ok(response) => match response.order_response() {
+            Ok(orders) => {
+                PostResult::Statuses(orders.statuses.iter().map(map_venue_status).collect())
+            }
+            // Non-order actions (cancels) carry no per-order statuses; their
+            // outcome arrives on the account stream.
+            Err(_) => PostResult::Statuses(SmallVec::new()),
+        },
+        Err(err) => {
+            // Fail closed first: mark the post's orders `Unknown` before any
+            // reconciliation, so a genuinely resting order is never invisible.
+            let fail = AccountUpdate::PostAck {
+                stamp: engine::now_stamp(),
+                req_id: post.req_id,
+                result: PostResult::Error(err.to_string()),
+            };
+            if !handles.send_account(fail) {
+                return;
+            }
+            let Some(address) = address.as_deref() else {
+                return;
+            };
+            for cloid in &post.cloids {
+                let Ok(status) = info.order_status_by_cloid(address, &cloid.to_hex()).await else {
+                    continue;
+                };
+                let Some((status, filled_sz)) = mev_engine::reconcile::order_status_update(&status)
+                else {
+                    continue;
+                };
+                let update = AccountUpdate::OrderUpdate {
+                    stamp: engine::now_stamp(),
+                    cloid: *cloid,
+                    oid: 0,
+                    status,
+                    filled_sz,
+                    avg_px: Decimal::ZERO,
+                };
+                if !handles.send_account(update) {
+                    return;
+                }
+            }
+            return;
+        }
+    };
+    let update = AccountUpdate::PostAck {
+        stamp: engine::now_stamp(),
+        req_id: post.req_id,
+        result,
+    };
+    let _ = handles.send_account(update);
 }
 
 /// Map a wire per-order status to the engine's typed status.
@@ -694,18 +834,30 @@ async fn deadman(
     metrics::gauge!(mev_metrics::names::DEADMAN_ARMED).set(0.0);
 }
 
-/// Ingest market data into the v2 engine (and a health-only snapshot).
+/// A raw frame handed off the ingest task for health/recording.
+struct SideFrame {
+    /// Exact text received.
+    text: String,
+    /// Local receive time in wall-clock ms.
+    ts_ms: u64,
+}
+
+/// Bounded queue from the ingest task to the health/SQLite sidecar.
+const SIDE_CHANNEL_CAP: usize = 16_384;
+
+/// Ingest market data into the v2 engine.
 ///
-/// Frames are decoded with the `mev-engine` typed decoders straight into
-/// `MarketUpdate`s; the same text is decoded again by `mev-hl-client` for the
-/// health snapshot and SQLite recording (off the engine thread).
+/// The typed decode and the hand-off to the engine happen **first**, so the
+/// engine is never queued behind the slower legacy decode (ADR-0001 put
+/// `ws::decode` at 130–260 µs). The raw frame is then offered to the health /
+/// SQLite sidecar on a bounded, non-blocking channel (drop on full; the engine
+/// never waits on recording).
 async fn ingest(
     handles: InputHandles,
     subscriptions: Vec<Subscription>,
     registry: CoinRegistry,
     network: Network,
-    health_state: Arc<RwLock<MarketState>>,
-    recorder: Option<engine::Recorder>,
+    side_tx: tokio::sync::mpsc::Sender<SideFrame>,
     market_drops: Arc<AtomicU64>,
 ) {
     let ingester = Ingest::new(ConnId(0), registry);
@@ -733,18 +885,6 @@ async fn ingest(
                             mono_ns,
                             text,
                         }) => {
-                            // Health + recording decode (never gates decisions).
-                            if let Ok(Some(event)) = mev_hl_client::ws::decode(&text) {
-                                if let Some(recorder) = &recorder {
-                                    recorder.record(
-                                        &mev_strategy::Event::Market(event.clone()),
-                                        SystemClock.now_ms(),
-                                    );
-                                }
-                                if let Ok(mut guard) = health_state.write() {
-                                    guard.apply(&event);
-                                }
-                            }
                             let stamp = Stamp {
                                 // `RawEvent::Text::t_ns` is wall-clock ms.
                                 t_recv_ns: t_ns.saturating_mul(1_000_000),
@@ -764,6 +904,12 @@ async fn ingest(
                                     tracing::debug!(error = %err, "undecodable market frame");
                                 }
                             }
+                            // Off the engine path: decode again for the health
+                            // snapshot and the replay log on a sidecar task.
+                            let _ = side_tx.try_send(SideFrame {
+                                text,
+                                ts_ms: SystemClock.now_ms(),
+                            });
                         }
                         Ok(RawEvent::Gap { reason, detail }) => {
                             tracing::warn!(reason, detail, "market feed gap");
@@ -794,6 +940,174 @@ async fn ingest(
                 tracing::warn!(error = %err, "market stream connect failed");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+/// Apply health and SQLite recording to raw frames, off the ingest path.
+///
+/// Runs the legacy `ws::decode` here so it never delays the engine hand-off
+/// (ADR-0001: 130–260 µs per frame). A dropped frame only costs health/recording
+/// fidelity; it is folded into a gap by the next update.
+async fn recording_sidecar(
+    mut rx: tokio::sync::mpsc::Receiver<SideFrame>,
+    health_state: Arc<RwLock<MarketState>>,
+    recorder: Option<engine::Recorder>,
+) {
+    while let Some(frame) = rx.recv().await {
+        if let Ok(Some(event)) = mev_hl_client::ws::decode(&frame.text) {
+            if let Some(recorder) = &recorder {
+                recorder.record(&mev_strategy::Event::Market(event.clone()), frame.ts_ms);
+            }
+            if let Ok(mut guard) = health_state.write() {
+                guard.apply(&event);
+            }
+        }
+    }
+}
+
+/// Consume the H-3 account channels into lossless [`AccountUpdate`]s.
+///
+/// Runs on its own connection, separate from market data, and is never lossy:
+/// the engine resolves live cancels, fills, and order state from this stream
+/// (SPEC-0010 §15, SPEC-0002 H-3). On a reconnect the venue's `userFills`
+/// snapshot resyncs state; the REST reconciler is the 30 s backstop.
+async fn account_stream(
+    handles: InputHandles,
+    subscriptions: Vec<Subscription>,
+    registry: CoinRegistry,
+    network: Network,
+) {
+    let ingester = Ingest::new(ConnId(1), registry);
+    let planned: Vec<String> = subscriptions
+        .iter()
+        .map(|sub| serde_json::to_string(sub).unwrap_or_default())
+        .collect();
+    let mut backoff = Duration::from_secs(1);
+
+    loop {
+        match RawWsConn::connect(Box::new(HlProtocol::new(network)), planned.clone()).await {
+            Ok(mut conn) => {
+                info!("account stream connected");
+                loop {
+                    match conn.next().await {
+                        Ok(RawEvent::Text {
+                            t_ns,
+                            mono_ns,
+                            text,
+                        }) => {
+                            let stamp = Stamp {
+                                t_recv_ns: t_ns.saturating_mul(1_000_000),
+                                mono_ns,
+                                ts_exch_ms: 0,
+                            };
+                            match ingester.decode_account(&text, stamp) {
+                                Ok(updates) => {
+                                    for update in updates {
+                                        if !handles.send_account(update) {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::debug!(error = %err, "undecodable account frame");
+                                }
+                            }
+                        }
+                        Ok(RawEvent::Gap { reason, detail }) => {
+                            tracing::warn!(reason, detail, "account feed gap");
+                            if reason == "shutdown" {
+                                return;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(error = %err, "account stream ended");
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "account stream connect failed");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+/// Poll the kill-switch triggers and drive [`Control`] into the engine.
+///
+/// Triggers (SPEC-0004 K-3): `SIGUSR1`, the kill flag file, and `hl panic`
+/// (which writes that file). `SIGUSR2` sends `Control::Resume`; clearing also
+/// needs the file removed (the two-key rule), so a poll re-trips otherwise.
+#[cfg(unix)]
+async fn control(handles: InputHandles, kill_file: PathBuf) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigusr1 = match signal(SignalKind::user_defined1()) {
+        Ok(sig) => sig,
+        Err(err) => {
+            error!(error = %err, "failed to register SIGUSR1");
+            return;
+        }
+    };
+    let mut sigusr2 = match signal(SignalKind::user_defined2()) {
+        Ok(sig) => sig,
+        Err(err) => {
+            error!(error = %err, "failed to register SIGUSR2");
+            return;
+        }
+    };
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut killed = false;
+    loop {
+        tokio::select! {
+            _ = shutdown_signal() => break,
+            _ = sigusr1.recv() => {
+                if !killed {
+                    if !handles.send_account(AccountUpdate::Control(Control::KillSwitch)) {
+                        break;
+                    }
+                    killed = true;
+                }
+            }
+            _ = sigusr2.recv() => {
+                if killed {
+                    if !handles.send_account(AccountUpdate::Control(Control::Resume)) {
+                        break;
+                    }
+                    killed = false;
+                }
+            }
+            _ = tick.tick() => {
+                if !killed && mev_risk::kill::check_flag_file(&kill_file) {
+                    if !handles.send_account(AccountUpdate::Control(Control::KillSwitch)) {
+                        break;
+                    }
+                    killed = true;
+                }
+            }
+        }
+    }
+}
+
+/// Poll the kill-switch flag file on platforms without `SIGUSR1`/`SIGUSR2`.
+#[cfg(not(unix))]
+async fn control(handles: InputHandles, kill_file: PathBuf) {
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut killed = false;
+    loop {
+        tokio::select! {
+            _ = shutdown_signal() => break,
+            _ = tick.tick() => {
+                if !killed && mev_risk::kill::check_flag_file(&kill_file) {
+                    if !handles.send_account(AccountUpdate::Control(Control::KillSwitch)) {
+                        break;
+                    }
+                    killed = true;
+                }
             }
         }
     }
