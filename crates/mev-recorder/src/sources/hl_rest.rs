@@ -37,6 +37,12 @@ const PAGE_TOLERANCE_MS: u64 = 60_000;
 /// Maximum time range covered by one `candleSnapshot` page.
 const CANDLE_PAGE_MS: u64 = 6 * 3_600 * 1_000;
 
+/// First retry delay after a failed or dropped request.
+const RETRY_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
+
+/// Retry delay cap: failures retry within minutes, never a whole day.
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
 /// A response captured with its raw body intact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawResponse {
@@ -161,15 +167,20 @@ impl WeightBucket {
     }
 }
 
-/// Persisted paging state (SPEC-0008 §8: last fetched time per coin).
+/// Persisted paging state (SPEC-0008 §8).
+///
+/// Each value is the **start** of the last page that was fetched and accepted,
+/// not its maximum. On restart the page is fetched again, so a crash before the
+/// segment writer flushed (or a dropped envelope) cannot leave a permanent
+/// hole. The overlap is deliberate: P-1 must de-duplicate it when normalizing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotterState {
-    /// Last `fundingHistory` time fetched, per coin (ms since the epoch).
-    #[serde(default)]
-    pub funding_last_ms: BTreeMap<String, u64>,
-    /// Last `candleSnapshot` open time fetched, keyed by `coin|interval` (ms).
-    #[serde(default)]
-    pub candle_last_ms: BTreeMap<String, u64>,
+    /// Resume time for `fundingHistory`, per coin (ms since the epoch).
+    #[serde(default, alias = "funding_last_ms")]
+    pub funding_resume_ms: BTreeMap<String, u64>,
+    /// Resume time for `candleSnapshot`, keyed by `coin|interval` (ms).
+    #[serde(default, alias = "candle_last_ms")]
+    pub candle_resume_ms: BTreeMap<String, u64>,
 }
 
 impl SnapshotterState {
@@ -195,26 +206,28 @@ impl SnapshotterState {
 
     /// The `startTime` to resume `fundingHistory` for `coin`.
     pub fn funding_start_ms(&self, coin: &str, fallback: u64) -> u64 {
-        self.funding_last_ms
+        self.funding_resume_ms
             .get(coin)
-            .map_or(fallback, |last| last.saturating_add(1))
+            .copied()
+            .unwrap_or(fallback)
     }
 
-    /// Record the last fetched `fundingHistory` time for `coin`.
-    pub fn set_funding_last(&mut self, coin: impl Into<String>, ms: u64) {
-        self.funding_last_ms.insert(coin.into(), ms);
+    /// Record the start of the last accepted `fundingHistory` page for `coin`.
+    pub fn set_funding_resume(&mut self, coin: impl Into<String>, ms: u64) {
+        self.funding_resume_ms.insert(coin.into(), ms);
     }
 
     /// The `startTime` to resume `candleSnapshot` for `coin|interval`.
     pub fn candle_start_ms(&self, coin: &str, interval: &str, fallback: u64) -> u64 {
-        self.candle_last_ms
+        self.candle_resume_ms
             .get(&candle_key(coin, interval))
-            .map_or(fallback, |last| last.saturating_add(1))
+            .copied()
+            .unwrap_or(fallback)
     }
 
-    /// Record the last fetched candle open time for `coin|interval`.
-    pub fn set_candle_last(&mut self, coin: &str, interval: &str, ms: u64) {
-        self.candle_last_ms.insert(candle_key(coin, interval), ms);
+    /// Record the start of the last accepted candle page for `coin|interval`.
+    pub fn set_candle_resume(&mut self, coin: &str, interval: &str, ms: u64) {
+        self.candle_resume_ms.insert(candle_key(coin, interval), ms);
     }
 }
 
@@ -313,6 +326,13 @@ pub struct RestSnapshotter {
     state: SnapshotterState,
     config: SnapshotterConfig,
     seq: u64,
+    /// In-run paging cursors, past the last accepted page. Empty on a fresh
+    /// process, so the first request for a coin resumes from the persisted
+    /// page start (re-fetching its last page).
+    next_funding: BTreeMap<String, u64>,
+    next_candle: BTreeMap<String, u64>,
+    /// Current capped backoff per paging job, reset on a successful request.
+    backoff: BTreeMap<JobKey, Duration>,
 }
 
 impl RestSnapshotter {
@@ -332,15 +352,39 @@ impl RestSnapshotter {
             state,
             config,
             seq: 0,
+            next_funding: BTreeMap::new(),
+            next_candle: BTreeMap::new(),
+            backoff: BTreeMap::new(),
         })
     }
 
     /// The `fundingHistory` request body for `coin`, resumed from state.
     pub fn funding_request(&self, coin: &str) -> Value {
-        let start = self
-            .state
-            .funding_start_ms(coin, self.config.funding_backfill_start_ms);
-        json!({ "type": "fundingHistory", "coin": coin, "startTime": start })
+        json!({
+            "type": "fundingHistory",
+            "coin": coin,
+            "startTime": self.funding_start(coin),
+        })
+    }
+
+    /// The next in-run `fundingHistory` cursor for `coin` (the persisted page
+    /// start until a page is accepted).
+    fn funding_start(&self, coin: &str) -> u64 {
+        self.next_funding.get(coin).copied().unwrap_or_else(|| {
+            self.state
+                .funding_start_ms(coin, self.config.funding_backfill_start_ms)
+        })
+    }
+
+    /// The next in-run `candleSnapshot` cursor for `coin|interval`.
+    fn candle_start(&self, coin: &str, interval: &str) -> u64 {
+        self.next_candle
+            .get(&candle_key(coin, interval))
+            .copied()
+            .unwrap_or_else(|| {
+                self.state
+                    .candle_start_ms(coin, interval, self.config.candle_backfill_start_ms)
+            })
     }
 
     /// Run until `shutdown` is notified.
@@ -364,11 +408,11 @@ impl RestSnapshotter {
             if !self.acquire(job.weight, &shutdown).await {
                 break;
             }
-            let response = match self.execute(&job.body).await {
-                Ok(response) => Some(response),
+            let (response, accepted) = match self.execute(&job.body).await {
+                Ok((response, accepted)) => (Some(response), accepted),
                 Err(err) => {
                     warn!(error = %err, "rest request failed");
-                    None
+                    (None, false)
                 }
             };
 
@@ -383,7 +427,8 @@ impl RestSnapshotter {
                 }
                 JobKey::Funding(_) | JobKey::Candles(_, _) => {
                     let start = job_start_ms(&job.body, &job.key);
-                    let next_at = self.finish_paging(&job.key, start, response.as_ref(), now);
+                    let next_at =
+                        self.finish_paging(&job.key, start, response.as_ref(), accepted, now);
                     let mut next = self.build_job(job.key.clone(), now);
                     next.next_at = next_at;
                     jobs.push(next);
@@ -471,11 +516,7 @@ impl RestSnapshotter {
             ),
             JobKey::Funding(coin) => (self.funding_request(coin), 20, None),
             JobKey::Candles(coin, interval) => {
-                let start = self.state.candle_start_ms(
-                    coin,
-                    interval,
-                    self.config.candle_backfill_start_ms,
-                );
+                let start = self.candle_start(coin, interval);
                 let end = start + CANDLE_PAGE_MS;
                 (
                     json!({
@@ -538,11 +579,11 @@ impl RestSnapshotter {
         }
     }
 
-    async fn execute(&mut self, body: &Value) -> Result<RawResponse, RestError> {
+    async fn execute(&mut self, body: &Value) -> Result<(RawResponse, bool), RestError> {
         match self.client.post_info(body).await {
             Ok(response) => {
-                self.record_rest(body, &response);
-                Ok(response)
+                let accepted = self.record_rest(body, &response);
+                Ok((response, accepted))
             }
             Err(err) => {
                 self.record_gap(&err.to_string());
@@ -551,7 +592,8 @@ impl RestSnapshotter {
         }
     }
 
-    fn record_rest(&mut self, request: &Value, response: &RawResponse) {
+    /// Record a REST envelope, returning `false` if the sink dropped it.
+    fn record_rest(&mut self, request: &Value, response: &RawResponse) -> bool {
         let meta = json!({
             "req": request,
             "status": response.status,
@@ -566,9 +608,11 @@ impl RestSnapshotter {
             meta,
         );
         self.seq += 1;
-        if !self.sink.send(env) {
+        let accepted = self.sink.send(env);
+        if !accepted {
             warn!(src = %self.config.src, conn = %self.config.conn, "rest envelope dropped");
         }
+        accepted
     }
 
     fn record_gap(&mut self, detail: &str) {
@@ -586,38 +630,71 @@ impl RestSnapshotter {
         }
     }
 
-    /// Update paging state from a response and return the next run time.
+    /// Advance paging state from an accepted response and return the next run
+    /// time.
+    ///
+    /// `accepted` is `false` when the request failed or its envelope was
+    /// dropped. In that case the cursor does not move, so the page is fetched
+    /// again (after a capped backoff); a restart re-fetches the last accepted
+    /// page from its start, so a crash cannot leave a permanent hole.
     fn finish_paging(
         &mut self,
         key: &JobKey,
         start_ms: u64,
         response: Option<&RawResponse>,
+        accepted: bool,
         now: Instant,
     ) -> Instant {
         let now_ms = self.clock.now_ms();
         let max = response
             .and_then(|response| max_field(&response.body, key.time_field()))
             .unwrap_or(0);
-        let progressed = max > 0 && max >= start_ms;
+        let progressed = accepted && max > 0 && max >= start_ms;
         if progressed {
+            // Persist the page *start*; move the in-run cursor past it.
             match key {
-                JobKey::Funding(coin) => self.state.set_funding_last(coin.clone(), max),
+                JobKey::Funding(coin) => {
+                    self.state.set_funding_resume(coin.clone(), start_ms);
+                    self.next_funding
+                        .insert(coin.clone(), max.saturating_add(1));
+                }
                 JobKey::Candles(coin, interval) => {
-                    self.state.set_candle_last(coin, interval, max);
+                    self.state.set_candle_resume(coin, interval, start_ms);
+                    self.next_candle
+                        .insert(candle_key(coin, interval), max.saturating_add(1));
                 }
                 _ => {}
             }
-        }
-        if let Err(err) = self.state.save(&self.config.state_path()) {
-            warn!(error = %err, "failed to save snapshotter state");
-        }
-        let caught_up = max.saturating_add(PAGE_TOLERANCE_MS) >= now_ms;
-        if progressed && !caught_up {
-            now
-        } else {
+            self.backoff.remove(key);
+            if let Err(err) = self.state.save(&self.config.state_path()) {
+                warn!(error = %err, "failed to save snapshotter state");
+            }
+            let caught_up = max.saturating_add(PAGE_TOLERANCE_MS) >= now_ms;
+            if caught_up {
+                now + self.config.daily_interval
+            } else {
+                now
+            }
+        } else if accepted && response.is_some() {
+            // A successful request that made no progress: caught up for a day.
+            self.backoff.remove(key);
             now + self.config.daily_interval
+        } else {
+            // Dropped or failed: retry within the cap, never a full day.
+            let wait = next_backoff(self.backoff.get(key).copied());
+            self.backoff.insert(key.clone(), wait);
+            now + wait
         }
     }
+}
+
+/// The next backoff delay: double the previous, capped.
+fn next_backoff(previous: Option<Duration>) -> Duration {
+    let next = match previous {
+        None => RETRY_BACKOFF_INITIAL,
+        Some(previous) => previous.saturating_mul(2),
+    };
+    next.min(RETRY_BACKOFF_MAX)
 }
 
 impl JobKey {
@@ -827,10 +904,100 @@ mod tests {
         drop(sink);
 
         let state = SnapshotterState::load(&config.state_path()).unwrap();
-        assert_eq!(state.funding_last_ms.get("BTC"), Some(&5000));
+        assert_eq!(state.funding_resume_ms.get("BTC"), Some(&0));
 
         let restarted = RestSnapshotter::new(config, Arc::new(NoopSink), clock).unwrap();
-        assert_eq!(restarted.funding_request("BTC")["startTime"], 5001);
+        assert_eq!(restarted.funding_request("BTC")["startTime"], 0);
+    }
+
+    fn paging_response(body: &'static str) -> RawResponse {
+        RawResponse {
+            status: 200,
+            body: body.to_string(),
+            latency_us: 1,
+        }
+    }
+
+    #[test]
+    fn restart_refetches_the_last_page() {
+        let dir = temp_dir("restart-page");
+        let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
+        let config = SnapshotterConfig {
+            out_dir: dir.clone(),
+            funding_coins: vec!["BTC".into()],
+            funding_backfill_start_ms: 0,
+            ..SnapshotterConfig::default()
+        };
+        let mut snapshotter =
+            RestSnapshotter::new(config.clone(), Arc::new(NoopSink), clock.clone()).unwrap();
+        let response = paging_response(r#"[{"coin":"BTC","time":9000}]"#);
+        let now = Instant::now();
+
+        // Page [4000, 9000] accepted: the in-run cursor advances to 9001.
+        snapshotter.finish_paging(
+            &JobKey::Funding("BTC".into()),
+            4000,
+            Some(&response),
+            true,
+            now,
+        );
+        assert_eq!(snapshotter.funding_start("BTC"), 9001);
+        assert_eq!(snapshotter.state.funding_resume_ms.get("BTC"), Some(&4000));
+
+        // A fresh process re-fetches the last page from its start, not 9001.
+        let restarted = RestSnapshotter::new(config, Arc::new(NoopSink), clock).unwrap();
+        assert_eq!(restarted.funding_request("BTC")["startTime"], 4000);
+    }
+
+    #[test]
+    fn dropped_envelope_does_not_advance_state() {
+        let dir = temp_dir("dropped");
+        let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
+        let config = SnapshotterConfig {
+            out_dir: dir,
+            funding_coins: vec!["BTC".into()],
+            funding_backfill_start_ms: 1000,
+            ..SnapshotterConfig::default()
+        };
+        let mut snapshotter = RestSnapshotter::new(config, Arc::new(NoopSink), clock).unwrap();
+        let response = paging_response(r#"[{"coin":"BTC","time":9000}]"#);
+        let now = Instant::now();
+
+        // `accepted=false` models the sink dropping the rest envelope.
+        snapshotter.finish_paging(
+            &JobKey::Funding("BTC".into()),
+            5000,
+            Some(&response),
+            false,
+            now,
+        );
+        assert!(!snapshotter.state.funding_resume_ms.contains_key("BTC"));
+        assert!(!snapshotter.next_funding.contains_key("BTC"));
+        assert_eq!(snapshotter.funding_start("BTC"), 1000);
+    }
+
+    #[test]
+    fn failed_request_retries_within_the_backoff_cap() {
+        let dir = temp_dir("backoff");
+        let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
+        let config = SnapshotterConfig {
+            out_dir: dir,
+            funding_coins: vec!["BTC".into()],
+            ..SnapshotterConfig::default()
+        };
+        let mut snapshotter = RestSnapshotter::new(config, Arc::new(NoopSink), clock).unwrap();
+        let now = Instant::now();
+        let key = JobKey::Funding("BTC".into());
+
+        let mut last = Duration::ZERO;
+        for _ in 0..12 {
+            let next = snapshotter.finish_paging(&key, 0, None, false, now);
+            let delay = next.saturating_duration_since(now);
+            assert!(delay > Duration::ZERO);
+            assert!(delay <= RETRY_BACKOFF_MAX, "retry waited {delay:?}");
+            last = delay;
+        }
+        assert_eq!(last, RETRY_BACKOFF_MAX);
     }
 
     #[test]
@@ -844,13 +1011,13 @@ mod tests {
         let dir = temp_dir("state");
         let path = dir.join("hl-rest-state.json");
         let mut state = SnapshotterState::default();
-        state.set_funding_last("BTC", 1000);
-        state.set_candle_last("BTC", "1m", 2000);
+        state.set_funding_resume("BTC", 1000);
+        state.set_candle_resume("BTC", "1m", 2000);
         state.save(&path).unwrap();
         let back = SnapshotterState::load(&path).unwrap();
         assert_eq!(back, state);
-        assert_eq!(state.funding_start_ms("BTC", 0), 1001);
-        assert_eq!(state.candle_start_ms("BTC", "1m", 0), 2001);
+        assert_eq!(state.funding_start_ms("BTC", 0), 1000);
+        assert_eq!(state.candle_start_ms("BTC", "1m", 0), 2000);
         assert_eq!(state.funding_start_ms("ETH", 7), 7);
     }
 }
