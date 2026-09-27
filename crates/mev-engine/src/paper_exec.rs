@@ -143,6 +143,7 @@ pub struct PaperExec {
     /// Eligible and on the book, waiting for a cross.
     resting: Vec<TrackedOrder>,
     next_oid: u64,
+    next_tid: u64,
     fees_paid: Decimal,
 }
 
@@ -164,6 +165,7 @@ impl PaperExec {
             pending: Vec::new(),
             resting: Vec::new(),
             next_oid: 1,
+            next_tid: 1,
             fees_paid: Decimal::ZERO,
         }
     }
@@ -423,11 +425,14 @@ impl PaperExec {
             VenueOrderStatus::PartiallyFilled
         };
 
+        let tid = self.next_tid;
+        self.next_tid = self.next_tid.wrapping_add(1);
         vec![
             AccountUpdate::Fill {
                 stamp,
                 cloid: Some(order.cloid),
                 oid: order.oid,
+                tid,
                 coin: order.coin,
                 side: order.side,
                 px,

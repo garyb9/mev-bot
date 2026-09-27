@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 
 use crate::types::{
     AccountUpdate, AssetCtxLite, BOOK_DEPTH, BookSnapshot, Cloid, CoinId, CoinRegistry, ConnId,
-    Level, MarketUpdate, Side, Stamp, Trade, VenueOrderStatus,
+    FillData, Level, MarketUpdate, Side, Stamp, Trade, VenueOrderStatus,
 };
 
 /// The set of coins an ingest connection is responsible for.
@@ -282,24 +282,33 @@ pub fn decode_account(text: &str, coins: &IngestCoins, stamp: Stamp) -> Result<V
         "userFills" => {
             let frame: UserFillsFrame =
                 serde_json::from_str(text).map_err(|e| Error::Decode(e.to_string()))?;
-            Ok(frame
-                .data
-                .fills
-                .iter()
-                .filter_map(|fill| fill_update(fill, coins, stamp))
-                .collect())
+            if frame.data.is_snapshot {
+                // A snapshot is one unit: the first one is recorded and skipped
+                // by the dispatcher (it is already in the starting position),
+                // and a reconnect snapshot resyncs missed fills (SPEC-0002 H-3).
+                let fills = frame
+                    .data
+                    .fills
+                    .iter()
+                    .filter_map(|fill| fill_data(fill, coins))
+                    .collect();
+                Ok(vec![AccountUpdate::Fills { stamp, fills }])
+            } else {
+                Ok(frame
+                    .data
+                    .fills
+                    .iter()
+                    .filter_map(|fill| fill_update(fill, coins, stamp))
+                    .collect())
+            }
         }
         "user" => {
+            // Fills are taken from `userFills` only, so they are not applied
+            // twice; `userEvents` is kept for funding, liquidations, and
+            // non-user cancels (SPEC-0002 H-3, SPEC-0010 E-8).
             let frame: UserEventFrame =
                 serde_json::from_str(text).map_err(|e| Error::Decode(e.to_string()))?;
             let mut out = Vec::new();
-            if let Some(fills) = &frame.data.fills {
-                out.extend(
-                    fills
-                        .iter()
-                        .filter_map(|fill| fill_update(fill, coins, stamp)),
-                );
-            }
             if let Some(funding) = &frame.data.funding
                 && let Some(coin) = coins.id(&funding.coin)
             {
@@ -377,7 +386,10 @@ struct UserFillsFrame {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WireUserFills {
+    #[serde(default)]
+    is_snapshot: bool,
     #[serde(default)]
     fills: Vec<WireFill>,
 }
@@ -390,8 +402,6 @@ struct UserEventFrame {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireUserEvent {
-    #[serde(default)]
-    fills: Option<Vec<WireFill>>,
     #[serde(default)]
     funding: Option<WireFunding>,
 }
@@ -413,26 +423,48 @@ struct WireFill {
     time: u64,
     #[serde(default)]
     oid: u64,
+    /// The wire fill has no `cloid` in the official schema; tolerate it when a
+    /// venue build does include one, but never rely on it (map by `oid`).
+    #[serde(default)]
+    cloid: Option<String>,
+    #[serde(default)]
+    tid: u64,
     #[serde(default)]
     fee: rust_decimal::Decimal,
     #[serde(default)]
     liquidation: Option<serde_json::Value>,
 }
 
-fn fill_update(fill: &WireFill, coins: &IngestCoins, stamp: Stamp) -> Option<AccountUpdate> {
+fn fill_data(fill: &WireFill, coins: &IngestCoins) -> Option<FillData> {
     let coin = coins.id(&fill.coin)?;
-    let mut stamp = stamp;
-    stamp.ts_exch_ms = fill.time;
-    Some(AccountUpdate::Fill {
-        stamp,
-        cloid: None,
+    Some(FillData {
+        cloid: fill.cloid.as_deref().and_then(Cloid::from_hex),
         oid: fill.oid,
+        tid: fill.tid,
         coin,
         side: parse_side(&fill.side),
         px: fill.px,
         sz: fill.sz,
         fee: fill.fee,
         liquidation: fill.liquidation.is_some(),
+    })
+}
+
+fn fill_update(fill: &WireFill, coins: &IngestCoins, stamp: Stamp) -> Option<AccountUpdate> {
+    let data = fill_data(fill, coins)?;
+    let mut stamp = stamp;
+    stamp.ts_exch_ms = fill.time;
+    Some(AccountUpdate::Fill {
+        stamp,
+        cloid: data.cloid,
+        oid: data.oid,
+        tid: data.tid,
+        coin: data.coin,
+        side: data.side,
+        px: data.px,
+        sz: data.sz,
+        fee: data.fee,
+        liquidation: data.liquidation,
     })
 }
 
@@ -678,6 +710,7 @@ mod tests {
                 px,
                 sz,
                 fee,
+                tid,
                 liquidation,
                 ..
             } => {
@@ -686,10 +719,56 @@ mod tests {
                 assert_eq!(px, &ds("60000"));
                 assert_eq!(sz, &ds("0.01"));
                 assert_eq!(fee, &ds("0.27"));
+                assert_eq!(*tid, 7);
                 assert!(!liquidation);
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn golden_snapshot_user_fills_frame_is_one_update() {
+        // Captured shape: the first `userFills` message has `isSnapshot: true`
+        // and is delivered as one batch so the first-connect snapshot can be
+        // recorded without being applied.
+        let frame = r#"{"channel":"userFills","data":{"isSnapshot":true,"user":"0xabc","fills":[
+            {"coin":"BTC","px":"60000","sz":"0.01","side":"B","time":7,"oid":42,"fee":"0.27","tid":7},
+            {"coin":"ETH","px":"3000","sz":"0.5","side":"A","time":8,"oid":43,"fee":"0.1","tid":8}]}}"#;
+        let updates = ingester().decode_account(frame, Stamp::default()).unwrap();
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            AccountUpdate::Fills { fills, .. } => {
+                assert_eq!(fills.len(), 2);
+                assert_eq!(fills[0].tid, 7);
+                assert_eq!(fills[0].coin, CoinId(0));
+                assert_eq!(fills[1].tid, 8);
+                assert_eq!(fills[1].coin, CoinId(1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn golden_streaming_user_fills_frame_is_per_fill() {
+        let frame = r#"{"channel":"userFills","data":{"isSnapshot":false,"user":"0xabc","fills":[
+            {"coin":"BTC","px":"60000","sz":"0.01","side":"B","time":7,"oid":42,"fee":"0.27","tid":7}]}}"#;
+        let updates = ingester().decode_account(frame, Stamp::default()).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(&updates[0], AccountUpdate::Fill { tid: 7, .. }));
+    }
+
+    #[test]
+    fn user_events_do_not_emit_fills() {
+        // Fills arrive on `userFills` only; a `user` frame with a `fills` array
+        // must not produce a second fill (SPEC-0002 H-3).
+        let frame = r#"{"channel":"user","data":{"fills":[
+            {"coin":"BTC","px":"60000","sz":"0.01","side":"B","time":7,"oid":42,"fee":"0.27","tid":7}]}}"#;
+        assert!(
+            ingester()
+                .decode_account(frame, Stamp::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

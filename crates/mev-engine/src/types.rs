@@ -385,14 +385,16 @@ pub enum AccountUpdate {
         /// Average fill price.
         avg_px: Px,
     },
-    /// A fill.
+    /// A live (non-snapshot) fill from the `userFills` channel.
     Fill {
         /// Receive stamp.
         stamp: Stamp,
-        /// Client order id, if known.
+        /// Client order id, if the wire carried one.
         cloid: Option<Cloid>,
         /// Venue order id.
         oid: u64,
+        /// Venue trade id, used to de-duplicate fill delivery.
+        tid: u64,
         /// Coin.
         coin: CoinId,
         /// Side.
@@ -405,6 +407,19 @@ pub enum AccountUpdate {
         fee: Px,
         /// Whether this was a liquidation.
         liquidation: bool,
+    },
+    /// A `userFills` snapshot, handled as one unit so the first-connect
+    /// snapshot can be recorded without being applied (SPEC-0002 H-3,
+    /// SPEC-0010 E-8).
+    ///
+    /// The fills are a `Vec` (one allocation per snapshot): a snapshot may hold
+    /// up to 2000 fills and is rare, while `Fill` stays small on the account
+    /// channel.
+    Fills {
+        /// Receive stamp.
+        stamp: Stamp,
+        /// The snapshot's fills.
+        fills: Vec<FillData>,
     },
     /// A posted action's result.
     PostAck {
@@ -433,6 +448,29 @@ pub enum AccountUpdate {
     },
     /// A control command.
     Control(Control),
+}
+
+/// One fill inside a `userFills` snapshot (`AccountUpdate::Fills`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillData {
+    /// Client order id, if the wire carried one.
+    pub cloid: Option<Cloid>,
+    /// Venue order id.
+    pub oid: u64,
+    /// Venue trade id.
+    pub tid: u64,
+    /// Coin.
+    pub coin: CoinId,
+    /// Side.
+    pub side: Side,
+    /// Fill price.
+    pub px: Px,
+    /// Fill size.
+    pub sz: Sz,
+    /// Fee paid.
+    pub fee: Px,
+    /// Whether this was a liquidation.
+    pub liquidation: bool,
 }
 
 /// A compact trade, borrowing the wire shape but with fixed size.
@@ -660,12 +698,17 @@ mod tests {
                 stamp,
                 cloid: None,
                 oid: 1,
+                tid: 42,
                 coin: CoinId(0),
                 side: Side::Sell,
                 px: ds("100"),
                 sz: ds("1"),
                 fee: ds("0.05"),
                 liquidation: false,
+            },
+            AccountUpdate::Fills {
+                stamp,
+                fills: Vec::new(),
             },
             AccountUpdate::PostAck {
                 stamp,
@@ -686,6 +729,6 @@ mod tests {
             },
             AccountUpdate::Control(Control::KillSwitch),
         ];
-        assert_eq!(account.len(), 6);
+        assert_eq!(account.len(), 7);
     }
 }

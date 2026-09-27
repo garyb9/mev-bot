@@ -687,6 +687,7 @@ mod tests {
             strategy: StrategyId::from("t"),
             state,
             req_id: None,
+            oid: None,
         }
     }
 

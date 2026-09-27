@@ -46,7 +46,7 @@
 //!   scheduling them on the loop's heap is the caller's job (the v2 loop has no
 //!   interest-driven scheduler yet).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -71,7 +71,7 @@ use crate::strategy::{
 };
 use crate::timers::TimerId as HeapTimerId;
 use crate::types::{
-    AccountUpdate, Cloid, CoinId, CoinRegistry, Control, PostResult, Px, Side, Stamp,
+    AccountUpdate, Cloid, CoinId, CoinRegistry, Control, PostResult, Px, Side, Stamp, Sz,
 };
 
 /// The dispatcher's runtime knobs.
@@ -139,6 +139,12 @@ pub struct StrategyDispatcher {
     /// Request id → cloids, kept so an `Error` post ack can resolve them
     /// (`OrderManager::on_post_ack` only handles per-order statuses).
     req_cloids: BTreeMap<u64, SmallVec<[Cloid; 8]>>,
+    /// De-duplication of fills by venue `tid`, with the first-connect snapshot
+    /// skip (SPEC-0002 H-3, SPEC-0010 E-8).
+    fills: FillTracker,
+    /// `oid → (cloid, owner)` for terminal orders pruned from the manager, so a
+    /// late fill still reaches its owning strategy. Bounded FIFO.
+    recent_routes: BTreeMap<u64, (Cloid, StrategyId)>,
     /// Shared market-drop counter the producer can increment.
     market_drops: Arc<AtomicU64>,
     /// Drops already folded into the recorder.
@@ -203,6 +209,8 @@ impl StrategyDispatcher {
             halted: false,
             timer_owners: BTreeMap::new(),
             req_cloids: BTreeMap::new(),
+            fills: FillTracker::new(),
+            recent_routes: BTreeMap::new(),
             market_drops: Arc::new(AtomicU64::new(0)),
             drops_seen: 0,
             resting_orders: Arc::new(AtomicUsize::new(0)),
@@ -393,6 +401,7 @@ impl StrategyDispatcher {
             } => {
                 self.orders
                     .on_order_update(*cloid, *status, *filled_sz, *avg_px);
+                self.orders.record_oid(*oid, *cloid);
                 let event = self.orders.get(*cloid).map(|order| {
                     (
                         order.strategy.clone(),
@@ -418,6 +427,7 @@ impl StrategyDispatcher {
             AccountUpdate::Fill {
                 cloid,
                 oid,
+                tid,
                 coin,
                 side,
                 px,
@@ -425,35 +435,31 @@ impl StrategyDispatcher {
                 fee,
                 ..
             } => {
-                self.orders.on_fill(*cloid, *sz);
-                // A perp fill moves the position directly; a spot fill is left
-                // to the reconciler (balances are keyed by token, not coin).
-                if !self.is_spot(*coin) {
-                    let signed = if matches!(side, Side::Buy) { *sz } else { -*sz };
-                    let current = self.account.position_szi(*coin);
-                    self.account.set_position_szi(*coin, current + signed);
+                // Live fills skip tids already seen (a reconnect snapshot may
+                // re-deliver them).
+                if self.fills.observe_live(*tid) {
+                    self.apply_fill(*cloid, *oid, *coin, *side, *px, *sz, *fee, stamp, state);
                 }
-                let event = cloid.and_then(|cloid| {
-                    let order = self.orders.get(cloid)?;
-                    Some((
-                        order.strategy.clone(),
-                        OrderEvent {
-                            stamp,
-                            cloid: Some(cloid),
-                            oid: *oid,
-                            coin: *coin,
-                            side: strat_side(*side),
-                            px: *px,
-                            sz: *sz,
-                            fee: *fee,
-                            maker: false,
-                            reduce_only: order.reduce_only,
-                            kind: OrderEventKind::Fill,
-                        },
-                    ))
-                });
-                if let Some((owner, event)) = event {
-                    self.deliver_to(&owner, &event, state);
+            }
+            AccountUpdate::Fills { fills, stamp } => {
+                if self.fills.first_snapshot {
+                    // A reconnect snapshot applies only the tids missed during
+                    // the gap (the resync H-3 asks for).
+                    for fill in fills {
+                        if self.fills.observe(fill.tid) {
+                            self.apply_fill(
+                                fill.cloid, fill.oid, fill.coin, fill.side, fill.px, fill.sz,
+                                fill.fee, *stamp, state,
+                            );
+                        }
+                    }
+                } else {
+                    // The first-connect snapshot is already in the starting
+                    // position: record its tids without applying them.
+                    for fill in fills {
+                        self.fills.record(fill.tid);
+                    }
+                    self.fills.first_snapshot = true;
                 }
             }
             AccountUpdate::PostAck { req_id, result, .. } => {
@@ -479,6 +485,70 @@ impl StrategyDispatcher {
 
         let t_decided = now_ns();
         self.run_actions(stamp, state, t_recv, t_decided);
+    }
+
+    /// Apply one already-deduplicated fill: move the position, advance the
+    /// order's filled size, and deliver a fill event to the owning strategy.
+    ///
+    /// A fill is mapped to its order by `cloid` (when the wire carried one),
+    /// else by the `oid → cloid` index, else by the recent-route cache for an
+    /// order pruned after it filled. A fill that arrives after the order's
+    /// terminal update and after pruning still reaches the strategy.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_fill(
+        &mut self,
+        cloid: Option<Cloid>,
+        oid: u64,
+        coin: CoinId,
+        side: Side,
+        px: Px,
+        sz: Sz,
+        fee: Px,
+        stamp: Stamp,
+        state: &EngineState,
+    ) {
+        let cloid = cloid
+            .or_else(|| self.orders.cloid_for_oid(oid))
+            .or_else(|| self.recent_routes.get(&oid).map(|(cloid, _)| *cloid));
+
+        // A perp fill moves the position directly; a spot fill is left to the
+        // reconciler (balances are keyed by token, not coin).
+        if !self.is_spot(coin) {
+            let signed = if matches!(side, Side::Buy) { sz } else { -sz };
+            let current = self.account.position_szi(coin);
+            self.account.set_position_szi(coin, current + signed);
+        }
+        if let Some(cloid) = cloid {
+            self.orders.on_fill(Some(cloid), sz);
+        }
+
+        let route = cloid
+            .and_then(|cloid| {
+                self.orders
+                    .get(cloid)
+                    .map(|order| (cloid, order.strategy.clone(), order.reduce_only))
+            })
+            .or_else(|| {
+                self.recent_routes
+                    .get(&oid)
+                    .map(|(cloid, owner)| (*cloid, owner.clone(), false))
+            });
+        if let Some((cloid, owner, reduce_only)) = route {
+            let event = OrderEvent {
+                stamp,
+                cloid: Some(cloid),
+                oid,
+                coin,
+                side: strat_side(side),
+                px,
+                sz,
+                fee,
+                maker: false,
+                reduce_only,
+                kind: OrderEventKind::Fill,
+            };
+            self.deliver_to(&owner, &event, state);
+        }
     }
 
     fn handle_control(&mut self, control: &Control) {
@@ -699,6 +769,7 @@ impl StrategyDispatcher {
             strategy: intent.strategy.clone(),
             state: OrderState::PendingNew,
             req_id: None,
+            oid: None,
         };
         self.owners.insert(cloid, intent.strategy.clone());
         self.orders.insert(order);
@@ -869,10 +940,30 @@ impl Dispatcher for StrategyDispatcher {
         self.recorder.record_iteration(iteration_ns, events);
         self.sync_market_drops();
         // Keep the order map bounded: drop terminal orders once their delivery
-        // is done. The scan runs only when terminal orders exist.
-        if self.orders.prune_terminal() > 0 {
+        // is done. The scan runs only when terminal orders exist. Before
+        // pruning, remember each terminal order's `oid → owner` so a fill that
+        // arrives after the terminal update and after pruning is still routed.
+        if self.orders.terminal_count() > 0 {
+            for order in self.orders.iter() {
+                if order.state.is_terminal()
+                    && let Some(oid) = order.oid
+                {
+                    self.recent_routes
+                        .insert(oid, (order.cloid, order.strategy.clone()));
+                }
+            }
+            self.orders.prune_terminal();
             self.owners
                 .retain(|cloid, _| self.orders.get(*cloid).is_some());
+            while self.recent_routes.len() > MAX_RECENT_ROUTES {
+                let oldest = self.recent_routes.keys().next().copied();
+                match oldest {
+                    Some(oid) => {
+                        self.recent_routes.remove(&oid);
+                    }
+                    None => break,
+                }
+            }
         }
         self.resting_orders
             .store(self.orders.resting_count(), Ordering::Relaxed);
@@ -949,6 +1040,7 @@ fn account_stamp(update: &AccountUpdate) -> Stamp {
     match update {
         AccountUpdate::OrderUpdate { stamp, .. }
         | AccountUpdate::Fill { stamp, .. }
+        | AccountUpdate::Fills { stamp, .. }
         | AccountUpdate::PostAck { stamp, .. }
         | AccountUpdate::Reconcile { stamp, .. }
         | AccountUpdate::Funding { stamp, .. } => *stamp,
@@ -971,6 +1063,68 @@ fn now_ns() -> u64 {
 /// Wall-clock milliseconds, for the rate-budget refill.
 fn now_ms() -> u64 {
     SystemClock.now_ms()
+}
+
+/// Holds a full `userFills` snapshot (the venue returns at most 2000) plus a
+/// wide margin, so a reconnect snapshot's tids are all de-duplicated.
+const MAX_SEEN_FILLS: usize = 8_192;
+
+/// Cap on the recent-route cache for late fills of pruned terminal orders.
+const MAX_RECENT_ROUTES: usize = 4_096;
+
+/// A bounded, FIFO set of fill `tid`s.
+///
+/// `first_snapshot` distinguishes the first-connect `userFills` snapshot (whose
+/// tids are recorded but not applied, since they are already in the starting
+/// position) from a reconnect snapshot (whose unseen tids are the fills missed
+/// during the gap, and are applied).
+#[derive(Debug)]
+struct FillTracker {
+    seen: HashSet<u64>,
+    order: VecDeque<u64>,
+    first_snapshot: bool,
+}
+
+impl FillTracker {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            first_snapshot: false,
+        }
+    }
+
+    fn insert(&mut self, tid: u64) {
+        if self.seen.insert(tid) {
+            self.order.push_back(tid);
+            while self.order.len() > MAX_SEEN_FILLS {
+                if let Some(old) = self.order.pop_front() {
+                    self.seen.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// Record a tid without asking whether it is new (first snapshot).
+    fn record(&mut self, tid: u64) {
+        self.insert(tid);
+    }
+
+    /// Mark a tid seen; `true` means it is new and should be applied.
+    fn observe(&mut self, tid: u64) -> bool {
+        if self.seen.contains(&tid) {
+            return false;
+        }
+        self.insert(tid);
+        true
+    }
+
+    /// Observe a live (non-snapshot) fill. A live fill also ends the
+    /// first-connect phase, so a later reconnect snapshot is applied.
+    fn observe_live(&mut self, tid: u64) -> bool {
+        self.first_snapshot = true;
+        self.observe(tid)
+    }
 }
 
 #[cfg(test)]
@@ -1090,6 +1244,7 @@ mod tests {
             strategy: StrategyId::from("other"),
             state,
             req_id: None,
+            oid: None,
         }
     }
 
@@ -1332,6 +1487,7 @@ mod tests {
                 stamp: stamp(21),
                 cloid: Some(placed),
                 oid: 7,
+                tid: 100,
                 coin: CoinId(0),
                 side: Side::Buy,
                 px: ds("100"),
@@ -1354,6 +1510,181 @@ mod tests {
             ds("0.5"),
             "perp fill updates the position"
         );
+    }
+
+    fn fill_update(tid: u64, cloid: Option<Cloid>, oid: u64, sz: &str) -> AccountUpdate {
+        AccountUpdate::Fill {
+            stamp: stamp(tid),
+            cloid,
+            oid,
+            tid,
+            coin: CoinId(0),
+            side: Side::Buy,
+            px: ds("100"),
+            sz: ds(sz),
+            fee: Decimal::ZERO,
+            liquidation: false,
+        }
+    }
+
+    fn snapshot_fills(fills: &[(u64, u64, &str)]) -> AccountUpdate {
+        AccountUpdate::Fills {
+            stamp: stamp(1),
+            fills: fills
+                .iter()
+                .map(|(tid, oid, sz)| crate::types::FillData {
+                    cloid: None,
+                    oid: *oid,
+                    tid: *tid,
+                    coin: CoinId(0),
+                    side: Side::Buy,
+                    px: ds("100"),
+                    sz: ds(sz),
+                    fee: Decimal::ZERO,
+                    liquidation: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn same_fill_delivered_twice_moves_the_position_once() {
+        let mut h = harness(Vec::new(), false);
+        let state = state_with("100", "101");
+        h.dispatcher
+            .on_account_state(&fill_update(5, None, 1, "1"), &state);
+        // A reconnect snapshot redelivers the same tid: it must be skipped.
+        h.dispatcher
+            .on_account_state(&snapshot_fills(&[(5, 1, "1")]), &state);
+        assert_eq!(
+            h.dispatcher.account.position_szi(CoinId(0)),
+            ds("1"),
+            "a fill seen twice moves the position once"
+        );
+    }
+
+    #[test]
+    fn first_connect_snapshot_does_not_move_the_position() {
+        let mut h = harness(Vec::new(), false);
+        let state = state_with("100", "101");
+        h.dispatcher
+            .on_account_state(&snapshot_fills(&[(1, 1, "1"), (2, 2, "1")]), &state);
+        assert_eq!(
+            h.dispatcher.account.position_szi(CoinId(0)),
+            Decimal::ZERO,
+            "the first snapshot is already in the starting position"
+        );
+        // Its tids are recorded, so a live redelivery is skipped too.
+        h.dispatcher
+            .on_account_state(&fill_update(1, None, 1, "1"), &state);
+        assert_eq!(h.dispatcher.account.position_szi(CoinId(0)), Decimal::ZERO);
+    }
+
+    #[test]
+    fn reconnect_snapshot_applies_only_new_tids() {
+        let mut h = harness(Vec::new(), false);
+        let state = state_with("100", "101");
+        // First snapshot: skipped, tids 1 and 2 recorded.
+        h.dispatcher
+            .on_account_state(&snapshot_fills(&[(1, 1, "1"), (2, 2, "2")]), &state);
+        // A live fill ends the first-connect phase and moves the position.
+        h.dispatcher
+            .on_account_state(&fill_update(3, None, 3, "1"), &state);
+        assert_eq!(h.dispatcher.account.position_szi(CoinId(0)), ds("1"));
+        // Reconnect snapshot: 2 and 3 already seen; only the new tid 4 applies.
+        h.dispatcher.on_account_state(
+            &snapshot_fills(&[(2, 2, "2"), (3, 3, "1"), (4, 4, "1")]),
+            &state,
+        );
+        assert_eq!(h.dispatcher.account.position_szi(CoinId(0)), ds("2"));
+    }
+
+    #[test]
+    fn fill_maps_to_order_by_oid_and_updates_filled_sz() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
+        let events = strategy.events();
+        let mut h = harness(vec![Box::new(strategy)], false);
+        let state = state_with("100", "101");
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+        let placed = *h
+            .dispatcher
+            .orders
+            .iter()
+            .next()
+            .map(|order| &order.cloid)
+            .unwrap();
+
+        h.dispatcher.on_account_state(
+            &AccountUpdate::OrderUpdate {
+                stamp: stamp(20),
+                cloid: placed,
+                oid: 7,
+                status: VenueOrderStatus::Resting,
+                filled_sz: Decimal::ZERO,
+                avg_px: Decimal::ZERO,
+            },
+            &state,
+        );
+        // The fill carries no cloid: it is mapped through the oid index.
+        h.dispatcher
+            .on_account_state(&fill_update(9, None, 7, "0.5"), &state);
+
+        let order = h.dispatcher.orders.get(placed).unwrap();
+        assert_eq!(order.filled_sz, ds("0.5"));
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == OrderEventKind::Fill),
+            "the owning strategy receives the fill"
+        );
+    }
+
+    #[test]
+    fn fill_after_terminal_update_and_pruning_still_reaches_the_owner() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
+        let events = strategy.events();
+        let mut h = harness(vec![Box::new(strategy)], false);
+        let state = state_with("100", "101");
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+        let placed = *h
+            .dispatcher
+            .orders
+            .iter()
+            .next()
+            .map(|order| &order.cloid)
+            .unwrap();
+
+        h.dispatcher.on_account_state(
+            &AccountUpdate::OrderUpdate {
+                stamp: stamp(20),
+                cloid: placed,
+                oid: 7,
+                status: VenueOrderStatus::Filled,
+                filled_sz: Decimal::ONE,
+                avg_px: ds("100"),
+            },
+            &state,
+        );
+        assert!(h.dispatcher.orders.get(placed).unwrap().state.is_terminal());
+        // The loop prunes the terminal order and remembers its oid route.
+        h.dispatcher.record_iteration(0, 0);
+        assert!(h.dispatcher.orders.get(placed).is_none());
+
+        h.dispatcher
+            .on_account_state(&fill_update(11, None, 7, "1"), &state);
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == OrderEventKind::Fill),
+            "a late fill is still delivered after pruning"
+        );
+        assert_eq!(h.dispatcher.account.position_szi(CoinId(0)), ds("1"));
     }
 
     #[test]

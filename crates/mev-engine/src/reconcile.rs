@@ -403,7 +403,9 @@ impl Reconciler {
                             OrderState::Resting
                         },
                         req_id: None,
+                        oid: Some(order.oid),
                     });
+                    orders.record_oid(order.oid, order.cloid);
                     corrected += 1;
                 }
                 Drift::OrderMismatch {
@@ -568,6 +570,7 @@ mod tests {
             strategy: StrategyId::from("t"),
             state,
             req_id: None,
+            oid: None,
         }
     }
 

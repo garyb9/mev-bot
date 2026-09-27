@@ -97,6 +97,8 @@ pub struct LiveOrder {
     pub state: OrderState,
     /// Request id, set when the action is handed to exec.
     pub req_id: Option<u64>,
+    /// Venue order id, once a post ack or order update reports it.
+    pub oid: Option<u64>,
 }
 
 impl LiveOrder {
@@ -116,6 +118,8 @@ impl LiveOrder {
 pub struct OrderManager {
     orders: BTreeMap<Cloid, LiveOrder>,
     by_req: BTreeMap<u64, SmallVec<[Cloid; 8]>>,
+    /// Venue order id → client order id, so a fill can be mapped to its order.
+    by_oid: BTreeMap<u64, Cloid>,
     /// Incremental per-coin worst-case in-flight notional; indexes by `CoinId`.
     pending_notional: Vec<Decimal>,
     coin_count: usize,
@@ -123,6 +127,8 @@ pub struct OrderManager {
     working_count: usize,
     /// Incremental count of terminal orders still retained for delivery.
     terminal_count: usize,
+    /// Incremental count of `Unknown` orders (avoids a scan per market event).
+    unknown_count: usize,
 }
 
 impl OrderManager {
@@ -131,10 +137,12 @@ impl OrderManager {
         Self {
             orders: BTreeMap::new(),
             by_req: BTreeMap::new(),
+            by_oid: BTreeMap::new(),
             pending_notional: vec![Decimal::ZERO; coin_count],
             coin_count,
             working_count: 0,
             terminal_count: 0,
+            unknown_count: 0,
         }
     }
 
@@ -150,6 +158,7 @@ impl OrderManager {
         let coin = order.coin.index();
         let working = order.state.is_working();
         let terminal = order.state.is_terminal();
+        let unknown = order.state.is_unknown();
         let contribution = order.remaining_notional();
         if let Some(old) = self.orders.insert(cloid, order) {
             if old.state.is_working()
@@ -163,6 +172,9 @@ impl OrderManager {
             if old.state.is_terminal() {
                 self.terminal_count -= 1;
             }
+            if old.state.is_unknown() {
+                self.unknown_count -= 1;
+            }
         }
         if working && let Some(slot) = self.pending_notional.get_mut(coin) {
             *slot += contribution;
@@ -172,6 +184,9 @@ impl OrderManager {
         }
         if terminal {
             self.terminal_count += 1;
+        }
+        if unknown {
+            self.unknown_count += 1;
         }
         cloid
     }
@@ -198,12 +213,23 @@ impl OrderManager {
         if order.state.is_terminal() {
             self.terminal_count -= 1;
         }
+        if order.state.is_unknown() {
+            self.unknown_count -= 1;
+        }
+        if let Some(oid) = order.oid {
+            self.by_oid.remove(&oid);
+        }
         Some(order)
     }
 
     /// Number of tracked orders.
     pub fn len(&self) -> usize {
         self.orders.len()
+    }
+
+    /// Number of terminal orders still retained for delivery.
+    pub fn terminal_count(&self) -> usize {
+        self.terminal_count
     }
 
     /// Whether no orders are tracked.
@@ -236,8 +262,30 @@ impl OrderManager {
     }
 
     /// Whether any tracked order has an unknown outcome awaiting reconciliation.
+    ///
+    /// O(1): an incremental counter kept exact by [`Self::insert`],
+    /// [`Self::remove`], and [`Self::set_state`].
     pub fn has_unknown(&self) -> bool {
-        self.orders.values().any(|order| order.state.is_unknown())
+        self.unknown_count > 0
+    }
+
+    /// Record the venue oid for a client order id, for fill mapping.
+    ///
+    /// Also sets the order's `oid` when it is tracked. Oids are never zero on
+    /// the wire, so `0` is ignored.
+    pub fn record_oid(&mut self, oid: u64, cloid: Cloid) {
+        if oid == 0 {
+            return;
+        }
+        self.by_oid.insert(oid, cloid);
+        if let Some(order) = self.orders.get_mut(&cloid) {
+            order.oid = Some(oid);
+        }
+    }
+
+    /// The client order id for a venue oid, if it is still tracked or recent.
+    pub fn cloid_for_oid(&self, oid: u64) -> Option<Cloid> {
+        self.by_oid.get(&oid).copied()
     }
 
     /// Whether any order on `coin` has an unknown outcome.
@@ -259,6 +307,10 @@ impl OrderManager {
         let before = self.orders.len();
         self.orders.retain(|_, order| !order.state.is_terminal());
         self.terminal_count = 0;
+        // Drop the oid index entries for pruned orders; a late fill for them is
+        // delivered from the dispatcher's short-lived recent-route cache.
+        self.by_oid
+            .retain(|_, cloid| self.orders.contains_key(cloid));
         before - self.orders.len()
     }
 
@@ -290,7 +342,16 @@ impl OrderManager {
         let was_working = order.state.is_working();
         let now_working = state.is_working();
         let was_terminal = order.state.is_terminal();
+        let was_unknown = order.state.is_unknown();
+        let now_unknown = state.is_unknown();
         order.state = state;
+        if was_unknown != now_unknown {
+            if now_unknown {
+                self.unknown_count += 1;
+            } else {
+                self.unknown_count -= 1;
+            }
+        }
         if was_working != now_working
             && let Some(slot) = self.pending_notional.get_mut(coin)
         {
@@ -540,6 +601,7 @@ mod tests {
             strategy: StrategyId::from("t"),
             state,
             req_id: None,
+            oid: None,
         }
     }
 

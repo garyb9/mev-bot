@@ -431,6 +431,7 @@ mod tests {
             strategy: StrategyId::from("t"),
             state: OrderState::Resting,
             req_id: None,
+            oid: None,
         }
     }
 
