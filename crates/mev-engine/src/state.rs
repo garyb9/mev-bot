@@ -41,6 +41,30 @@ impl MarketSlot {
         }
     }
 
+    /// The stamp of the freshest of `bbo`, `book`, and `ctx` (by monotonic
+    /// time), or `None` when the slot has no data yet.
+    ///
+    /// Used as the event time for a coin's dispatch so strategies see the time
+    /// of the update that triggered them (SPEC-0010 §8).
+    pub fn latest_stamp(&self) -> Option<Stamp> {
+        let mut best: Option<Stamp> = None;
+        let mut fold = |stamp: Stamp| {
+            if stamp.mono_ns > 0 && best.is_none_or(|b| stamp.mono_ns >= b.mono_ns) {
+                best = Some(stamp);
+            }
+        };
+        if let Some((_, _, stamp)) = &self.bbo {
+            fold(*stamp);
+        }
+        if let Some((_, stamp)) = &self.book {
+            fold(*stamp);
+        }
+        if let Some((_, stamp)) = &self.ctx {
+            fold(*stamp);
+        }
+        best
+    }
+
     /// The freshest best ask (prefers the later of `bbo` and the book top).
     pub fn best_ask(&self) -> Option<Level> {
         match (&self.bbo, &self.book) {

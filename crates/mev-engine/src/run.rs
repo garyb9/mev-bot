@@ -10,9 +10,9 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, select};
-use mev_core::clock::{Clock, SystemClock};
 
 use crate::channels::Inputs;
+use crate::clock::{LiveClock, SharedClock};
 use crate::dispatch::StrategyDispatcher;
 use crate::instrument::{LatencyRecorder, Metric};
 use crate::routes::Routes;
@@ -102,6 +102,7 @@ pub struct EngineLoop<D: Dispatcher> {
     dispatcher: D,
     config: LoopConfig,
     stop: Receiver<()>,
+    clock: SharedClock,
 }
 
 impl<D: Dispatcher> EngineLoop<D> {
@@ -118,7 +119,22 @@ impl<D: Dispatcher> EngineLoop<D> {
             dispatcher,
             config,
             stop,
+            clock: Arc::new(LiveClock::new()),
         }
+    }
+
+    /// Use an explicit clock (replay); defaults to [`LiveClock`].
+    ///
+    /// The caller must pass the *same* clock to the dispatcher for the paper
+    /// backend and the loop to agree on event time.
+    pub fn with_clock(mut self, clock: SharedClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The loop's clock.
+    pub fn clock(&self) -> &SharedClock {
+        &self.clock
     }
 
     /// Access the current market state (tests / introspection).
@@ -139,7 +155,7 @@ impl<D: Dispatcher> EngineLoop<D> {
     /// Run until the inputs close or a stop is requested.
     pub fn run(mut self) -> StopReason {
         loop {
-            let processed = self.iterate(SystemClock.now_ms() * 1_000_000);
+            let processed = self.iterate(self.clock.mono_ns());
             if processed == 0 {
                 match self.idle() {
                     StopReason::InputsClosed => return StopReason::InputsClosed,
@@ -176,18 +192,26 @@ impl<D: Dispatcher> EngineLoop<D> {
             n += 1;
         }
 
-        // 3. Timers.
+        // 3. Timers. The wall-clock half of the stamp comes from the clock, so
+        // replay sees the recorded event time, not the host clock.
         let now_stamp = Stamp {
+            t_recv_ns: self.clock.now().t_recv_ns,
             mono_ns: now_mono_ns,
-            ..Default::default()
+            ts_exch_ms: 0,
         };
         for id in self.timers.pop_due(now_mono_ns) {
             self.dispatcher.on_timer_state(id, now_stamp, &self.state);
         }
 
-        // 4. Dispatch each dirty coin once, in CoinId order.
+        // 4. Dispatch each dirty coin once, in CoinId order, with the time of
+        // the update that marked it dirty (SPEC-0010 §8).
         for coin in self.state.drain_dirty() {
-            self.dispatcher.on_coin_state(coin, now_stamp, &self.state);
+            let stamp = self
+                .state
+                .slot(coin)
+                .and_then(|slot| slot.latest_stamp())
+                .unwrap_or(now_stamp);
+            self.dispatcher.on_coin_state(coin, stamp, &self.state);
         }
 
         // 5. Loop-health instrumentation (E-10 §17).
@@ -264,7 +288,7 @@ impl<D: Dispatcher> EngineLoop<D> {
             .timers
             .next_deadline()
             .map(|deadline| {
-                let now = SystemClock.now_ms() * 1_000_000;
+                let now = self.clock.mono_ns();
                 Duration::from_nanos(deadline.saturating_sub(now))
             })
             .unwrap_or(MAX_BLOCK)
@@ -521,6 +545,60 @@ mod tests {
         // Drop the only senders.
         drop(handles);
         assert_eq!(engine.run(), StopReason::InputsClosed);
+    }
+
+    struct StampRecorder {
+        seen: Arc<Mutex<Vec<(CoinId, u64, i64)>>>,
+        interests: Vec<Interests>,
+    }
+
+    impl Dispatcher for StampRecorder {
+        fn interests(&self) -> Vec<Interests> {
+            self.interests.clone()
+        }
+        fn on_coin(&mut self, coin: CoinId, stamp: Stamp) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((coin, stamp.mono_ns, stamp.t_recv_ns));
+        }
+    }
+
+    #[test]
+    fn dispatch_uses_the_coins_event_stamp_not_the_iteration_time() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (handles, inputs) = inputs(64, 64);
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let dispatcher = StampRecorder {
+            seen: seen.clone(),
+            interests: vec![Interests::coins([CoinId(0)])],
+        };
+        let mut engine = EngineLoop::new(
+            inputs,
+            dispatcher,
+            LoopConfig {
+                spin_us: 0,
+                coin_count: 1,
+            },
+            stop_rx,
+        );
+        handles.send_market(MarketUpdate::Bbo {
+            coin: CoinId(0),
+            stamp: Stamp {
+                t_recv_ns: 123,
+                mono_ns: 456,
+                ts_exch_ms: 0,
+            },
+            bid: Level::default(),
+            ask: Level::default(),
+        });
+        // The iteration's own time is deliberately different from the event's.
+        engine.iterate(9_999);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(CoinId(0), 456, 123)],
+            "ctx.now must be the update's stamp, so replay is event-time"
+        );
     }
 
     #[test]

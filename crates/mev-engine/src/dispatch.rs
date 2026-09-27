@@ -50,7 +50,6 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use mev_core::clock::{Clock, SystemClock};
 use mev_hl_client::RejectReason;
 use mev_risk::Decision;
 use mev_strategy::{OrderIntent, StrategyId};
@@ -58,6 +57,7 @@ use rust_decimal::Decimal;
 use smallvec::SmallVec;
 
 use crate::builder::{AssetTable, plan_iteration};
+use crate::clock::{LiveClock, SharedClock};
 use crate::exec::{ExecBackend, ReqIds, UnsignedPost, apply_post_ack, dispatch};
 use crate::instrument::{LatencyRecorder, Metric, Stamps};
 use crate::orders::{CloidAssigner, LiveOrder, OrderManager, OrderState};
@@ -152,6 +152,9 @@ pub struct StrategyDispatcher {
     /// Shared resting-order count, refreshed once per iteration for the
     /// dead-man switch (read without touching the order path).
     resting_orders: Arc<AtomicUsize>,
+    /// The engine's time source (SPEC-0010 §13): live wall clock, or the replay
+    /// clock the driver advances per event.
+    clock: SharedClock,
     config: DispatcherConfig,
 }
 
@@ -214,8 +217,20 @@ impl StrategyDispatcher {
             market_drops: Arc::new(AtomicU64::new(0)),
             drops_seen: 0,
             resting_orders: Arc::new(AtomicUsize::new(0)),
+            clock: Arc::new(LiveClock::new()),
             config,
         }
+    }
+
+    /// Use an explicit clock (replay); defaults to [`LiveClock`].
+    pub fn with_clock(mut self, clock: SharedClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The engine clock (introspection / driver sharing).
+    pub fn clock(&self) -> &SharedClock {
+        &self.clock
     }
 
     /// The account state (positions, margin) the dispatcher is tracking.
@@ -345,7 +360,13 @@ impl StrategyDispatcher {
         if indices.is_empty() {
             return;
         }
-        let t_recv = slot_mono(state.slot(coin)).unwrap_or(0);
+        // Event time of the update that marked this coin dirty (SPEC-0010 §8):
+        // fall back to the slot's freshest stamp if the caller passed none.
+        let t_recv = if stamp.mono_ns > 0 {
+            stamp.mono_ns
+        } else {
+            slot_mono(state.slot(coin)).unwrap_or(0)
+        };
         for index in indices {
             if self.paused.get(index).copied().unwrap_or(false) {
                 continue;
@@ -361,7 +382,7 @@ impl StrategyDispatcher {
             };
             self.strategies[index].on_market(coin, &ctx, &mut self.actions);
         }
-        let t_decided = now_ns();
+        let t_decided = self.clock.mono_ns();
         self.run_actions(stamp, state, t_recv, t_decided);
         self.tick_paper(state);
     }
@@ -384,7 +405,7 @@ impl StrategyDispatcher {
             registry: &self.registry,
         };
         self.strategies[index].on_timer(timer, &ctx, &mut self.actions);
-        let t_decided = now_ns();
+        let t_decided = self.clock.mono_ns();
         self.run_actions(stamp, state, 0, t_decided);
         self.tick_paper(state);
     }
@@ -512,7 +533,7 @@ impl StrategyDispatcher {
             self.risk.breakers_mut().clear_label("exec_error");
         }
 
-        let t_decided = now_ns();
+        let t_decided = self.clock.mono_ns();
         self.run_actions(stamp, state, t_recv, t_decided);
     }
 
@@ -708,7 +729,7 @@ impl StrategyDispatcher {
         let actions = self.actions.take();
         self.actions.clear();
 
-        let now_ms = now_ms();
+        let now_ms = self.clock.now_ms();
         let mut approved: SmallVec<[Action; 16]> = SmallVec::new();
         for mut action in actions {
             if self.gate_action(&mut action, state, now_ms) {
@@ -716,7 +737,7 @@ impl StrategyDispatcher {
             }
         }
 
-        let t_risked = now_ns();
+        let t_risked = self.clock.mono_ns();
         if approved.is_empty() {
             return;
         }
@@ -856,7 +877,7 @@ impl StrategyDispatcher {
             }
         }
 
-        let t_signed = now_ns();
+        let t_signed = self.clock.mono_ns();
         if let Some(exec) = self.exec.as_mut() {
             if dispatch(batch, exec, &mut self.orders).is_err() {
                 // Outbound channel full or exec down: fail closed. Rare, so
@@ -871,13 +892,13 @@ impl StrategyDispatcher {
         } else if paper_mode {
             // `simulate`: the paper backend fills synchronously; its account
             // updates are applied on this iteration's paper tick.
-            let updates = self.feed_paper(&batch, now_ms());
+            let updates = self.feed_paper(&batch, self.clock.now_ms());
             self.paper_updates.extend(updates);
         } else {
             // No backend (`observe`): never leave orders pending. Fail closed.
             self.reject_requests(&batch_reqs);
         }
-        let t_handoff = now_ns();
+        let t_handoff = self.clock.mono_ns();
 
         // `t_written`/`t_ack` come from the exec layer and are unset here, so the
         // headline tick-to-order and handoff histograms are not recorded until
@@ -928,7 +949,7 @@ impl StrategyDispatcher {
         if self.paper.is_none() {
             return;
         }
-        let now_ms = now_ms();
+        let now_ms = self.clock.now_ms();
         let mut updates = std::mem::take(&mut self.paper_updates);
         if let Some(paper) = self.paper.as_mut() {
             updates.extend(paper.on_market(&self.registry, state.slots(), now_ms));
@@ -1094,16 +1115,6 @@ fn mid(slot: &MarketSlot) -> Option<Px> {
     let bid = slot.best_bid()?.px;
     let ask = slot.best_ask()?.px;
     Some((bid + ask) / Decimal::TWO)
-}
-
-/// Engine monotonic time in nanoseconds, on the loop's millisecond base.
-fn now_ns() -> u64 {
-    SystemClock.now_ms().saturating_mul(1_000_000)
-}
-
-/// Wall-clock milliseconds, for the rate-budget refill.
-fn now_ms() -> u64 {
-    SystemClock.now_ms()
 }
 
 /// Holds a full `userFills` snapshot (the venue returns at most 2000) plus a

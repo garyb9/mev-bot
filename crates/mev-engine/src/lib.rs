@@ -14,6 +14,7 @@
 
 pub mod builder;
 pub mod channels;
+pub mod clock;
 pub mod dispatch;
 pub mod exec;
 pub mod ingest;
@@ -34,6 +35,7 @@ pub use builder::{
     AssetMeta, AssetTable, BuiltBatch, DropReason, aggressive_limit_px, aggressive_limit_px_market,
     plan_iteration,
 };
+pub use clock::{EngineClock, LiveClock, ReplayClock, SharedClock};
 pub use dispatch::{DispatcherConfig, StrategyDispatcher};
 pub use exec::{
     BatchOutcome, ExecBackend, ReqIds, SendError, UnsignedPost, apply_post_ack, dispatch,
