@@ -1969,6 +1969,54 @@ mod tests {
     }
 
     #[test]
+    fn resolving_unknowns_keeps_exec_backpressure_tripped() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+        let state = state_with("100", "101");
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+
+        let (req_id, cloids) = {
+            let post = h.posts.lock().unwrap().first().unwrap().clone();
+            (post.req_id, post.cloids.clone())
+        };
+        // A lost reply trips exec_error and marks the order Unknown.
+        h.dispatcher.on_account_state(
+            &AccountUpdate::PostAck {
+                stamp: stamp(30),
+                req_id,
+                result: PostResult::Error("lost reply".into()),
+            },
+            &state,
+        );
+        // A later, independent backpressure trip.
+        h.dispatcher.risk.breakers_mut().trip("exec_backpressure");
+
+        // Resolving the Unknown clears exec_error only.
+        h.dispatcher.on_account_state(
+            &AccountUpdate::ResolveUnknown {
+                stamp: stamp(40),
+                cloid: cloids[0],
+                status: order_status_response("open"),
+            },
+            &state,
+        );
+        assert!(!h.dispatcher.orders.has_unknown());
+        assert!(
+            !h.dispatcher.risk.breakers().is_label_tripped("exec_error"),
+            "exec_error clears once the Unknowns resolve"
+        );
+        assert!(
+            h.dispatcher
+                .risk
+                .breakers()
+                .is_label_tripped("exec_backpressure"),
+            "exec_backpressure is a separate breaker and stays tripped"
+        );
+        assert!(h.dispatcher.risk.breakers().is_tripped());
+    }
+
+    #[test]
     fn stale_order_status_after_a_stream_update_is_ignored() {
         let strategy = Recording::new("test", CoinId(0))
             .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);

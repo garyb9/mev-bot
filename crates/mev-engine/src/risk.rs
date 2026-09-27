@@ -285,12 +285,15 @@ impl RateBudget {
     }
 }
 
-/// A sticky circuit-breaker latch. K-4 adds the individual thresholds; for now
-/// the gate only needs the combined state, checked after the kill switch.
+/// Sticky circuit breakers, one latch per label (SPEC-0004 K-4).
+///
+/// Each breaker is independent: tripping `exec_error` and later
+/// `exec_backpressure` leaves both tripped, and clearing `exec_error` (once its
+/// `Unknown` orders resolve) does not clear `exec_backpressure`. The number of
+/// distinct breakers is small, so a `Vec` is cheaper than a map on the gate.
 #[derive(Debug, Clone, Default)]
 pub struct Breakers {
-    tripped: bool,
-    label: Option<&'static str>,
+    labels: Vec<&'static str>,
 }
 
 impl Breakers {
@@ -301,43 +304,48 @@ impl Breakers {
 
     /// Whether any breaker is tripped.
     pub fn is_tripped(&self) -> bool {
-        self.tripped
+        !self.labels.is_empty()
     }
 
     /// The label of the first tripped breaker, if any.
     pub fn label(&self) -> Option<&'static str> {
-        self.label
+        self.labels.first().copied()
     }
 
-    /// Trip the breaker set. Sticky; returns `true` on the transition.
+    /// Every tripped breaker label, for `/healthz` and metrics.
+    pub fn labels(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.labels.iter().copied()
+    }
+
+    /// Whether `label` is tripped.
+    pub fn is_label_tripped(&self, label: &'static str) -> bool {
+        self.labels.contains(&label)
+    }
+
+    /// Trip `label`. Sticky; returns `true` if it was not already tripped.
     pub fn trip(&mut self, label: &'static str) -> bool {
-        if self.tripped {
+        if self.labels.contains(&label) {
             return false;
         }
-        self.tripped = true;
-        self.label = Some(label);
+        self.labels.push(label);
         true
     }
 
-    /// Clear every breaker (operator action). Returns `true` if it was tripped.
+    /// Clear every breaker (operator action). Returns `true` if any was tripped.
     pub fn clear(&mut self) -> bool {
-        let was = self.tripped;
-        self.tripped = false;
-        self.label = None;
+        let was = !self.labels.is_empty();
+        self.labels.clear();
         was
     }
 
-    /// Clear the breaker only when its label is `label`. Returns `true` when a
-    /// matching breaker was cleared.
+    /// Clear only `label`. Returns `true` when it was tripped and is now clear.
     ///
     /// Used for self-resolving conditions, e.g. the `exec_error` breaker clears
     /// once every `Unknown` order has been reconciled (SPEC-0010 §16).
     pub fn clear_label(&mut self, label: &'static str) -> bool {
-        if self.label == Some(label) {
-            self.clear()
-        } else {
-            false
-        }
+        let before = self.labels.len();
+        self.labels.retain(|tripped| *tripped != label);
+        self.labels.len() != before
     }
 }
 
@@ -1065,6 +1073,29 @@ mod tests {
             gate.evaluate(&buy(Some(ds("100")), ds("1")), &ctx),
             Ok(Decision::Approve)
         );
+    }
+
+    #[test]
+    fn breakers_keep_independent_state() {
+        let mut breakers = Breakers::new();
+        assert!(!breakers.is_tripped());
+        assert!(breakers.trip("exec_error"));
+        assert!(!breakers.trip("exec_error"), "re-trip is not a transition");
+        assert!(breakers.trip("exec_backpressure"));
+        assert!(breakers.is_label_tripped("exec_error"));
+        assert!(breakers.is_label_tripped("exec_backpressure"));
+
+        // Clearing one does not clear the other.
+        assert!(breakers.clear_label("exec_error"));
+        assert!(!breakers.clear_label("exec_error"), "already clear");
+        assert!(!breakers.is_label_tripped("exec_error"));
+        assert!(breakers.is_tripped());
+        assert_eq!(breakers.label(), Some("exec_backpressure"));
+
+        // An operator clear drops every breaker.
+        assert!(breakers.clear());
+        assert!(!breakers.is_tripped());
+        assert_eq!(breakers.labels().count(), 0);
     }
 
     #[test]
