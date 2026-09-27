@@ -81,15 +81,18 @@ is open and its dependencies are met, the agent does it before any T1 task.
 | 6 | Verify the venue's nonce and `scheduleCancel` rules | Items 4 and 5, and the nonce design, rest on unverified assumptions | [SPEC-0002 H-9](../specs/SPEC-0002-execution-signing.md) |
 | 7 | Market stream: pong/data watchdog, jittered backoff, cancellable reconnect | Silent stale feeds; reconnect storms; shutdown can hang | [SPEC-0008 R-3](../specs/SPEC-0008-recorder-and-opportunity-research.md) |
 | 8 | A lost reply (`PostResult::Error`) is recorded as a terminal `Rejected`, dropping the order from exposure and the dead-man resting count, instead of `Unknown` resolved by `orderStatus` by `cloid` | A live order can be resting yet invisible to risk and the dead-man switch | [SPEC-0002 H-2](../specs/SPEC-0002-execution-signing.md), [SPEC-0010 E-13](../specs/SPEC-0010-event-driven-engine.md) |
-| 9 | The exec writer awaits each post, so only one order is ever in flight (undoes H-1; violates §5.1) | A place waits a full round trip behind its cancel | [SPEC-0002 H-1](../specs/SPEC-0002-execution-signing.md), [SPEC-0010 E-6](../specs/SPEC-0010-event-driven-engine.md) |
+| 9 | The exec writer waits for a whole group of posts before taking the next one, and a lost reply stalls every later post, including kill-switch cancels, for the request timeout plus the recovery calls | A place waits a full round trip behind its cancel, and a stall delays the kill switch | [SPEC-0002 H-1](../specs/SPEC-0002-execution-signing.md), [SPEC-0010 E-6](../specs/SPEC-0010-event-driven-engine.md) |
 | 10 | No kill-switch trigger exists (no `SIGUSR1`, no flag-file poll, no `hl panic`/`hl resume`), though the RUNBOOK documents them | Gate G2 requires a kill-switch drill; there is no way to trip it | [SPEC-0004 K-3](../specs/SPEC-0004-risk-portfolio-accounting.md), [SPEC-0010 §16](../specs/SPEC-0010-event-driven-engine.md) |
 | 11 | The H-3 account stream is not wired into `hl`, so live cancels never resolve, finished orders are never pruned, and `resting_count()` rescans every order each iteration | Live order state drifts, the dead-man count is wrong, and per-iteration cost grows without bound | [SPEC-0002 H-3](../specs/SPEC-0002-execution-signing.md), [SPEC-0010 E-8](../specs/SPEC-0010-event-driven-engine.md) |
+| 12 | Fills are applied twice (`userFills` and `userEvents` both carry them); the `userFills` snapshot is replayed on every connect; fills are never mapped to orders | Position and exposure go wrong (the risk cap can be breached), and strategies never see live fills | [SPEC-0002 H-3](../specs/SPEC-0002-execution-signing.md), [SPEC-0010 E-8](../specs/SPEC-0010-event-driven-engine.md) |
+| 13 | A definitive post error, or an order the venue never saw, stays `Unknown` forever, so the `exec_error` breaker never clears | Exposure stays pinned and the dead-man switch keeps refreshing until restart | [SPEC-0002 H-2](../specs/SPEC-0002-execution-signing.md) |
 
 Order: 6 (quick) and 1 + 2 first (small, and they touch the same files);
-then 3 → 4 → 5; 7 in parallel. Rows 8–11 were added in the post-E-13 review
-(2026-09-27): 8 and 11 come first (a real order can be invisible to risk),
-then 9, then 10; all before any testnet or live run. New defects found in
-later reviews are added here.
+then 3 → 4 → 5; 7 in parallel. Rows 8–13 were added in the post-E-13 reviews
+(2026-09-27). Rows 8 and 11 come first (a real order can be invisible to
+risk), then **12 and 13** (fills and stuck-`Unknown` orders), then 9, then
+10; **all before any testnet or live run**. New defects found in later
+reviews are added here.
 
 Strategy code for any tier waits for gate G1, or an owner-approved G1.5 pilot.
 The funding pilot (M4) is a stack-prover, not a tier. Strategy code, including

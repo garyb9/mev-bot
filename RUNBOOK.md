@@ -101,12 +101,15 @@ reuse a nonce.
 
 ## Kill switch
 
-- **Manual _(pending)_:** the design (SPEC-0004 K-3) is `SIGUSR1`, the
-  configured flag file, or `hl panic` (which writes the file). None of these
-  are wired into `hl` yet; the `Control::KillSwitch` path the dead-man task uses
-  is the only kill trigger today.
-- **Expected action:** cancel all resting orders + halt new risk. Flattening is
+- **Triggers (SPEC-0004 K-3):** `SIGUSR1` (`kill -USR1 <pid>`), the flag file at
+  `HL_KILL_FILE` (default `data/KILL`; its existence trips the switch), or
+  `hl panic` (which writes that file). A control task polls every 250 ms.
+- **Expected action:** cancel all working orders + halt new risk. Flattening is
   opt-in.
+- **Clear (two-key):** remove the flag file (`hl resume`) **and** send `SIGUSR2`
+  to the running process to clear the sticky in-process flag. Today `SIGUSR2`
+  resumes even while the file exists (the next poll re-trips); the two-key check
+  is task E of `docs/briefs/2026-09-27-post-e13-review-fixes.md`.
 - **Verify:** open orders go to zero; `/healthz` reflects halt; logs record the
   trip.
 
