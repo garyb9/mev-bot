@@ -567,6 +567,17 @@ impl CloidAssigner {
         }
     }
 
+    /// Create an assigner with a fixed prefix.
+    ///
+    /// Replay and `simulate` use this so the cloids (and therefore the action
+    /// log) are byte-identical across runs (SPEC-0010 G-6). Never use a fixed
+    /// prefix for `live`: two processes sharing an agent wallet could collide.
+    pub fn with_prefix(prefix: u64) -> Self {
+        Self {
+            factory: mev_hl_client::CloidFactory::with_prefix(prefix),
+        }
+    }
+
     /// The next unique cloid.
     ///
     /// The factory always emits a `0x` + 32-hex-char string, so parsing is
@@ -585,6 +596,18 @@ mod tests {
 
     fn ds(value: &str) -> Decimal {
         Decimal::from_str(value).unwrap()
+    }
+
+    #[test]
+    fn fixed_prefix_yields_deterministic_cloids() {
+        let first = CloidAssigner::with_prefix(0);
+        let second = CloidAssigner::with_prefix(0);
+        assert_eq!(first.next(), second.next());
+        assert_ne!(
+            first.next(),
+            first.next(),
+            "the counter still advances within a run"
+        );
     }
 
     fn cloid(n: u8) -> Cloid {
