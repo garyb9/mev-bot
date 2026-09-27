@@ -22,7 +22,8 @@ pub use planner::{
     PlanLimits, PlanTotals, PlannerError, Stream, Subscription, VolumeIndex,
 };
 pub use reader::{
-    FileCheck, InspectReport, ReaderError, SeqHoles, StreamCoverage, VerifyConfig, VerifyReport,
+    FileCheck, InspectReport, MergeIter, MissingSeqs, ReaderError, SegmentReader, SeqHoles,
+    SeqRange, StreamCoverage, VerifyConfig, VerifyReport,
 };
 pub use segment::{
     DiskSpace, ManifestEntry, SegmentConfig, SegmentError, SegmentWriter, SystemDiskSpace,

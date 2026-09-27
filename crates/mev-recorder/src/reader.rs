@@ -1,13 +1,16 @@
 //! Segment reader and `inspect`/`verify` analysis (SPEC-0008 §12.1, task R-7).
 //!
-//! Reading always tolerates a truncated tail: the zstd stream is decoded until
-//! the last complete line, so a `.crashed` file yields every envelope the writer
-//! managed to flush. The analysis functions are pure library code; wiring the
-//! CLI is R-6's job.
+//! Segments are read lazily, one envelope at a time ([`SegmentReader`]), so a
+//! large file is never held in memory; several files merge through a k-way heap
+//! ([`merge_segments_iter`]). A truncated zstd tail is tolerated only for
+//! `.crashed` files, which yield every envelope the writer managed to flush;
+//! for a finished segment a decode failure is an error. The analysis functions
+//! are pure library code; wiring the CLI is R-6's job.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -45,6 +48,55 @@ pub enum ReaderError {
     InvalidDate(String),
 }
 
+/// An inclusive range of missing `seq` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqRange {
+    /// First missing `seq` (inclusive).
+    pub start: u64,
+    /// Last missing `seq` (inclusive).
+    pub end: u64,
+}
+
+impl SeqRange {
+    /// Number of `seq` values in the range.
+    pub fn count(&self) -> u64 {
+        self.end.saturating_sub(self.start).saturating_add(1)
+    }
+}
+
+/// Missing `seq` values for one connection, stored compactly as ranges.
+///
+/// [`len`](MissingSeqs::len) returns the total number of missing values (not
+/// the number of ranges), so callers that count holes keep their meaning while
+/// a day-long outage costs one range instead of millions of numbers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MissingSeqs {
+    ranges: Vec<SeqRange>,
+}
+
+impl MissingSeqs {
+    /// The missing ranges, in ascending order and non-overlapping.
+    pub fn ranges(&self) -> &[SeqRange] {
+        &self.ranges
+    }
+
+    /// Total number of missing `seq` values.
+    pub fn len(&self) -> usize {
+        self.ranges.iter().map(|range| range.count() as usize).sum()
+    }
+
+    /// Whether no `seq` value is missing.
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn push(&mut self, start: u64, end: u64) {
+        if start <= end {
+            self.ranges.push(SeqRange { start, end });
+        }
+    }
+}
+
 /// Per-connection `seq` holes found while reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeqHoles {
@@ -52,8 +104,11 @@ pub struct SeqHoles {
     pub src: String,
     /// Connection id.
     pub conn: String,
-    /// Sequence numbers missing between the observed minimum and maximum.
-    pub missing: Vec<u64>,
+    /// Number of `seq` runs seen (a new run starts when `seq` goes back down,
+    /// as it does when the producing process restarts).
+    pub runs: u64,
+    /// Missing `seq` values, per run.
+    pub missing: MissingSeqs,
 }
 
 /// Output of `hl record inspect` (SPEC-0008 §12.1).
@@ -149,36 +204,251 @@ pub struct VerifyConfig {
     pub date: String,
 }
 
-/// Decode every envelope in a segment, tolerating a truncated tail.
-pub fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, ReaderError> {
-    let file = File::open(path)?;
-    let mut decoder = zstd::stream::read::Decoder::new(file)?;
-    let mut buffer = Vec::new();
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        match decoder.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
-            Err(_) => break,
+/// A lazy reader over one segment file, yielding one envelope per line.
+///
+/// The file is decompressed and parsed incrementally, so a many-gigabyte
+/// segment never has to be held in memory. A truncated zstd tail is tolerated
+/// only for `.crashed` segments (it ends iteration at the last complete line);
+/// for a finished segment a decode failure is an error.
+pub struct SegmentReader {
+    inner: BufReader<zstd::stream::read::Decoder<'static, BufReader<Box<dyn Read>>>>,
+    path: PathBuf,
+    crashed: bool,
+    line: String,
+    line_no: usize,
+    done: bool,
+}
+
+impl SegmentReader {
+    /// Open a segment file. A `.crashed` name tolerates a truncated tail.
+    pub fn open(path: &Path) -> Result<Self, ReaderError> {
+        let file = File::open(path)?;
+        Self::with_reader(file, path, is_crashed(path))
+    }
+
+    fn with_reader<R: Read + 'static>(
+        reader: R,
+        path: &Path,
+        crashed: bool,
+    ) -> Result<Self, ReaderError> {
+        let decoder = zstd::stream::read::Decoder::new(Box::new(reader) as Box<dyn Read>)?;
+        Ok(Self {
+            inner: BufReader::new(decoder),
+            path: path.to_path_buf(),
+            crashed,
+            line: String::new(),
+            line_no: 0,
+            done: false,
+        })
+    }
+
+    fn decode(&self, line: &str) -> Result<Envelope, ReaderError> {
+        serde_json::from_str(line).map_err(|source| ReaderError::Decode {
+            path: self.path.display().to_string(),
+            line: self.line_no,
+            source,
+        })
+    }
+}
+
+impl Iterator for SegmentReader {
+    type Item = Result<Envelope, ReaderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.done {
+                return None;
+            }
+            self.line.clear();
+            match self.inner.read_line(&mut self.line) {
+                Ok(0) => {
+                    self.done = true;
+                    return None;
+                }
+                Ok(_) => {
+                    self.line_no += 1;
+                    if !self.line.ends_with('\n') {
+                        // The tail was cut mid-line. A crashed segment stops at
+                        // its last full line; a finished one still parses it if
+                        // it happens to be complete.
+                        self.done = true;
+                        if self.crashed {
+                            return None;
+                        }
+                        let trimmed = self.line.trim_end();
+                        if trimmed.is_empty() {
+                            return None;
+                        }
+                        return Some(self.decode(trimmed));
+                    }
+                    let trimmed = self.line.trim_end_matches(['\n', '\r']);
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    return Some(self.decode(trimmed));
+                }
+                Err(err) => {
+                    self.done = true;
+                    if self.crashed {
+                        // A truncated zstd tail is expected for a crash.
+                        return None;
+                    }
+                    return Some(Err(ReaderError::Io(err)));
+                }
+            }
         }
     }
-    parse_lines(path, &buffer)
+}
+
+/// Decode every envelope in a segment, tolerating a truncated `.crashed` tail.
+pub fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, ReaderError> {
+    SegmentReader::open(path)?.collect()
+}
+
+/// Lazily merge segment files by `(t_ns, conn, seq)`.
+pub fn merge_segments_iter(paths: &[PathBuf]) -> Result<MergeIter, ReaderError> {
+    MergeIter::new(paths)
 }
 
 /// Read several files and merge their envelopes by `(t_ns, conn, seq)`.
 pub fn merge_segments(paths: &[PathBuf]) -> Result<Vec<Envelope>, ReaderError> {
-    let mut all = Vec::new();
-    for path in paths {
-        all.extend(read_envelopes(path)?);
+    merge_segments_iter(paths)?.collect()
+}
+
+struct MergeNode {
+    t_ns: i64,
+    conn: String,
+    seq: u64,
+    source: usize,
+    env: Envelope,
+}
+
+impl PartialEq for MergeNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
     }
-    all.sort_by(|a, b| (a.t_ns, a.conn.as_str(), a.seq).cmp(&(b.t_ns, b.conn.as_str(), b.seq)));
-    Ok(all)
+}
+
+impl Eq for MergeNode {}
+
+impl PartialOrd for MergeNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.t_ns, self.conn.as_str(), self.seq, self.source).cmp(&(
+            other.t_ns,
+            other.conn.as_str(),
+            other.seq,
+            other.source,
+        ))
+    }
+}
+
+/// A k-way merge of segment readers, ordered by `(t_ns, conn, seq)`.
+pub struct MergeIter {
+    readers: Vec<SegmentReader>,
+    heap: BinaryHeap<Reverse<MergeNode>>,
+    pending: VecDeque<ReaderError>,
+}
+
+impl MergeIter {
+    fn new(paths: &[PathBuf]) -> Result<Self, ReaderError> {
+        let mut readers = Vec::with_capacity(paths.len());
+        for path in paths {
+            readers.push(SegmentReader::open(path)?);
+        }
+        let mut heap = BinaryHeap::new();
+        let mut pending = VecDeque::new();
+        for (source, reader) in readers.iter_mut().enumerate() {
+            if let Some(item) = reader.next() {
+                match item {
+                    Ok(env) => heap.push(Reverse(MergeNode {
+                        t_ns: env.t_ns,
+                        conn: env.conn.clone(),
+                        seq: env.seq,
+                        source,
+                        env,
+                    })),
+                    Err(err) => pending.push_back(err),
+                }
+            }
+        }
+        Ok(Self {
+            readers,
+            heap,
+            pending,
+        })
+    }
+}
+
+impl Iterator for MergeIter {
+    type Item = Result<Envelope, ReaderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(err) = self.pending.pop_front() {
+            return Some(Err(err));
+        }
+        let Reverse(node) = self.heap.pop()?;
+        if let Some(item) = self.readers[node.source].next() {
+            match item {
+                Ok(env) => self.heap.push(Reverse(MergeNode {
+                    t_ns: env.t_ns,
+                    conn: env.conn.clone(),
+                    seq: env.seq,
+                    source: node.source,
+                    env,
+                })),
+                Err(err) => self.pending.push_back(err),
+            }
+        }
+        Some(Ok(node.env))
+    }
+}
+
+/// Per-connection `seq` tracker that finds holes across process restarts.
+#[derive(Default)]
+struct SeqTracker {
+    runs: u64,
+    last_seq: Option<u64>,
+    missing: MissingSeqs,
+}
+
+impl SeqTracker {
+    fn observe(&mut self, seq: u64) {
+        match self.last_seq {
+            None => self.start_run(seq),
+            Some(last) if seq < last => self.start_run(seq),
+            Some(last) => {
+                if seq > last.saturating_add(1) {
+                    self.missing.push(last.saturating_add(1), seq - 1);
+                }
+            }
+        }
+        self.last_seq = Some(seq);
+    }
+
+    fn start_run(&mut self, seq: u64) {
+        self.runs += 1;
+        if seq > 0 {
+            self.missing.push(0, seq - 1);
+        }
+    }
+}
+
+/// Whether a kind carries a producer `seq` (the writer's own bookkeeping lines
+/// reuse the neighbouring envelope's `seq` and are not holes).
+fn counts_toward_seq(kind: Kind) -> bool {
+    !matches!(kind, Kind::SegmentOpen | Kind::SegmentClose)
 }
 
 /// Build the `inspect` report over one or more segment files.
 pub fn inspect(paths: &[PathBuf]) -> Result<InspectReport, ReaderError> {
     let mut report = InspectReport::default();
-    let mut seqs: BTreeMap<(String, String), BTreeSet<u64>> = BTreeMap::new();
+    let mut seq: BTreeMap<(String, String), SeqTracker> = BTreeMap::new();
     let mut open_gaps: BTreeMap<(String, String), i64> = BTreeMap::new();
 
     for path in paths {
@@ -186,7 +456,8 @@ pub fn inspect(paths: &[PathBuf]) -> Result<InspectReport, ReaderError> {
         if is_crashed(path) {
             report.crashed_files += 1;
         }
-        for env in read_envelopes(path)? {
+        for env in SegmentReader::open(path)? {
+            let env = env?;
             report.records += 1;
             *report.by_src.entry(env.src.clone()).or_insert(0) += 1;
             *report.by_conn.entry(env.conn.clone()).or_insert(0) += 1;
@@ -199,7 +470,9 @@ pub fn inspect(paths: &[PathBuf]) -> Result<InspectReport, ReaderError> {
             report.last_t_ns = Some(report.last_t_ns.map_or(env.t_ns, |t| t.max(env.t_ns)));
 
             let conn_key = (env.src.clone(), env.conn.clone());
-            seqs.entry(conn_key.clone()).or_default().insert(env.seq);
+            if counts_toward_seq(env.kind) {
+                seq.entry(conn_key.clone()).or_default().observe(env.seq);
+            }
 
             match env.kind {
                 Kind::GapStart => {
@@ -217,13 +490,14 @@ pub fn inspect(paths: &[PathBuf]) -> Result<InspectReport, ReaderError> {
         }
     }
 
-    for ((src, conn), set) in seqs {
-        let Some((&min, &max)) = set.iter().next().zip(set.iter().next_back()) else {
-            continue;
-        };
-        let missing: Vec<u64> = (min..=max).filter(|seq| !set.contains(seq)).collect();
-        if !missing.is_empty() {
-            report.seq_holes.push(SeqHoles { src, conn, missing });
+    for ((src, conn), tracker) in seq {
+        if !tracker.missing.is_empty() {
+            report.seq_holes.push(SeqHoles {
+                src,
+                conn,
+                runs: tracker.runs,
+                missing: tracker.missing,
+            });
         }
     }
 
@@ -305,28 +579,6 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
         .sort_by(|a, b| (&a.src, &a.conn).cmp(&(&b.src, &b.conn)));
 
     Ok(report)
-}
-
-fn parse_lines(path: &Path, buffer: &[u8]) -> Result<Vec<Envelope>, ReaderError> {
-    let Some(last_newline) = buffer.iter().rposition(|&byte| byte == b'\n') else {
-        return Ok(Vec::new());
-    };
-    let mut envelopes = Vec::new();
-    for (line_no, line) in buffer[..=last_newline]
-        .split(|&byte| byte == b'\n')
-        .enumerate()
-    {
-        if line.is_empty() {
-            continue;
-        }
-        let env = serde_json::from_slice(line).map_err(|source| ReaderError::Decode {
-            path: path.display().to_string(),
-            line: line_no + 1,
-            source,
-        })?;
-        envelopes.push(env);
-    }
-    Ok(envelopes)
 }
 
 fn read_manifest(path: &Path) -> Result<Vec<ManifestEntry>, ReaderError> {
@@ -532,7 +784,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -651,52 +903,166 @@ mod tests {
     }
 
     #[test]
+    fn corrupted_finished_segment_is_an_error() {
+        let dir = temp_dir("corrupt");
+        let lines: Vec<String> = frames()
+            .iter()
+            .map(|env| serde_json::to_string(env).unwrap())
+            .collect();
+        let mut bytes = zstd_frame(&lines);
+        // Flip bytes in the middle of the compressed stream. A finished segment
+        // must report the damage instead of silently stopping.
+        let mid = bytes.len() / 2;
+        for byte in &mut bytes[mid..mid + 8] {
+            *byte ^= 0xff;
+        }
+        let path = dir.join("hl-ws-01-0.jsonl.zst");
+        fs::write(&path, &bytes).unwrap();
+
+        let result: Result<Vec<Envelope>, ReaderError> =
+            SegmentReader::open(&path).unwrap().collect();
+        assert!(result.is_err(), "corruption was decoded without error");
+    }
+
+    struct CountingReader {
+        inner: File,
+        bytes: Arc<AtomicU64>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.bytes.fetch_add(n as u64, Ordering::SeqCst);
+            Ok(n)
+        }
+    }
+
+    fn pseudo_random_hex(seed: u64) -> String {
+        let mut x = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let mut out = String::with_capacity(128);
+        for _ in 0..8 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.push_str(&format!("{x:016x}"));
+        }
+        out
+    }
+
+    #[test]
+    fn large_file_read_lazily() {
+        let dir = temp_dir("lazy");
+        let total = 20_000u64;
+        let lines: Vec<String> = (0..total)
+            .map(|i| {
+                let env =
+                    Envelope::frame(&clock_at(), "hl-ws", "hl-ws-01", i, pseudo_random_hex(i));
+                serde_json::to_string(&env).unwrap()
+            })
+            .collect();
+        let bytes = zstd_frame(&lines);
+        let path = dir.join("hl-ws-01-0.jsonl.zst");
+        fs::write(&path, &bytes).unwrap();
+
+        let counted = Arc::new(AtomicU64::new(0));
+        let file = File::open(&path).unwrap();
+        let reader = CountingReader {
+            inner: file,
+            bytes: counted.clone(),
+        };
+        let mut segment = SegmentReader::with_reader(reader, &path, false).unwrap();
+        let first = segment.next().unwrap().unwrap();
+        assert_eq!(first.seq, 0);
+
+        let read = counted.load(Ordering::SeqCst);
+        assert!(
+            read < bytes.len() as u64 / 4,
+            "one envelope read {read} of {} compressed bytes; the reader is not lazy",
+            bytes.len()
+        );
+    }
+
+    fn clock_at() -> FixedEnvelopeClock {
+        FixedEnvelopeClock::new(1_700_000_000_000_000_000, 0)
+    }
+
+    #[test]
+    fn holes_spanning_a_restart_are_found() {
+        let dir = temp_dir("restart-holes");
+        let clock = clock_at();
+        // Run A: seq 0,1,2. Run B (after a restart): seq 0,1,3. A naive union
+        // over all seqs would see {0,1,2,3} and miss the hole in run B.
+        let envelopes = [
+            Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "a"),
+            Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "b"),
+            Envelope::frame(&clock, "hl-ws", "hl-ws-01", 2, "c"),
+            Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "d"),
+            Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "e"),
+            Envelope::frame(&clock, "hl-ws", "hl-ws-01", 3, "f"),
+        ];
+        let lines: Vec<String> = envelopes
+            .iter()
+            .map(|env| serde_json::to_string(env).unwrap())
+            .collect();
+        let path = dir.join("s.jsonl.zst");
+        fs::write(&path, zstd_frame(&lines)).unwrap();
+
+        let report = inspect(&[path]).unwrap();
+        assert_eq!(report.seq_holes.len(), 1);
+        assert_eq!(report.seq_holes[0].runs, 2);
+        assert_eq!(
+            report.seq_holes[0].missing.ranges(),
+            &[SeqRange { start: 2, end: 2 }]
+        );
+    }
+
+    #[test]
     fn merge_orders_by_time_conn_seq() {
         let dir = temp_dir("merge");
         let clock = FixedEnvelopeClock::new(1_000, 0);
-        let a = [
-            Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "a0"),
-            Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "a1"),
-        ];
-        let b = [
-            Envelope::frame(&clock, "hl-ws", "hl-ws-02", 0, "b0"),
-            Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "c0"),
-        ];
-        let path_a = dir.join("a.jsonl.zst");
-        let path_b = dir.join("b.jsonl.zst");
-        fs::write(
-            &path_a,
-            zstd_frame(
-                &a.iter()
-                    .map(|e| serde_json::to_string(e).unwrap())
-                    .collect::<Vec<_>>(),
-            ),
-        )
-        .unwrap();
-        fs::write(
-            &path_b,
-            zstd_frame(
-                &b.iter()
-                    .map(|e| serde_json::to_string(e).unwrap())
-                    .collect::<Vec<_>>(),
-            ),
-        )
-        .unwrap();
+        // A real segment file holds one (src, conn) and is time-ordered, which
+        // is the invariant the k-way merge relies on.
+        clock.set_t_ns(1_000);
+        let a0 = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "a0");
+        clock.set_t_ns(2_000);
+        let a1 = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "a1");
+        clock.set_t_ns(1_000);
+        let b0 = Envelope::frame(&clock, "hl-ws", "hl-ws-02", 0, "b0");
 
-        let merged = merge_segments(&[path_b, path_a]).unwrap();
-        assert_eq!(merged.len(), 4);
+        let write = |name: &str, envelopes: &[Envelope]| {
+            let path = dir.join(name);
+            let lines: Vec<String> = envelopes
+                .iter()
+                .map(|env| serde_json::to_string(env).unwrap())
+                .collect();
+            fs::write(&path, zstd_frame(&lines)).unwrap();
+            path
+        };
+        let path_a = write("a.jsonl.zst", &[a0, a1]);
+        let path_b = write("b.jsonl.zst", &[b0]);
+
+        let merged = merge_segments(&[path_b.clone(), path_a.clone()]).unwrap();
         let keys: Vec<(i64, &str, u64)> = merged
             .iter()
             .map(|e| (e.t_ns, e.conn.as_str(), e.seq))
             .collect();
-        let mut sorted = keys.clone();
-        sorted.sort();
-        assert_eq!(keys, sorted);
-        assert_eq!(keys[0].1, "hl-ws-01");
-        assert_eq!(keys[1].1, "hl-ws-01");
-        assert_eq!(keys[2].1, "hl-ws-01");
-        assert_eq!(keys[3].1, "hl-ws-02");
-        assert_eq!(keys[3].2, 0);
+        assert_eq!(
+            keys,
+            vec![
+                (1_000, "hl-ws-01", 0),
+                (1_000, "hl-ws-02", 0),
+                (2_000, "hl-ws-01", 1),
+            ]
+        );
+
+        // The lazy iterator yields the same order.
+        let lazy: Vec<Envelope> = merge_segments_iter(&[path_b, path_a])
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(lazy, merged);
     }
 
     #[test]
@@ -730,7 +1096,12 @@ mod tests {
         assert_eq!(report.gap_count, 1);
         assert_eq!(report.gap_total_ms, 1_500);
         assert_eq!(report.seq_holes.len(), 1);
-        assert_eq!(report.seq_holes[0].missing, vec![3]);
+        assert_eq!(report.seq_holes[0].runs, 1);
+        assert_eq!(
+            report.seq_holes[0].missing.ranges(),
+            &[SeqRange { start: 3, end: 3 }]
+        );
+        assert_eq!(report.seq_holes[0].missing.len(), 1);
         assert_eq!(report.by_src.get("hl-ws"), Some(&5));
         assert_eq!(report.by_kind.get("frame"), Some(&3));
     }
