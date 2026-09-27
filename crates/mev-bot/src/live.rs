@@ -309,11 +309,46 @@ pub(crate) async fn account_stream_conn(
     }
 }
 
+/// What a `SIGUSR2` should do given the kill flag file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeAction {
+    /// Send `Control::Resume`.
+    Resume,
+    /// Ignore the signal because the flag file still exists.
+    Ignore,
+}
+
+/// Decide a `SIGUSR2` (SPEC-0004 K-3).
+///
+/// Never resume while the kill flag file exists: the next 250 ms poll would
+/// re-trip the kill, and orders could go out in between. Otherwise resume
+/// whatever the local state says (a kill sent by the dead-man task, which the
+/// control task did not itself set, must still be resumable).
+fn resume_action(flag_file_exists: bool) -> ResumeAction {
+    if flag_file_exists {
+        ResumeAction::Ignore
+    } else {
+        ResumeAction::Resume
+    }
+}
+
+/// Send an initial `KillSwitch` if the flag file exists at startup, so the
+/// engine begins halted (SPEC-0004 K-3). Returns whether it did.
+pub(crate) fn initial_kill(handles: &InputHandles, kill_file: &Path) -> bool {
+    if mev_risk::kill::check_flag_file(kill_file) {
+        info!(path = %kill_file.display(), "kill flag present at startup; starting killed");
+        let _ = handles.send_account(AccountUpdate::Control(Control::KillSwitch));
+        true
+    } else {
+        false
+    }
+}
+
 /// Poll the kill-switch triggers and drive [`Control`] into the engine.
 ///
 /// Triggers (SPEC-0004 K-3): `SIGUSR1`, the kill flag file, and `hl panic`
-/// (which writes that file). `SIGUSR2` sends `Control::Resume`; clearing also
-/// needs the file removed (the two-key rule), so a poll re-trips otherwise.
+/// (which writes that file). `SIGUSR2` sends `Control::Resume` unless the flag
+/// file still exists (the two-key rule); a kill from any source is resumable.
 #[cfg(unix)]
 pub(crate) async fn control(handles: InputHandles, kill_file: std::path::PathBuf) {
     use tokio::signal::unix::{SignalKind, signal};
@@ -345,11 +380,16 @@ pub(crate) async fn control(handles: InputHandles, kill_file: std::path::PathBuf
                 }
             }
             _ = sigusr2.recv() => {
-                if killed {
-                    if !handles.send_account(AccountUpdate::Control(Control::Resume)) {
-                        break;
+                match resume_action(mev_risk::kill::check_flag_file(&kill_file)) {
+                    ResumeAction::Ignore => {
+                        tracing::warn!("SIGUSR2 ignored: the kill flag file still exists");
                     }
-                    killed = false;
+                    ResumeAction::Resume => {
+                        if !handles.send_account(AccountUpdate::Control(Control::Resume)) {
+                            break;
+                        }
+                        killed = false;
+                    }
                 }
             }
             _ = tick.tick() => {
@@ -718,6 +758,33 @@ mod tests {
             Some(AccountUpdate::Control(Control::KillSwitch)) => {}
             other => panic!("expected Control::KillSwitch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sigusr2_resumes_only_without_the_flag_file() {
+        assert_eq!(resume_action(true), ResumeAction::Ignore);
+        assert_eq!(resume_action(false), ResumeAction::Resume);
+    }
+
+    #[test]
+    fn startup_flag_file_sends_an_initial_kill() {
+        let path =
+            std::env::temp_dir().join(format!("mev-kill-startup-{}.flag", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (handles, inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
+
+        // Present at startup: send KillSwitch before the loop runs.
+        std::fs::write(&path, b"kill\n").unwrap();
+        assert!(initial_kill(&handles, &path));
+        assert!(matches!(
+            inputs.account.try_recv(),
+            Ok(AccountUpdate::Control(Control::KillSwitch))
+        ));
+
+        // Absent: nothing is sent.
+        let _ = std::fs::remove_file(&path);
+        assert!(!initial_kill(&handles, &path));
+        assert!(inputs.account.try_recv().is_err());
     }
 
     #[test]

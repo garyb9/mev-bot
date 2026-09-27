@@ -448,6 +448,10 @@ async fn run(
     let (handles, inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
 
+    // SPEC-0004 K-3: if the kill flag file exists at startup, begin killed so no
+    // order can go out before the first control poll.
+    live::initial_kill(&handles, &config.kill_file);
+
     // Exec backend: the paper backend fills in-process for `simulate`; `live`
     // hands unsigned posts to a WS writer; `observe` has no backend.
     let mut exec_writer = None;
