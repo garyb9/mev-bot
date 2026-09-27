@@ -326,6 +326,19 @@ impl Breakers {
         self.label = None;
         was
     }
+
+    /// Clear the breaker only when its label is `label`. Returns `true` when a
+    /// matching breaker was cleared.
+    ///
+    /// Used for self-resolving conditions, e.g. the `exec_error` breaker clears
+    /// once every `Unknown` order has been reconciled (SPEC-0010 §16).
+    pub fn clear_label(&mut self, label: &'static str) -> bool {
+        if self.label == Some(label) {
+            self.clear()
+        } else {
+            false
+        }
+    }
 }
 
 /// The engine-relevant subset of the risk limits (SPEC-0004 §5).

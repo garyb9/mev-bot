@@ -467,6 +467,29 @@ impl Reconciler {
     }
 }
 
+/// Map a venue `orderStatus` response to the engine status and filled size for
+/// an order, or `None` when the venue cannot resolve it (`unknownOid` or an
+/// unmodelled state).
+///
+/// Shared by [`resolve_unknown`] and the live exec path, so a response is mapped
+/// one way everywhere.
+pub fn order_status_update(status: &OrderStatusResponse) -> Option<(VenueOrderStatus, Decimal)> {
+    let filled = status
+        .order
+        .as_ref()
+        .and_then(|wrapper| wrapper.order.as_ref())
+        .map(|order| (order.orig_sz - order.sz).max(Decimal::ZERO))
+        .unwrap_or(Decimal::ZERO);
+    let mapped = match status.resolution() {
+        OrderResolution::Resting | OrderResolution::Triggered => VenueOrderStatus::Resting,
+        OrderResolution::Filled => VenueOrderStatus::Filled,
+        OrderResolution::Cancelled => VenueOrderStatus::Cancelled,
+        OrderResolution::Rejected => VenueOrderStatus::Rejected,
+        OrderResolution::NotFound | OrderResolution::Other(_) => return None,
+    };
+    Some((mapped, filled))
+}
+
 /// Resolve an `Unknown` order using a venue `orderStatus` response.
 ///
 /// The caller performs the I/O; this applies the response through the order
@@ -483,22 +506,7 @@ pub fn resolve_unknown(
     if !order.state.is_unknown() {
         return UnknownResolution::Resolved(order.state);
     }
-    let filled = status
-        .order
-        .as_ref()
-        .and_then(|wrapper| wrapper.order.as_ref())
-        .map(|order| (order.orig_sz - order.sz).max(Decimal::ZERO))
-        .unwrap_or(Decimal::ZERO);
-
-    let mapped = match status.resolution() {
-        OrderResolution::Resting | OrderResolution::Triggered => Some(VenueOrderStatus::Resting),
-        OrderResolution::Filled => Some(VenueOrderStatus::Filled),
-        OrderResolution::Cancelled => Some(VenueOrderStatus::Cancelled),
-        OrderResolution::Rejected => Some(VenueOrderStatus::Rejected),
-        OrderResolution::NotFound | OrderResolution::Other(_) => None,
-    };
-
-    let Some(venue_status) = mapped else {
+    let Some((venue_status, filled)) = order_status_update(status) else {
         return UnknownResolution::Unresolved;
     };
     orders.on_order_update(cloid, venue_status, filled, Decimal::ZERO);

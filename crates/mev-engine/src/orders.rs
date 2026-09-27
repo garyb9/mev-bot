@@ -119,6 +119,10 @@ pub struct OrderManager {
     /// Incremental per-coin worst-case in-flight notional; indexes by `CoinId`.
     pending_notional: Vec<Decimal>,
     coin_count: usize,
+    /// Incremental count of working orders (`state.is_working()`).
+    working_count: usize,
+    /// Incremental count of terminal orders still retained for delivery.
+    terminal_count: usize,
 }
 
 impl OrderManager {
@@ -129,6 +133,8 @@ impl OrderManager {
             by_req: BTreeMap::new(),
             pending_notional: vec![Decimal::ZERO; coin_count],
             coin_count,
+            working_count: 0,
+            terminal_count: 0,
         }
     }
 
@@ -143,15 +149,29 @@ impl OrderManager {
         let cloid = order.cloid;
         let coin = order.coin.index();
         let working = order.state.is_working();
+        let terminal = order.state.is_terminal();
         let contribution = order.remaining_notional();
-        if let Some(old) = self.orders.insert(cloid, order)
-            && old.state.is_working()
-            && let Some(slot) = self.pending_notional.get_mut(coin)
-        {
-            *slot -= old.remaining_notional();
+        if let Some(old) = self.orders.insert(cloid, order) {
+            if old.state.is_working()
+                && let Some(slot) = self.pending_notional.get_mut(coin)
+            {
+                *slot -= old.remaining_notional();
+            }
+            if old.state.is_working() {
+                self.working_count -= 1;
+            }
+            if old.state.is_terminal() {
+                self.terminal_count -= 1;
+            }
         }
         if working && let Some(slot) = self.pending_notional.get_mut(coin) {
             *slot += contribution;
+        }
+        if working {
+            self.working_count += 1;
+        }
+        if terminal {
+            self.terminal_count += 1;
         }
         cloid
     }
@@ -169,10 +189,14 @@ impl OrderManager {
     /// Remove an order, removing its in-flight exposure if it was working.
     pub fn remove(&mut self, cloid: Cloid) -> Option<LiveOrder> {
         let order = self.orders.remove(&cloid)?;
-        if order.state.is_working()
-            && let Some(slot) = self.pending_notional.get_mut(order.coin.index())
-        {
-            *slot -= order.remaining_notional();
+        if order.state.is_working() {
+            if let Some(slot) = self.pending_notional.get_mut(order.coin.index()) {
+                *slot -= order.remaining_notional();
+            }
+            self.working_count -= 1;
+        }
+        if order.state.is_terminal() {
+            self.terminal_count -= 1;
         }
         Some(order)
     }
@@ -199,20 +223,21 @@ impl OrderManager {
             .filter(|order| order.state.is_working())
     }
 
-    /// Number of orders currently on the book (for the dead-man switch).
+    /// Number of orders that might still be resting at the venue, for the
+    /// dead-man switch.
     ///
-    /// Counts `Resting` and `PartiallyFilled` orders; pending cancels/modifies
-    /// are still working but no longer need a fresh `scheduleCancel`.
+    /// Counts **every working order** — `PendingNew`, `Resting`,
+    /// `PartiallyFilled`, `PendingCancel`, `PendingModify`, and `Unknown` — not
+    /// just confirmed-resting ones: a lost reply (`Unknown`) or a not-yet-acked
+    /// place may be on the book, and the scheduleCancel must cover it. This is
+    /// `O(1)` (an incremental counter), so the loop can read it every iteration.
     pub fn resting_count(&self) -> usize {
-        self.orders
-            .values()
-            .filter(|order| {
-                matches!(
-                    order.state,
-                    OrderState::Resting | OrderState::PartiallyFilled
-                )
-            })
-            .count()
+        self.working_count
+    }
+
+    /// Whether any tracked order has an unknown outcome awaiting reconciliation.
+    pub fn has_unknown(&self) -> bool {
+        self.orders.values().any(|order| order.state.is_unknown())
     }
 
     /// Whether any order on `coin` has an unknown outcome.
@@ -220,6 +245,21 @@ impl OrderManager {
         self.orders
             .values()
             .any(|order| order.coin == coin && order.state.is_unknown())
+    }
+
+    /// Remove terminal (`Filled`/`Cancelled`/`Rejected`) orders so the map does
+    /// not grow for the lifetime of a session. Returns the number removed.
+    ///
+    /// Called only when terminal orders exist, so the scan is off the steady
+    /// path. Exposure is already zero for terminal orders.
+    pub fn prune_terminal(&mut self) -> usize {
+        if self.terminal_count == 0 {
+            return 0;
+        }
+        let before = self.orders.len();
+        self.orders.retain(|_, order| !order.state.is_terminal());
+        self.terminal_count = 0;
+        before - self.orders.len()
     }
 
     /// The worst-case in-flight notional for a coin.
@@ -249,6 +289,7 @@ impl OrderManager {
         let remaining = order.remaining_notional();
         let was_working = order.state.is_working();
         let now_working = state.is_working();
+        let was_terminal = order.state.is_terminal();
         order.state = state;
         if was_working != now_working
             && let Some(slot) = self.pending_notional.get_mut(coin)
@@ -258,6 +299,17 @@ impl OrderManager {
             } else {
                 *slot -= remaining;
             }
+        }
+        if was_working != now_working {
+            if now_working {
+                self.working_count += 1;
+            } else {
+                self.working_count -= 1;
+            }
+        }
+        // Terminal is sticky, so a terminal order never becomes non-terminal.
+        if !was_terminal && state.is_terminal() {
+            self.terminal_count += 1;
         }
     }
 
@@ -700,22 +752,57 @@ mod tests {
         manager.assign_req(1, &[c1, c2]);
 
         manager.on_post_ack(1, &[VenueOrderStatus::Resting, VenueOrderStatus::Resting]);
-        assert_eq!(manager.resting_count(), 2);
+        // The dead-man count includes every working order: c1/c2 resting and c3
+        // still pending.
+        assert_eq!(manager.resting_count(), 3);
 
         // c3 never got a request; a repeated ack is a no-op.
         manager.on_post_ack(1, &[VenueOrderStatus::Resting]);
-        assert_eq!(manager.resting_count(), 2);
+        assert_eq!(manager.resting_count(), 3);
 
-        // A partially filled order still rests, a filled one does not.
+        // A partially filled order is still working, a filled one is terminal.
         manager.on_order_update(c1, VenueOrderStatus::PartiallyFilled, ds("0.4"), ds("10"));
         manager.on_order_update(c2, VenueOrderStatus::Filled, ds("1"), ds("10"));
-        assert_eq!(manager.resting_count(), 1);
+        assert_eq!(manager.resting_count(), 2);
         assert_eq!(manager.len(), 3);
         // c1 (PartiallyFilled) and c3 (PendingNew) still work; c2 is terminal.
         assert_eq!(manager.working().count(), 2);
         assert!(!manager.is_empty());
         assert_eq!(manager.iter().count(), 3);
         assert_eq!(manager.coin_count(), 1);
+    }
+
+    #[test]
+    fn prune_terminal_removes_finished_orders_and_keeps_exposure() {
+        let mut manager = OrderManager::new(1);
+        let c1 = cloid(1);
+        let c2 = cloid(2);
+        manager.insert(live(c1, 0, "10", "1", OrderState::PendingNew));
+        manager.insert(live(c2, 0, "10", "1", OrderState::PendingNew));
+        assert_eq!(manager.resting_count(), 2);
+        assert_eq!(manager.pending_notional(CoinId(0)), ds("20"));
+
+        manager.set_state(c1, OrderState::Filled);
+        assert_eq!(manager.prune_terminal(), 1);
+        assert_eq!(manager.len(), 1);
+        assert_eq!(manager.resting_count(), 1);
+        // c1's exposure was released on the terminal transition.
+        assert_eq!(manager.pending_notional(CoinId(0)), ds("10"));
+        // A second prune is a no-op once no terminal orders remain.
+        assert_eq!(manager.prune_terminal(), 0);
+    }
+
+    #[test]
+    fn unknown_orders_are_working_and_queryable() {
+        let mut manager = OrderManager::new(1);
+        let c1 = cloid(1);
+        manager.insert(live(c1, 0, "10", "1", OrderState::PendingNew));
+        manager.set_state(c1, OrderState::Unknown);
+        assert!(manager.has_unknown());
+        assert!(manager.unknown_on_coin(CoinId(0)));
+        // An unknown order still counts for the dead-man switch and exposure.
+        assert_eq!(manager.resting_count(), 1);
+        assert_eq!(manager.pending_notional(CoinId(0)), ds("10"));
     }
 
     #[test]

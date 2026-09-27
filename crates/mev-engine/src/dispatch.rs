@@ -72,7 +72,6 @@ use crate::strategy::{
 use crate::timers::TimerId as HeapTimerId;
 use crate::types::{
     AccountUpdate, Cloid, CoinId, CoinRegistry, Control, PostResult, Px, Side, Stamp,
-    VenueOrderStatus,
 };
 
 /// The dispatcher's runtime knobs.
@@ -471,6 +470,13 @@ impl StrategyDispatcher {
             }
         }
 
+        // SPEC-0010 §16: resume new places once every `Unknown` order has been
+        // reconciled. Only the self-resolving `exec_error` breaker is cleared
+        // here; `exec_backpressure` and operator breakers stay tripped.
+        if !self.orders.has_unknown() {
+            self.risk.breakers_mut().clear_label("exec_error");
+        }
+
         let t_decided = now_ns();
         self.run_actions(stamp, state, t_recv, t_decided);
     }
@@ -539,38 +545,23 @@ impl StrategyDispatcher {
                 }
             }
             PostResult::Error(reason) => {
-                // Fail closed: every order in the failed post is rejected.
+                // A lost reply does not mean the order was rejected: it may be
+                // resting. Mark it `Unknown` (fail closed), trip the breaker to
+                // halt new places, and let the exec layer reconcile it by cloid
+                // via `orderStatus` (SPEC-0010 §10/§16, SPEC-0002 H-2). An
+                // unknown order still counts for exposure and the dead-man
+                // switch, and blocks new non-reduce-only places on its coin.
                 self.risk.breakers_mut().trip("exec_error");
-                tracing::warn!(req_id, %reason, "post ack error: orders rejected, breaker tripped");
+                tracing::warn!(
+                    req_id,
+                    %reason,
+                    "post ack error: orders marked Unknown, breaker tripped"
+                );
                 let Some(cloids) = self.req_cloids.remove(&req_id) else {
                     return;
                 };
                 for cloid in &cloids {
-                    self.orders
-                        .set_state(*cloid, OrderState::Rejected(RejectReason::Unknown));
-                }
-                for cloid in &cloids {
-                    let event = self.orders.get(*cloid).map(|order| {
-                        (
-                            order.strategy.clone(),
-                            OrderEvent {
-                                stamp,
-                                cloid: Some(*cloid),
-                                oid: 0,
-                                coin: order.coin,
-                                side: strat_side(order.side),
-                                px: Decimal::ZERO,
-                                sz: Decimal::ZERO,
-                                fee: Decimal::ZERO,
-                                maker: false,
-                                reduce_only: order.reduce_only,
-                                kind: OrderEventKind::Status(VenueOrderStatus::Rejected),
-                            },
-                        )
-                    });
-                    if let Some((owner, event)) = event {
-                        self.deliver_to(&owner, &event, state);
-                    }
+                    self.orders.set_state(*cloid, OrderState::Unknown);
                 }
             }
         }
@@ -877,6 +868,12 @@ impl Dispatcher for StrategyDispatcher {
     fn record_iteration(&mut self, iteration_ns: u64, events: usize) {
         self.recorder.record_iteration(iteration_ns, events);
         self.sync_market_drops();
+        // Keep the order map bounded: drop terminal orders once their delivery
+        // is done. The scan runs only when terminal orders exist.
+        if self.orders.prune_terminal() > 0 {
+            self.owners
+                .retain(|cloid, _| self.orders.get(*cloid).is_some());
+        }
         self.resting_orders
             .store(self.orders.resting_count(), Ordering::Relaxed);
     }
@@ -991,7 +988,7 @@ mod tests {
     use crate::risk::RiskGate;
     use crate::state::EngineState;
     use crate::strategy::TimerId as StratTimerId;
-    use crate::types::{AccountSnapshot, Level};
+    use crate::types::{AccountSnapshot, Level, VenueOrderStatus};
 
     fn ds(value: &str) -> Decimal {
         Decimal::from_str(value).unwrap()
@@ -1397,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn post_ack_error_rejects_orders_and_trips_the_breaker() {
+    fn post_ack_error_marks_orders_unknown_and_trips_the_breaker() {
         let strategy = Recording::new("test", CoinId(0))
             .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
         let mut h = harness(vec![Box::new(strategy)], false);
@@ -1417,10 +1414,55 @@ mod tests {
             &state,
         );
         assert!(h.dispatcher.risk.breakers().is_tripped());
-        assert!(matches!(
+        assert_eq!(h.dispatcher.risk.breakers().label(), Some("exec_error"));
+        // A lost reply is not a rejection: the order may be resting.
+        assert_eq!(
             h.dispatcher.orders.get(cloids[0]).unwrap().state,
-            OrderState::Rejected(_)
-        ));
+            OrderState::Unknown
+        );
+        // It still counts for the dead-man switch and exposure.
+        assert_eq!(h.dispatcher.orders.resting_count(), 1);
+    }
+
+    #[test]
+    fn resolving_an_unknown_order_clears_the_exec_breaker() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+        let state = state_with("100", "101");
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+
+        let (req_id, cloids) = {
+            let post = h.posts.lock().unwrap().first().unwrap().clone();
+            (post.req_id, post.cloids.clone())
+        };
+        h.dispatcher.on_account_state(
+            &AccountUpdate::PostAck {
+                stamp: stamp(30),
+                req_id,
+                result: PostResult::Error("boom".into()),
+            },
+            &state,
+        );
+        assert!(h.dispatcher.risk.breakers().is_tripped());
+
+        // The exec layer resolves it by cloid (`orderStatus`): it was resting.
+        h.dispatcher.on_account_state(
+            &AccountUpdate::OrderUpdate {
+                stamp: stamp(40),
+                cloid: cloids[0],
+                oid: 7,
+                status: VenueOrderStatus::Resting,
+                filled_sz: Decimal::ZERO,
+                avg_px: Decimal::ZERO,
+            },
+            &state,
+        );
+        assert_eq!(
+            h.dispatcher.orders.get(cloids[0]).unwrap().state,
+            OrderState::Resting
+        );
+        assert!(!h.dispatcher.risk.breakers().is_tripped());
     }
 
     #[test]
