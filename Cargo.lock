@@ -2442,6 +2442,7 @@ dependencies = [
 name = "mev-recorder"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "libc",
  "mev-core",
  "mev-hl-client",

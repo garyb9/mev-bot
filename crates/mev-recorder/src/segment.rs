@@ -13,6 +13,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,6 +23,9 @@ use thiserror::Error;
 use tracing::{debug, error, warn};
 
 use crate::envelope::{Envelope, EnvelopeClock, SegmentOpenMeta, SystemEnvelopeClock};
+
+/// At most one "queue full" warning per this interval.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Errors raised by the segment writer.
 #[derive(Debug, Error)]
@@ -123,6 +127,43 @@ enum Msg {
     Shutdown,
 }
 
+/// Rate-limits the per-drop warning so a persistently full queue cannot flood
+/// the logs. The caller still owns the `hl_rec_dropped_total` metric.
+struct DropLog {
+    start: Instant,
+    /// Monotonic ns of the last warning; `u64::MAX` until the first.
+    last_warn_ns: AtomicU64,
+    dropped: AtomicU64,
+}
+
+impl DropLog {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last_warn_ns: AtomicU64::new(u64::MAX),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether a warning is due now; wins the race for at most one per
+    /// `DROP_WARN_INTERVAL`.
+    fn should_warn(&self) -> bool {
+        let now_ns = self.start.elapsed().as_nanos() as u64;
+        let last = self.last_warn_ns.load(Ordering::Relaxed);
+        if last != u64::MAX && now_ns.saturating_sub(last) < DROP_WARN_INTERVAL.as_nanos() as u64 {
+            return false;
+        }
+        self.last_warn_ns
+            .compare_exchange(last, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Count a dropped envelope and return the running total.
+    fn record_drop(&self) -> u64 {
+        self.dropped.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
 /// Handle to the segment writer thread.
 ///
 /// Dropping the handle does not stop the thread; call
@@ -132,6 +173,7 @@ pub struct SegmentWriter {
     handle: Option<JoinHandle<()>>,
     src: String,
     conn: String,
+    drop_log: DropLog,
 }
 
 impl SegmentWriter {
@@ -152,6 +194,7 @@ impl SegmentWriter {
             handle: Some(handle),
             src,
             conn,
+            drop_log: DropLog::new(),
         })
     }
 
@@ -162,11 +205,15 @@ impl SegmentWriter {
         match self.tx.try_send(Msg::Env(env)) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
-                warn!(
-                    src = %self.src,
-                    conn = %self.conn,
-                    "segment writer queue full; dropping envelope"
-                );
+                let dropped = self.drop_log.record_drop();
+                if self.drop_log.should_warn() {
+                    warn!(
+                        src = %self.src,
+                        conn = %self.conn,
+                        dropped,
+                        "segment writer queue full; dropping envelopes"
+                    );
+                }
                 false
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -504,9 +551,16 @@ fn recover_crashed(config: &SegmentConfig) -> Result<(), SegmentError> {
     if !root.is_dir() {
         return Ok(());
     }
-    let prefix = format!("{}-", config.conn);
     let mut partials = Vec::new();
-    collect_partials(&root, &prefix, &mut partials)?;
+    collect_partials(&root, &mut partials)?;
+    // Match the connection exactly by parsing the name: a prefix test would let
+    // conn `hl-ws` claim `hl-ws-02`'s files.
+    partials.retain(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_partial_name)
+            .is_some_and(|(conn, _)| conn == config.conn)
+    });
     partials.sort();
     for partial in partials {
         let name = partial
@@ -540,21 +594,16 @@ fn recover_crashed(config: &SegmentConfig) -> Result<(), SegmentError> {
     Ok(())
 }
 
-fn collect_partials(
-    dir: &Path,
-    conn_prefix: &str,
-    out: &mut Vec<PathBuf>,
-) -> Result<(), SegmentError> {
+fn collect_partials(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), SegmentError> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_partials(&path, conn_prefix, out)?;
+            collect_partials(&path, out)?;
         } else if file_type.is_file()
             && let Some(name) = path.file_name().and_then(|name| name.to_str())
             && name.ends_with(".partial")
-            && (conn_prefix.is_empty() || name.starts_with(conn_prefix))
         {
             out.push(path);
         }
@@ -849,6 +898,32 @@ mod tests {
     }
 
     #[test]
+    fn recover_crashed_matches_the_exact_conn() {
+        let dir = temp_dir("crash-conn");
+        let hour_dir = dir.join("testnet/hl-ws/2023-11-14/22");
+        fs::create_dir_all(&hour_dir).unwrap();
+        let mine = hour_dir.join("hl-ws-1700000000000000000.jsonl.zst.partial");
+        let other = hour_dir.join("hl-ws-02-1700000000000000000.jsonl.zst.partial");
+        fs::write(&mine, b"mine").unwrap();
+        fs::write(&other, b"other").unwrap();
+
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let writer = SegmentWriter::spawn(config(&dir, clock, "hl-ws", "hl-ws")).unwrap();
+        writer.shutdown();
+
+        assert!(!mine.exists());
+        assert!(
+            hour_dir
+                .join("hl-ws-1700000000000000000.jsonl.zst.crashed")
+                .exists()
+        );
+        assert!(
+            other.exists(),
+            "conn `hl-ws` claimed `hl-ws-02`'s partial file"
+        );
+    }
+
+    #[test]
     fn records_written_equal_read_back() {
         let dir = temp_dir("roundtrip");
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
@@ -910,27 +985,49 @@ mod tests {
         );
     }
 
+    /// A roughly 1 KiB `l2Book`-like frame, the size real market-data frames
+    /// actually reach. `/benches/segment.rs` asserts the throughput floor.
+    fn realistic_frame() -> String {
+        let level = |i: u32| {
+            format!(
+                "{{\"px\":\"{}.{:02}\",\"sz\":\"1.{:02}\",\"n\":{i}}}",
+                60_000 + i,
+                i,
+                i
+            )
+        };
+        let side: Vec<String> = (0..20).map(level).collect();
+        format!(
+            "{{\"channel\":\"l2Book\",\"data\":{{\"coin\":\"BTC\",\"time\":1700000000000,\"levels\":[[{}],[{}]]}}}}",
+            side.join(","),
+            side.join(",")
+        )
+    }
+
     #[test]
-    fn throughput_meets_floor() {
-        let dir = temp_dir("throughput");
+    fn writes_realistic_frame_sizes() {
+        let dir = temp_dir("realistic");
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
         let mut cfg = config(&dir, clock.clone(), "hl-ws", "hl-ws-01");
         cfg.channel_capacity = 65_536;
         let writer = SegmentWriter::spawn(cfg).unwrap();
 
-        let total: u64 = 100_000;
-        let start = Instant::now();
+        let total: u64 = 5_000;
+        let payload = realistic_frame();
         for i in 0..total {
             clock.set_mono_ns(i);
-            let env = Envelope::frame(&*clock, "hl-ws", "hl-ws-01", i, "0123456789");
+            let env = Envelope::frame(&*clock, "hl-ws", "hl-ws-01", i, payload.clone());
             while !writer.try_send(env.clone()) {
                 std::hint::spin_loop();
             }
         }
         writer.shutdown();
-        let elapsed = start.elapsed();
-        let rate = total as f64 / elapsed.as_secs_f64();
-        println!("segment writer throughput: {total} envelopes in {elapsed:?} ({rate:.0}/s)");
-        assert!(rate >= 50_000.0, "throughput {rate:.0}/s below 50k/s floor");
+
+        let frames: usize = files_with_ext(&dir.join("testnet/hl-ws"), "zst")
+            .iter()
+            .flat_map(|file| read_records(file))
+            .filter(|env| env.kind == Kind::Frame)
+            .count();
+        assert_eq!(frames as u64, total);
     }
 }

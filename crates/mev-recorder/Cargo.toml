@@ -24,3 +24,8 @@ tokio.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 wiremock.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "segment"
+harness = false
