@@ -5,6 +5,7 @@
 //! dirty coin once, and finally idles by spinning briefly and then blocking on
 //! both channels with a timeout at the next timer deadline.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -34,6 +35,19 @@ pub trait Dispatcher {
     fn on_coin(&mut self, _coin: CoinId, _stamp: Stamp) {}
     /// A timer fired.
     fn on_timer(&mut self, _id: TimerId, _stamp: Stamp) {}
+
+    /// The loop registered a repeating timer for a strategy (SPEC-0010 §8).
+    ///
+    /// Called once at first iteration for each `Interests::timers_ms` entry, so
+    /// a fired heap timer can be routed to the strategy-local timer id. The
+    /// default is a no-op for dispatchers that do not use timers.
+    fn on_timer_registered(
+        &mut self,
+        _heap: TimerId,
+        _strategy_index: usize,
+        _strategy_timer: crate::strategy::TimerId,
+    ) {
+    }
     /// A lossless account/control update arrived.
     fn on_account(&mut self, _update: &AccountUpdate) {}
 
@@ -65,6 +79,10 @@ pub trait Dispatcher {
 /// Upper bound on how long `idle` blocks without a scheduled timer, so the
 /// loop re-checks the stop signal promptly.
 const MAX_BLOCK: Duration = Duration::from_millis(250);
+
+/// First heap id reserved for the loop's repeating strategy timers, well above
+/// any id a test or the driver schedules by hand.
+const REPEAT_TIMER_BASE: u64 = 1 << 32;
 
 /// The engine loop's runtime knobs.
 #[derive(Debug, Clone)]
@@ -103,6 +121,14 @@ pub struct EngineLoop<D: Dispatcher> {
     config: LoopConfig,
     stop: Receiver<()>,
     clock: SharedClock,
+    /// Repeating timers declared via `Interests::timers_ms`:
+    /// `(strategy index, period_ms)` in declaration order.
+    strategy_timers: Vec<(usize, u64)>,
+    /// Heap timer id → period in ns, for the repeating timers.
+    repeating: BTreeMap<TimerId, u64>,
+    /// Whether the repeating timers were seeded (done at the first iteration,
+    /// once the clock is final).
+    seeded: bool,
 }
 
 impl<D: Dispatcher> EngineLoop<D> {
@@ -110,6 +136,17 @@ impl<D: Dispatcher> EngineLoop<D> {
     pub fn new(inputs: Inputs, dispatcher: D, config: LoopConfig, stop: Receiver<()>) -> Self {
         let interests = dispatcher.interests();
         let routes = Routes::build(config.coin_count, &interests);
+        let strategy_timers: Vec<(usize, u64)> = interests
+            .iter()
+            .enumerate()
+            .flat_map(|(index, interest)| {
+                interest
+                    .timers_ms
+                    .iter()
+                    .map(move |ms| (index, *ms))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let state = EngineState::new(config.coin_count);
         Self {
             inputs,
@@ -120,6 +157,35 @@ impl<D: Dispatcher> EngineLoop<D> {
             config,
             stop,
             clock: Arc::new(LiveClock::new()),
+            strategy_timers,
+            repeating: BTreeMap::new(),
+            seeded: false,
+        }
+    }
+
+    /// Schedule every declared repeating timer at its first deadline and tell
+    /// the dispatcher which strategy owns it (SPEC-0010 §8).
+    ///
+    /// Runs at the first iteration so the clock is final (the replay driver
+    /// installs its clock before driving the loop).
+    fn seed_timers(&mut self) {
+        if self.seeded {
+            return;
+        }
+        self.seeded = true;
+        let base = self.clock.mono_ns();
+        for (n, (strategy_index, period_ms)) in self.strategy_timers.iter().enumerate() {
+            let period_ns = period_ms.saturating_mul(1_000_000);
+            if period_ns == 0 {
+                continue;
+            }
+            let heap_id = TimerId(REPEAT_TIMER_BASE + n as u64);
+            let local = crate::strategy::TimerId(n as u32);
+            self.timers
+                .schedule(heap_id, base.saturating_add(period_ns));
+            self.repeating.insert(heap_id, period_ns);
+            self.dispatcher
+                .on_timer_registered(heap_id, *strategy_index, local);
         }
     }
 
@@ -177,6 +243,7 @@ impl<D: Dispatcher> EngineLoop<D> {
 
     /// Run one pass of the §9 algorithm; returns the number of events drained.
     pub fn iterate(&mut self, now_mono_ns: u64) -> usize {
+        self.seed_timers();
         let iteration_start = std::time::Instant::now();
         let mut n = 0;
 
@@ -199,8 +266,18 @@ impl<D: Dispatcher> EngineLoop<D> {
             mono_ns: now_mono_ns,
             ts_exch_ms: 0,
         };
-        for id in self.timers.pop_due(now_mono_ns) {
+        for (id, deadline) in self.timers.pop_due_entries(now_mono_ns) {
             self.dispatcher.on_timer_state(id, now_stamp, &self.state);
+            // Re-arm a repeating timer at the next multiple of its period after
+            // now, so missed periods collapse into one firing (conflation) and
+            // replay stays deterministic.
+            if let Some(period) = self.repeating.get(&id).copied() {
+                let mut next = deadline.saturating_add(period);
+                while next <= now_mono_ns {
+                    next = next.saturating_add(period);
+                }
+                self.timers.schedule(id, next);
+            }
         }
 
         // 4. Dispatch each dirty coin once, in CoinId order, with the time of
@@ -492,6 +569,53 @@ mod tests {
         engine.iterate(2_000);
         assert!(engine.state().slot(CoinId(0)).unwrap().stale);
         assert!(!engine.state().slot(CoinId(1)).unwrap().stale);
+    }
+
+    #[test]
+    fn repeating_timers_fire_on_replay_time_and_rearm() {
+        let record = Arc::new(Mutex::new(Record::default()));
+        let (handles, inputs) = inputs(16, 16);
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let interests = vec![Interests {
+            timers_ms: vec![1_000],
+            ..Interests::default()
+        }];
+        let dispatcher = Recorder {
+            record: record.clone(),
+            interests,
+        };
+        let clock = Arc::new(crate::clock::ReplayClock::new());
+        clock.set_ms(1_000_000, 0);
+        let mut engine = EngineLoop::new(
+            inputs,
+            dispatcher,
+            LoopConfig {
+                spin_us: 0,
+                coin_count: 0,
+            },
+            stop_rx,
+        )
+        .with_clock(clock.clone());
+        drop(handles);
+
+        // First iteration seeds the timer at mono 0 + 1 s; nothing is due yet.
+        engine.iterate(0);
+        assert!(record.lock().unwrap().timers.is_empty());
+
+        clock.set_ms(2_000_000, 1_000_000_000);
+        engine.iterate(1_000_000_000);
+        assert_eq!(
+            record.lock().unwrap().timers,
+            vec![TimerId(REPEAT_TIMER_BASE)]
+        );
+
+        // Not due again until the next period elapses.
+        engine.iterate(1_500_000_000);
+        assert_eq!(record.lock().unwrap().timers.len(), 1);
+
+        clock.set_ms(3_000_000, 2_000_000_000);
+        engine.iterate(2_000_000_000);
+        assert_eq!(record.lock().unwrap().timers.len(), 2);
     }
 
     #[test]

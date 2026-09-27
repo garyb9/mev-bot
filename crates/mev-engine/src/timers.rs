@@ -72,12 +72,24 @@ impl TimerHeap {
 
     /// Pop every timer whose deadline is `<= now_ns`, in firing order.
     pub fn pop_due(&mut self, now_ns: u64) -> Vec<TimerId> {
+        self.pop_due_entries(now_ns)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Pop every due timer with its deadline, in firing order.
+    ///
+    /// The deadline lets a repeating timer re-arm at `deadline + period`
+    /// (deterministic, independent of when the loop happens to iterate).
+    pub fn pop_due_entries(&mut self, now_ns: u64) -> Vec<(TimerId, u64)> {
         let mut due = Vec::new();
         while let Some(entry) = self.heap.peek() {
             if entry.0.deadline_ns > now_ns {
                 break;
             }
-            due.push(self.heap.pop().expect("peeked").0.id);
+            let entry = self.heap.pop().expect("peeked").0;
+            due.push((entry.id, entry.deadline_ns));
         }
         due
     }

@@ -992,6 +992,15 @@ impl Dispatcher for StrategyDispatcher {
         self.dispatch_timer(id, stamp, state);
     }
 
+    fn on_timer_registered(
+        &mut self,
+        heap: HeapTimerId,
+        strategy_index: usize,
+        strategy_timer: crate::strategy::TimerId,
+    ) {
+        self.register_timer(heap, strategy_index, strategy_timer);
+    }
+
     fn on_account_state(&mut self, update: &AccountUpdate, state: &EngineState) {
         self.apply_account(update, state);
     }
@@ -1047,6 +1056,7 @@ fn to_route_interests(interests: &Interests) -> RouteInterests {
         coins,
         streams,
         lossless_trades: false,
+        timers_ms: interests.timers_ms.clone(),
     }
 }
 

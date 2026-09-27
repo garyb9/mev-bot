@@ -28,6 +28,8 @@ pub struct Interests {
     pub streams: Vec<Stream>,
     /// Whether it needs a lossless trades tape (SPEC-0010 §5).
     pub lossless_trades: bool,
+    /// Repeating timer periods in milliseconds (SPEC-0010 §8).
+    pub timers_ms: Vec<u64>,
 }
 
 impl Interests {
@@ -37,6 +39,7 @@ impl Interests {
             coins: coins.into_iter().collect(),
             streams: Vec::new(),
             lossless_trades: false,
+            timers_ms: Vec::new(),
         }
     }
 
