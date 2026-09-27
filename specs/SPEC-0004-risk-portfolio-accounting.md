@@ -163,9 +163,13 @@ Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path in
 
 **K-3 done (2026-09-27, task D).** The control task, the account stream, and the exec writer moved to `crates/mev-bot/src/live.rs` with tests: a mock-WS account frame decodes to the expected `AccountUpdate`; creating the flag file sends `Control::KillSwitch`; `hl panic`/`hl resume` create/remove the file. The `simulate` end-to-end test (`dispatch::tests::simulate_kill_switch_cancels_all_and_places_none`) shows a kill cancels every working order and places nothing new within one iteration (the queued paper updates apply even while dispatch is halted).
 
+**K-3 resume fixed (2026-09-27, task E).** `SIGUSR2` sends `Control::Resume` only when the kill flag file is absent; while it exists the signal is ignored, so a resume cannot race the next 250 ms poll and let orders out. Resume is sent regardless of the control task's own latch, so a kill from the dead-man task is resumable. At startup, a pre-existing flag file sends an initial `KillSwitch` before the loop runs, so the bot begins halted. Tests: `live::tests::sigusr2_resumes_only_without_the_flag_file`, `live::tests::startup_flag_file_sends_an_initial_kill`.
+
 **K-4:** Each breaker has a threshold in config, a metric (`hl_breaker_trips_total{breaker}`), and a sticky state shown on `/healthz`. Default action: halt new places (cancels allowed). *Done when:* each breaker has a test that trips it.
 
 **K-4 partial (2026-09-26).** The engine-side `RiskGate` has a sticky `Breakers` latch that is checked after the kill switch and halts new places (cancels allowed), and the reconciler's 3-in-10-min drift breaker (SPEC-0010 §15) feeds it. The remaining breaker classes (daily loss, drawdown, reject-rate spike, nonce errors, stale feeds, exec backpressure) and the `hl_breaker_trips_total` metric/`/healthz` surface are still open.
+
+**K-4 per-breaker state (2026-09-27, task F).** `Breakers` now stores one sticky latch per label instead of a single flag plus the first label: `is_tripped` means any breaker is tripped, `clear_label` clears only its own, and `labels()` exposes the set for `/healthz`. This fixes `exec_error`'s self-clear wiping a later `exec_backpressure` trip. Tests: `risk::tests::breakers_keep_independent_state` and `dispatch::tests::resolving_unknowns_keeps_exec_backpressure_tripped`. The per-class thresholds, the `hl_breaker_trips_total` metric, and the `/healthz` breaker section remain open (K-4).
 
 **K-5:** Implement SPEC-0010 §12's budgets as a risk check. *Done when:* tests show places rejected below `rate_budget_min` while cancels pass.
 
