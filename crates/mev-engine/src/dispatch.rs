@@ -60,6 +60,7 @@ use crate::builder::{AssetTable, plan_iteration};
 use crate::clock::{LiveClock, SharedClock};
 use crate::exec::{ExecBackend, ReqIds, UnsignedPost, apply_post_ack, dispatch};
 use crate::instrument::{LatencyRecorder, Metric, Stamps};
+use crate::journal::{ActionSink, JournalEntry};
 use crate::orders::{CloidAssigner, LiveOrder, OrderManager, OrderState};
 use crate::paper_exec::{PaperExec, paper_cancels_from_post, paper_orders_from_post};
 use crate::risk::{RiskCtx, RiskGate, cancel_all_cloids};
@@ -155,6 +156,9 @@ pub struct StrategyDispatcher {
     /// The engine's time source (SPEC-0010 §13): live wall clock, or the replay
     /// clock the driver advances per event.
     clock: SharedClock,
+    /// Optional action journal for `simulate`/`replay` (SPEC-0010 §14); `None`
+    /// in live, so nothing extra runs on the hot path.
+    journal: Option<Box<dyn ActionSink + Send>>,
     config: DispatcherConfig,
 }
 
@@ -218,6 +222,7 @@ impl StrategyDispatcher {
             drops_seen: 0,
             resting_orders: Arc::new(AtomicUsize::new(0)),
             clock: Arc::new(LiveClock::new()),
+            journal: None,
             config,
         }
     }
@@ -225,6 +230,12 @@ impl StrategyDispatcher {
     /// Use an explicit clock (replay); defaults to [`LiveClock`].
     pub fn with_clock(mut self, clock: SharedClock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Record every approved action and fill into `sink` (SPEC-0010 §14).
+    pub fn with_journal(mut self, sink: Box<dyn ActionSink + Send>) -> Self {
+        self.journal = Some(sink);
         self
     }
 
@@ -561,6 +572,20 @@ impl StrategyDispatcher {
             .or_else(|| self.orders.cloid_for_oid(oid))
             .or_else(|| self.recent_routes.get(&oid).map(|(cloid, _)| *cloid));
 
+        if self.journal.is_some() {
+            let entry = JournalEntry::Fill {
+                cloid: cloid.map(|cloid| cloid.to_hex()),
+                coin: self.registry.coin(coin).unwrap_or("").to_string(),
+                side: venue_side_str(side).to_string(),
+                px,
+                sz,
+                fee,
+            };
+            if let Some(sink) = self.journal.as_mut() {
+                sink.record(&entry);
+            }
+        }
+
         // A perp fill moves the position directly; a spot fill is left to the
         // reconciler (balances are keyed by token, not coin).
         if !self.is_spot(coin) {
@@ -741,7 +766,43 @@ impl StrategyDispatcher {
         if approved.is_empty() {
             return;
         }
+        self.record_journal(&approved);
         self.plan_and_dispatch(&approved, state, t_recv, stamp.mono_ns, t_decided, t_risked);
+    }
+
+    /// Append the risk-approved actions to the journal, if one is attached
+    /// (SPEC-0010 §14). Entries are built before the sink borrow to keep the
+    /// order-manager lookup separate.
+    fn record_journal(&mut self, approved: &[Action]) {
+        if self.journal.is_none() {
+            return;
+        }
+        let mut entries: SmallVec<[JournalEntry; 16]> = SmallVec::new();
+        for action in approved {
+            match action {
+                Action::Place(intent) => entries.push(JournalEntry::Place {
+                    cloid: intent.cloid.clone().unwrap_or_default(),
+                    coin: intent.coin.clone(),
+                    side: strat_side_str(intent.side).to_string(),
+                    limit_px: intent.limit_px,
+                    size: intent.size,
+                }),
+                Action::Cancel { cloid } => entries.push(JournalEntry::Cancel {
+                    cloid: cloid.to_hex(),
+                }),
+                Action::Modify { cloid, px, sz } => entries.push(JournalEntry::Modify {
+                    cloid: cloid.to_hex(),
+                    px: *px,
+                    sz: *sz,
+                }),
+                Action::PlaceGroup(_) => {}
+            }
+        }
+        if let Some(sink) = self.journal.as_mut() {
+            for entry in &entries {
+                sink.record(entry);
+            }
+        }
     }
 
     /// Gate one action. Returns whether it should proceed to the builder.
@@ -1081,6 +1142,20 @@ fn strat_side(side: Side) -> mev_strategy::Side {
         mev_strategy::Side::Buy
     } else {
         mev_strategy::Side::Sell
+    }
+}
+
+/// The journal's lowercase rendering of a strategy side.
+fn strat_side_str(side: mev_strategy::Side) -> &'static str {
+    if side.is_buy() { "buy" } else { "sell" }
+}
+
+/// The journal's lowercase rendering of a venue side.
+fn venue_side_str(side: Side) -> &'static str {
+    if matches!(side, Side::Buy) {
+        "buy"
+    } else {
+        "sell"
     }
 }
 
@@ -2203,6 +2278,71 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == OrderEventKind::Fill),
             "the owning strategy should receive the fill"
+        );
+    }
+
+    #[test]
+    fn journal_records_approved_actions_and_fills_on_replay_time() {
+        use std::sync::Arc;
+
+        use mev_strategy::{AccountView, FeeRates, Instrument};
+
+        use crate::clock::ReplayClock;
+        use crate::journal::{JournalEntry, SharedSink};
+        use crate::paper_exec::{PaperConfig, PaperExec};
+
+        let mut buy = intent("BTC", Side::Buy);
+        buy.limit_px = Some(ds("101"));
+        buy.tif = TimeInForce::Gtc;
+        let strategy = Recording::new("test", CoinId(0)).with_script(vec![Action::Place(buy)]);
+
+        let mut instruments = BTreeMap::new();
+        instruments.insert("BTC".to_string(), Instrument::perp());
+        let paper = PaperExec::new(
+            PaperConfig {
+                latency_ms: 20,
+                maker_fills: true,
+            },
+            AccountView {
+                account_value: ds("1000"),
+                ..Default::default()
+            },
+            instruments,
+            FeeRates::PERP,
+            FeeRates::SPOT,
+        );
+        let sink = SharedSink::new();
+        let clock = Arc::new(ReplayClock::new());
+        clock.set_ms(1_000_000, 0);
+        let mut dispatcher = StrategyDispatcher::new(
+            vec![Box::new(strategy)],
+            registry(),
+            table(),
+            RiskGate::default(),
+            None,
+            DispatcherConfig::default(),
+        )
+        .with_paper(paper)
+        .with_clock(clock.clone())
+        .with_journal(Box::new(sink.clone()));
+
+        let state = state_with("100", "100");
+        dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+        // Advance replay time past the paper latency (now 21 ms) and dispatch
+        // again; the taker fills without any wall-clock sleep.
+        clock.set_ms(21_000_000, 20_000_000);
+        dispatcher.on_coin_state(CoinId(0), stamp(30), &state);
+
+        let entries = sink.entries();
+        assert!(
+            matches!(entries.first(), Some(JournalEntry::Place { .. })),
+            "the place is journaled first: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry, JournalEntry::Fill { .. })),
+            "the fill is journaled: {entries:?}"
         );
     }
 

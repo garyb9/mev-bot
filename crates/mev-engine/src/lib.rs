@@ -19,6 +19,7 @@ pub mod dispatch;
 pub mod exec;
 pub mod ingest;
 pub mod instrument;
+pub mod journal;
 pub mod orders;
 pub mod paper_exec;
 pub mod reconcile;
@@ -41,6 +42,7 @@ pub use exec::{
     BatchOutcome, ExecBackend, ReqIds, SendError, UnsignedPost, apply_post_ack, dispatch,
     dispatch_batch,
 };
+pub use journal::{ActionSink, JournalEntry, MemorySink, SharedSink};
 pub use orders::{CloidAssigner, LiveOrder, OrderManager, OrderState};
 pub use paper_exec::{
     PaperConfig, PaperExec, PaperOrder, paper_cancels_from_post, paper_orders_from_post,
