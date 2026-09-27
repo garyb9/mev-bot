@@ -395,9 +395,59 @@ fn replay_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// The ingest→engine path: typed decode, non-blocking hand-off, and one loop
+/// iteration — the path the E-13 wiring must keep ahead of the legacy decode
+/// (the post-E-13 review found the legacy `ws::decode`, 130–260 µs, running
+/// *before* the hand-off). `legacy_ws_decode` measures that decode separately so
+/// a regression in either is visible.
+fn ingest_to_engine(c: &mut Criterion) {
+    let registry =
+        CoinRegistry::from_coins(&["BTC".into(), "ETH".into(), "SOL".into(), "xyz:TSLA".into()]);
+    let ingest = Ingest::new(ConnId(0), registry);
+    let stamp = Stamp::default();
+    let frames: Vec<&str> = [L2BOOK, TRADES, CTX]
+        .into_iter()
+        .flat_map(|raw| raw.lines())
+        .collect();
+
+    let (handles, inputs) = inputs(frames.len() + 16, 16);
+    let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+    let mut engine = EngineLoop::new(
+        inputs,
+        DrainDispatcher { decisions: 0 },
+        LoopConfig {
+            spin_us: 0,
+            coin_count: DRAIN_COINS as usize,
+        },
+        stop_rx,
+    );
+
+    let mut group = c.benchmark_group("ingest_to_engine");
+    group.throughput(Throughput::Elements(frames.len() as u64));
+    group.bench_function("decode_send_dispatch", |b| {
+        b.iter(|| {
+            for frame in &frames {
+                if let Ok(Some(update)) = ingest.decode(black_box(frame), stamp) {
+                    // `send_market` is non-blocking (drops when full).
+                    let _ = handles.send_market(update);
+                }
+                black_box(engine.iterate(1));
+            }
+        });
+    });
+    group.bench_function("legacy_ws_decode", |b| {
+        b.iter(|| {
+            for frame in &frames {
+                let _ = black_box(mev_hl_client::ws::decode(black_box(frame)));
+            }
+        });
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = criterion_config();
-    targets = bbo_to_action, drain_1000, replay_throughput
+    targets = bbo_to_action, drain_1000, replay_throughput, ingest_to_engine
 }
 criterion_main!(benches);
