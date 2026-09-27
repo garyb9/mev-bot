@@ -1,0 +1,50 @@
+# Market-data recorder profile (SPEC-0008 §7.3, task R-6).
+#
+# `hl record` loads this file with figment. The values below are the §7.3
+# example; edit them to change what is recorded.
+#
+# Overrides (highest wins): built-in defaults < this file < `HL_RECORD_*` env
+# vars < CLI flags (`--profile`, `--network`, `--allow-truncate`). The env form
+# is nested with a double underscore, e.g.:
+#   HL_RECORD_PROFILE__DEFAULT__NETWORK=testnet
+#   HL_RECORD_PROFILE__DEFAULT__OUT_DIR=/mnt/rec
+#   HL_RECORD_PROFILE__DEFAULT__HL__L2BOOK=BT
+#
+# The recorder never loads keys and never places orders (SPEC-0008 §3).
+
+[profile.default]
+network = "mainnet"
+out_dir = "data/rec"
+zstd_level = 3
+min_free_gb = 20
+retain_days = 30
+meta_refresh_secs = 300          # re-resolve universes, pick up new listings
+# Port for `/healthz`, `/readyz`, `/metrics` (SPEC-0008 §12.2). Kept separate
+# from the bot's 9090 so both can run on one host.
+http_port = 9091
+
+[profile.default.hl]
+bbo              = ["perps:all", "hip3:all", "spot:top:40", "spot:quotes"]
+trades           = ["perps:top:40", "hip3:all", "spot:top:20"]
+active_asset_ctx = ["perps:all", "hip3:all"]
+all_mids         = true          # main dex + every HIP-3 dex
+l2book           = ["BTC", "ETH", "SOL", "HYPE", "hip3:all"]
+max_subs         = 900           # keep 100 of the 1000 as headroom
+subs_per_conn    = 150
+connections      = 8             # of 10; leaves 2 for ad-hoc tools / the bot
+allow_truncate   = false         # refuse to drop priority-1 subscriptions
+
+[profile.default.rest]
+enabled = true
+# see SPEC-0008 §8 for the request list and cadences
+weight_per_min = 300             # a quarter of the 1200/IP budget
+
+[profile.default.cex]
+binance_usdm = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT"]
+binance_spot = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+bybit_linear = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT"]
+
+[profile.default.hyperevm]
+enabled = false                  # R-9; needs a non-public RPC (see SPEC-0008 §10)
+rpc_ws  = "env:HL_EVM_WS_URL"
+pools   = "config/hyperevm-pools.toml"

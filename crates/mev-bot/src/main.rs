@@ -15,6 +15,7 @@ use std::{
 };
 
 mod engine;
+mod record;
 
 use anyhow::{Context as _, Result};
 use axum::{Router, extract::State, http::StatusCode, routing::get};
@@ -144,6 +145,51 @@ enum Command {
     /// Clear the kill switch: remove the flag file. The in-process flag stays
     /// sticky until the bot is restarted or resumed (SPEC-0004 K-3).
     Resume,
+    /// Market-data recorder (SPEC-0008). Never loads keys or places orders.
+    Record {
+        /// Recording profile name in `config/record.toml` (default: `default`).
+        #[arg(long, global = true)]
+        profile: Option<String>,
+        /// Allow dropping priority-1 subscriptions when over budget (SPEC-0008 §7.4).
+        #[arg(long, global = true)]
+        allow_truncate: bool,
+        #[command(subcommand)]
+        cmd: Option<RecordCmd>,
+    },
+    /// Connectivity and latency probes (SPEC-0008 §12.1).
+    Probe {
+        #[command(subcommand)]
+        cmd: ProbeCmd,
+    },
+}
+
+/// Subcommands of `hl record`.
+#[derive(Subcommand)]
+enum RecordCmd {
+    /// Print the resolved subscription plan and exit; opens no recording sockets.
+    Plan,
+    /// Inspect one or more segment files or directories (SPEC-0008 §12.1).
+    Inspect {
+        /// Segment files, or directories to walk recursively.
+        paths: Vec<PathBuf>,
+    },
+    /// Check a day's manifest against the files on disk (SPEC-0008 §12.1).
+    Verify {
+        /// UTC date to verify, `YYYY-MM-DD`.
+        #[arg(long)]
+        date: String,
+    },
+}
+
+/// Subcommands of `hl probe`.
+#[derive(Subcommand)]
+enum ProbeCmd {
+    /// Measure TCP/TLS/WS/REST latency to Hyperliquid (used by SPEC-0008 V-4).
+    Latency {
+        /// Number of samples per measurement.
+        #[arg(long, default_value_t = 20)]
+        count: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -277,6 +323,25 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
         Command::Replay { session, db } => replay(network, session, db).await,
         Command::Panic => set_kill_switch(network, true),
         Command::Resume => set_kill_switch(network, false),
+        Command::Record {
+            profile,
+            allow_truncate,
+            cmd,
+        } => match cmd {
+            None => record::run(profile, network.map(Into::into), allow_truncate).await,
+            Some(RecordCmd::Plan) => {
+                record::plan(profile, network.map(Into::into), allow_truncate).await
+            }
+            Some(RecordCmd::Inspect { paths }) => record::inspect(&paths),
+            Some(RecordCmd::Verify { date }) => {
+                record::verify(profile, network.map(Into::into), &date)
+            }
+        },
+        Command::Probe { cmd } => match cmd {
+            ProbeCmd::Latency { count } => {
+                record::probe_latency(network.map(Into::into), count).await
+            }
+        },
     }
 }
 
@@ -1547,7 +1612,7 @@ struct AppState {
     metrics: PrometheusHandle,
 }
 
-async fn serve(health: Health, metrics: PrometheusHandle, port: u16) -> Result<()> {
+pub(crate) async fn serve(health: Health, metrics: PrometheusHandle, port: u16) -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))

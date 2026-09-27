@@ -737,7 +737,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | **T0** | M | — | ✅ |
 | R-4 | Subscription planner + universe selectors | T1 | M | R-1 | ✅ |
 | R-5 | HL REST snapshotter with weight budget (incl. candle backfill) | T1 | M | R-1, R-2 | ✅ |
-| R-6 | `hl record` / `record plan` / `probe latency` CLI, profiles, metrics, health | T1 | M | R-2, R-3, R-4, R-5 | ☐ |
+| R-6 | `hl record` / `record plan` / `probe latency` CLI, profiles, metrics, health | T1 | M | R-2, R-3, R-4, R-5 | ✅ |
 | R-7 | Segment reader + `hl record inspect` / `verify` | T1 | S | R-2 | ✅ |
 | R-8 | Binance/Bybit sources | T1 | S | R-3, R-6, V-2 | ☐ |
 | R-9 | HyperEVM pool source | T2 | L | R-6, V-5, V-6 (+ SPEC-0009 node or a provider) | ☐ |
@@ -876,6 +876,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Do:** Add the `record` (with `plan`) and `probe latency` subcommands to `crates/mev-bot/src/main.rs` (move the recorder wiring into a new `crates/mev-bot/src/record.rs` module to keep `main.rs` manageable). Load `config/record.toml` (create it from §7.3) via `figment`, overridable by `HL_RECORD_*` env vars. Wire planner → `RawWsConn`s (paced) → `SegmentWriter`; the REST snapshotter; the `clock` envelope task; `/healthz` `/readyz` `/metrics` with the §12.2 metrics; graceful shutdown (SIGTERM ⇒ `gap_start{shutdown}` on every conn, then finalize segments).
 - **Tests:** `hl record plan` on a fixture; an integration test with mock WS + mock REST that runs ~2 s and asserts files + manifest exist and contain `segment_open`, `sub`, `frame`, `segment_close`.
 - **Done when:** tests pass; a manual 10-minute mainnet run produces readable segments (`hl record inspect`) with no gaps other than startup.
+- **Implemented (2026-09-27).** `crates/mev-bot/src/record.rs` (+ `mod record;` and `Record`/`Probe` subcommands) wires planner → one `RawWsConn` per connection (staggered dials, initial-dial retry) → per-`(src,conn)` `SegmentWriter`; the R-5 `RestSnapshotter`; per-WS-conn `clock` envelopes; `/healthz` `/readyz` `/metrics`; SIGTERM/SIGINT ⇒ `gap_start{shutdown}` then finalize. `config/record.toml` is the §7.3 example (bot uses port 9091 to avoid colliding with 9090). The §12.2 `hl_rec_*` names are in `mev-metrics`. A ~2 s mock-WS + `wiremock`-REST integration test asserts `segment_open`/`sub`/`frame`/`segment_close`; a 40 s real mainnet run produced 9 segments / 23 485 records and `hl record verify` passed. **The full 10-minute production soak and the manual sign-off are left to the operator (R-10 host).** Open questions in §17 (#18–#23); the missing `mev-recorder` stats/clock/liveness APIs are the main follow-up.
 
 #### R-7 — Segment reader + inspect/verify
 - **Do:** `crates/mev-recorder/src/reader.rs`: iterate the envelopes of a file (tolerates a truncated tail in `.crashed` files); merge several files by `(t_ns, conn, seq)`. Implement the `hl record inspect` and `hl record verify` outputs from §12.1.
@@ -1012,3 +1013,9 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 15. **`predictedFundings` (R-5)** is recorded raw but not parsed (shape ⚠ V-1).
 16. **`inspect` gap duration (R-7)** counts paired `gap_start`/`gap_end` only; an open gap (crashed tail, no `gap_end`) increments the gap count but contributes no duration (`crashed_files` is reported separately).
 17. **`verify` coverage (R-7)** is the single recorded span `[min_t_ns, max_t_ns]` per `(src,conn)` minus explicit gaps, clipped to the day; unmarked holes between segments can read as covered. Union per-segment intervals when R-6 produces real data.
+18. **`SegmentWriter` stats missing (R-6).** The writer exposes no counters, so `hl_rec_bytes_raw_total`, `hl_rec_bytes_zst_total`, `hl_rec_channel_depth`, and `hl_rec_segment_rotations_total` (names added) are not yet emitted. Add a `SegmentWriter::stats()` / shared `Arc<SegmentStats>`.
+19. **Writer liveness (R-6).** `/healthz` cannot tell whether the segment-writer thread is alive (no API); it returns OK while the HTTP server runs. Add a liveness flag/API.
+20. **`clock` envelope on `hl-rest` (R-6).** `RestSnapshotter` owns its `seq` and has no clock hook, and a second `(hl-rest, hl-rest)` producer would collide, so `clock` is emitted per `hl-ws` connection only. Needs a clock hook or a shared sequence.
+21. **Subscribe pacing inside `RawWsConn` (R-6).** §7.4 step 6 (≤ 20 msg/s, ≤ 1 dial/3 s on reconnect) cannot be enforced from R-6: `RawWsConn` sends all subscriptions/resubscribes in one burst with no incremental subscribe hook. Connection-level pacing and initial-dial retry are in R-6. Its `hl_ws_*` metrics also label `src="hl"` with no `conn` (§7.5 mismatch).
+22. **`hl record plan` opens metadata REST calls (R-6).** §12.1 says "no sockets opened", but resolving universe selectors needs `/info` metadata. It opens no WS/recording sockets; confirm the wording or accept the metadata calls.
+23. **`chronyc` column order (R-6/V-1).** The `clock` envelope parses `chronyc -c tracking` assuming `RefID,Name,Stratum,System time,…`; unverified. Fold into V-1.

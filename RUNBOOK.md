@@ -148,6 +148,72 @@ is non-deterministic (a bug — see SPEC-0003 §10). Replay never dials the netw
 The v2 replay driver that records `Timer`/`Fill` so new sessions replay is
 SPEC-0010 E-7 part 2 (blocked on SPEC-0008 R-7).
 
+## Recorder (market data, SPEC-0008)
+
+The recorder (`hl record`) is a separate, low-risk process: it never loads keys
+and never places orders. It writes raw Hyperliquid market data to rotating zstd
+segments under `data/rec/` and serves the same `/healthz` `/readyz` `/metrics`
+endpoints as the bot (default port `9091`).
+
+```sh
+# Start (profile `default` from config/record.toml). Runs until SIGTERM/Ctrl-C.
+hl record
+
+# Start against testnet, or a named profile
+hl record --network testnet
+hl record --profile default
+
+# Print the resolved subscription plan and exit; opens no recording sockets.
+# Use it to prove the plan stays within the HL WS limits (SPEC-0008 §7.4).
+hl record plan
+
+# Stop gracefully: emits `gap_start{shutdown}` on every connection, finalizes
+# each open segment, and writes the manifests.
+kill -TERM "$(pgrep -f 'hl record')"
+```
+
+Configuration lives in `config/record.toml` (profile shape in SPEC-0008 §7.3).
+Override any value with `HL_RECORD_*` env vars using `__` for nesting, e.g.
+`HL_RECORD_PROFILE__DEFAULT__NETWORK=testnet`.
+
+### Health
+
+| Endpoint | Meaning |
+|---|---|
+| `GET /healthz` | process liveness |
+| `GET /readyz` | `200` when every planned WS connection is connected and fed within the watchdog and REST data is fresh |
+| `GET /metrics` | Prometheus scrape (`hl_rec_*`, `hl_ws_*`) |
+
+### Coverage and integrity
+
+```sh
+# Inspect one or more segment files (or a directory, walked recursively):
+# record counts by src/conn/kind/channel, first/last time, gaps, seq holes.
+hl record inspect data/rec/mainnet
+
+# Check a day's manifest against the files on disk and report coverage %.
+hl record verify --date 2026-09-27
+```
+
+### Disk full / rotation / shipping
+
+- Segments rotate at the top of every UTC hour or at 1 GiB uncompressed,
+  whichever comes first (SPEC-0008 §6).
+- When free disk drops below `min_free_gb` (default 20) the affected stream
+  stops and emits `gap_start{reason:"disk"}`; the recorder never crashes on a
+  full disk.
+- Retention (`retain_days`, default 30) only deletes shipped segments, and
+  shipping is optional in v1 (SPEC-0008 R-10).
+- A segment that was cut off by a crash appears as `*.jsonl.zst.crashed` and is
+  readable up to its last complete line; it is reported by `hl record verify`.
+
+### Latency probing (SPEC-0008 V-4)
+
+```sh
+# TCP connect, TLS handshake, WS ping->pong, and /info allMids RTT (p50/p90/max)
+hl probe latency --count 50
+```
+
 ## Database (SQLite)
 
 - Path: `HL_DB_PATH` (default `data/hlbot.db`), WAL mode.

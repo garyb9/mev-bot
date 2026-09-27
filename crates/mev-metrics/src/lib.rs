@@ -78,4 +78,29 @@ pub mod names {
     pub const ENGINE_MARKET_DROPS_TOTAL: &str = "hl_engine_market_drops_total";
     /// Fraction of engine iterations that drained no events (SPEC-0010 §17).
     pub const ENGINE_IDLE_RATIO: &str = "hl_engine_idle_ratio";
+
+    /// Recorder: envelopes written, tagged by `src`, `conn`, and `kind`
+    /// (SPEC-0008 §12.2).
+    pub const REC_RECORDS_TOTAL: &str = "hl_rec_records_total";
+    /// Recorder: uncompressed envelope bytes written, tagged by `src`
+    /// (SPEC-0008 §12.2).
+    pub const REC_BYTES_RAW_TOTAL: &str = "hl_rec_bytes_raw_total";
+    /// Recorder: compressed bytes written, tagged by `src` (SPEC-0008 §12.2).
+    pub const REC_BYTES_ZST_TOTAL: &str = "hl_rec_bytes_zst_total";
+    /// Recorder: envelopes dropped on a full writer queue, tagged by `src` and
+    /// `conn` (SPEC-0008 §12.2).
+    pub const REC_DROPPED_TOTAL: &str = "hl_rec_dropped_total";
+    /// Recorder: seconds spent in a data gap, tagged by `src`, `conn`, and
+    /// `reason` (SPEC-0008 §12.2).
+    pub const REC_GAP_SECONDS_TOTAL: &str = "hl_rec_gap_seconds_total";
+    /// Recorder: segment-writer queue depth, tagged by `src` (SPEC-0008 §12.2).
+    pub const REC_CHANNEL_DEPTH: &str = "hl_rec_channel_depth";
+    /// Recorder: segment rotations, tagged by `src` (SPEC-0008 §12.2).
+    pub const REC_SEGMENT_ROTATIONS_TOTAL: &str = "hl_rec_segment_rotations_total";
+    /// Recorder: free disk bytes (SPEC-0008 §12.2).
+    pub const REC_DISK_FREE_BYTES: &str = "hl_rec_disk_free_bytes";
+    /// Recorder: chrony clock offset in nanoseconds (SPEC-0008 §12.2).
+    pub const REC_CLOCK_OFFSET_NS: &str = "hl_rec_clock_offset_ns";
+    /// Recorder: REST weight spent, tagged by `src` (SPEC-0008 §12.2).
+    pub const REST_WEIGHT_USED_TOTAL: &str = "hl_rest_weight_used_total";
 }
