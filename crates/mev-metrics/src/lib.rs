@@ -26,6 +26,10 @@ pub mod names {
     pub const WS_CONNECTED: &str = "hl_ws_connected";
     /// Order submission latency histogram, tagged by transport.
     pub const ORDER_SUBMIT_SECONDS: &str = "hl_order_submit_seconds";
+
+    /// Time from an exec post being received to its frame being enqueued on the
+    /// socket (SPEC-0002 H-1, SPEC-0010 §12). The reply wait is not included.
+    pub const EXEC_QUEUE_SECONDS: &str = "hl_exec_queue_seconds";
     /// Order rejects, tagged by exchange status.
     pub const ORDER_REJECTS: &str = "hl_order_rejects_total";
     /// Unknown order outcomes resolved via `orderStatus`, tagged by resolution.

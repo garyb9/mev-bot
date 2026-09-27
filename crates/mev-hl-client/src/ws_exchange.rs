@@ -32,7 +32,8 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::exchange::{
-    ActionResponse, ExchangeApi, ExchangeRequest, ExchangeResponse, Prepared, WriteCore, WriteGate,
+    ActionResponse, ExchangeApi, ExchangeRequest, Prepared, ReplyHandle, WriteCore, WriteGate,
+    parse_post_reply,
 };
 use crate::order::Action;
 use crate::raw_ws::set_tcp_nodelay;
@@ -201,8 +202,15 @@ impl WsExchange {
         Ok(guard.as_ref().expect("connection present").tx.clone())
     }
 
-    /// Send `request` and await the correlated `post` reply.
-    async fn post(&self, request: &ExchangeRequest) -> Result<Value> {
+    /// Serialize and enqueue `request`, returning the reply waiter.
+    ///
+    /// The frame is handed to the socket-owning task before this returns, so
+    /// calls in sequence preserve write order (SPEC-0010 §12). The caller
+    /// awaits the receiver separately, keeping only the wait concurrent.
+    async fn post_enqueue(
+        &self,
+        request: &ExchangeRequest,
+    ) -> Result<(u64, PendingMap, oneshot::Receiver<Option<Value>>)> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let frame = serde_json::to_string(&PostFrame {
             method: "post",
@@ -214,47 +222,77 @@ impl WsExchange {
         })
         .map_err(|e| Error::NotSent(format!("request serialisation failed: {e}")))?;
 
-        // Cap simultaneous posts at the venue limit.
-        let _permit = self
+        let (tx, rx) = oneshot::channel();
+        let (send_tx, pending) = self.register_pending(id, tx).await?;
+        if send_tx.send(Message::Text(frame.into())).await.is_err() {
+            self.remove_pending(id);
+            // The frame never entered the writer queue, so it was not sent.
+            return Err(Error::NotSent("websocket send failed".into()));
+        }
+        Ok((id, pending, rx))
+    }
+
+    /// Sign, enqueue, and return a handle for the reply (the split exec API).
+    ///
+    /// The in-flight permit is moved into the reply future, so it is released
+    /// when the reply resolves (or is abandoned), not when the frame is queued.
+    async fn enqueue_split(&self, action: &Action) -> Result<ReplyHandle> {
+        let request = match self.core.prepare(action).await? {
+            Prepared::DryRun(request) => {
+                return Ok(ReplyHandle::ready(Ok(ActionResponse {
+                    value: json!({ "status": "simulated", "request": request }),
+                })));
+            }
+            Prepared::Send(request) => request,
+        };
+
+        // Cap simultaneous posts at the venue limit. Held until the reply.
+        let permit = self
             .in_flight
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| Error::NotSent("websocket closed before send".into()))?;
 
-        let (tx, rx) = oneshot::channel();
-        let send_tx = self.register_pending(id, tx).await?;
-        if send_tx.send(Message::Text(frame.into())).await.is_err() {
-            self.remove_pending(id);
-            // The frame never entered the writer queue, so it was not sent.
-            return Err(Error::NotSent("websocket send failed".into()));
-        }
-
-        match tokio::time::timeout(self.request_timeout, rx).await {
-            Ok(Ok(Some(response))) => Ok(response),
-            // The reader resolved this id with `None` (socket lost).
-            Ok(Ok(None)) => Err(Error::UnknownOutcome(
-                "websocket dropped before reply".into(),
-            )),
-            Ok(Err(_)) => Err(Error::UnknownOutcome(
-                "websocket reply channel closed".into(),
-            )),
-            Err(_) => {
-                self.remove_pending(id);
-                Err(Error::UnknownOutcome(format!(
-                    "no reply within {:?}",
-                    self.request_timeout
-                )))
-            }
-        }
+        let (id, pending, rx) = self.post_enqueue(&request).await?;
+        let timeout = self.request_timeout;
+        Ok(ReplyHandle::new(async move {
+            let _permit = permit;
+            let value = match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(Some(response))) => response,
+                Ok(Ok(None)) => {
+                    return Err(Error::UnknownOutcome(
+                        "websocket dropped before reply".into(),
+                    ));
+                }
+                Ok(Err(_)) => {
+                    return Err(Error::UnknownOutcome(
+                        "websocket reply channel closed".into(),
+                    ));
+                }
+                Err(_) => {
+                    pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&id);
+                    return Err(Error::UnknownOutcome(format!(
+                        "no reply within {timeout:?}"
+                    )));
+                }
+            };
+            parse_post_reply(value)
+        }))
     }
 
     /// Register the waiter for `id`, dialing lazily if there is no connection.
+    ///
+    /// Returns the socket sender and a clone of the pending map so a timed-out
+    /// await can drop its own waiter.
     async fn register_pending(
         &self,
         id: u64,
         tx: oneshot::Sender<Option<Value>>,
-    ) -> Result<mpsc::Sender<Message>> {
+    ) -> Result<(mpsc::Sender<Message>, PendingMap)> {
         let send_tx = self.ensure_connection().await?;
         let guard = self.connection.lock().await;
         if let Some(conn) = guard.as_ref() {
@@ -263,7 +301,11 @@ impl WsExchange {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(id, tx);
         }
-        Ok(send_tx)
+        let pending = guard
+            .as_ref()
+            .map(|conn| conn.pending.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+        Ok((send_tx, pending))
     }
 
     /// Drop a waiter we no longer care about (e.g. after a timeout).
@@ -342,49 +384,9 @@ impl WsExchange {
         }
     }
 
-    /// Build, sign, and (if allowed) post an action.
+    /// Build, sign, enqueue, and await one action's reply.
     async fn send(&self, action: &Action) -> Result<ActionResponse> {
-        let request = match self.core.prepare(action).await? {
-            Prepared::DryRun(request) => {
-                return Ok(ActionResponse {
-                    value: json!({ "status": "simulated", "request": request }),
-                });
-            }
-            Prepared::Send(request) => request,
-        };
-
-        // The payload is `{"type":"action","payload":{"status":...,"response":...}}`
-        // or `{"type":"error","payload":"..."}`.
-        let reply = self.post(&request).await?;
-        match reply.get("type").and_then(Value::as_str) {
-            Some("action") => {
-                let payload = reply.get("payload").cloned().unwrap_or(Value::Null);
-                // The reply was received but could not be parsed: the order's
-                // outcome is ambiguous, so reconcile rather than reject.
-                let response: ExchangeResponse = serde_json::from_value(payload)
-                    .map_err(|e| Error::UnknownOutcome(format!("undecodable post reply: {e}")))?;
-                if !response.is_ok() {
-                    let message = response
-                        .error_message()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    return Err(Error::Exchange(message));
-                }
-                Ok(ActionResponse {
-                    value: response.response.unwrap_or(Value::Null),
-                })
-            }
-            Some("error") => {
-                let message = reply
-                    .get("payload")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                Err(Error::Exchange(message))
-            }
-            _ => Err(Error::UnknownOutcome(format!(
-                "unexpected post reply: {reply}"
-            ))),
-        }
+        self.enqueue_split(action).await?.wait().await
     }
 }
 
@@ -392,6 +394,10 @@ impl WsExchange {
 impl ExchangeApi for WsExchange {
     async fn submit(&self, action: &Action) -> Result<ActionResponse> {
         self.send(action).await
+    }
+
+    async fn enqueue(&self, action: &Action) -> Result<ReplyHandle> {
+        self.enqueue_split(action).await
     }
 }
 

@@ -24,7 +24,8 @@ pub use cloid::CloidFactory;
 pub use deadman::DeadMansSwitch;
 pub use exchange::{
     ActionResponse, ExchangeApi, ExchangeRequest, ExchangeResponse, HttpExchange, OrderResponse,
-    OrderStatus, Prepared, RejectReason, WriteCore, WriteGate, build_request,
+    OrderStatus, Prepared, RejectReason, ReplyHandle, WriteCore, WriteGate, build_request,
+    parse_post_reply,
 };
 pub use market::{FEED_BOOK, FEED_CTX, FeedAge, MarketState, OrderBook, Tolerance};
 pub use nonce::{NonceManager, ResetReason, now_ms};

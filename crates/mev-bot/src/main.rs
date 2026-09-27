@@ -20,6 +20,7 @@ mod record;
 use anyhow::{Context as _, Result};
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand, ValueEnum};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use mev_core::{
     clock::{Clock, SystemClock},
     config::{Config, ConfigOverrides, Mode, Network},
@@ -626,12 +627,13 @@ async fn run(
 
 /// Bridge the engine's synchronous exec channel to the async WS writer.
 ///
-/// The engine hands [`UnsignedPost`]s to the crossbeam `Receiver` off the
-/// engine thread; a small std thread moves them onto a tokio channel. The async
-/// task drains every post already queued, starts their submits **in order**
-/// (cancels before places, per the builder), and waits for the replies in
-/// parallel through `join_all`, so several posts are in flight at once (SPEC-0002
-/// H-1, SPEC-0010 §12).
+/// The engine hands [`UnsignedPost`]s to the crossbeam `Receiver` off the engine
+/// thread; a small std thread moves them onto a tokio channel. The writer loop
+/// **signs and enqueues** each post in receive order (cancels before places, per
+/// the builder) and pushes only the reply wait into a [`FuturesUnordered`], so
+/// the loop keeps taking posts while earlier replies are in flight: a post
+/// arriving during a slow reply no longer waits a round trip, and a lost reply
+/// cannot stall later posts or the kill switch (SPEC-0002 H-1, SPEC-0010 §12).
 fn spawn_exec_writer(
     posts: crossbeam_channel::Receiver<UnsignedPost>,
     exchange: Arc<dyn ExchangeApi>,
@@ -651,71 +653,89 @@ fn spawn_exec_writer(
         });
 
     tokio::spawn(async move {
+        let mut inflight = FuturesUnordered::new();
         loop {
-            // Block for one post, then take everything already queued. A batch's
-            // cancel and place posts arrive here together and go out in order.
-            let Some(first) = rx.recv().await else {
-                break;
-            };
-            let mut run = vec![first];
-            while let Ok(post) = rx.try_recv() {
-                run.push(post);
+            tokio::select! {
+                maybe = rx.recv() => {
+                    let Some(post) = maybe else { break };
+                    let queued = Instant::now();
+                    // Sign and enqueue now, in order; only the reply is awaited
+                    // later. No lock is held across this await.
+                    match exchange.enqueue(&post.action).await {
+                        Ok(handle) => {
+                            metrics::histogram!(mev_metrics::names::EXEC_QUEUE_SECONDS)
+                                .record(queued.elapsed().as_secs_f64());
+                            inflight.push(finish_post(
+                                handle,
+                                info.clone(),
+                                address.clone(),
+                                handles.clone(),
+                                post,
+                            ));
+                        }
+                        Err(err) => {
+                            // A pre-send failure: the orders are terminal.
+                            let result = mev_engine::exec::post_result_from_error(&err);
+                            let _ = handles.send_account(AccountUpdate::PostAck {
+                                stamp: engine::now_stamp(),
+                                req_id: post.req_id,
+                                result,
+                            });
+                        }
+                    }
+                }
+                Some(_) = inflight.next(), if !inflight.is_empty() => {}
             }
-            let submits: Vec<_> = run
-                .into_iter()
-                .map(|post| {
-                    submit_post(
-                        exchange.clone(),
-                        info.clone(),
-                        address.clone(),
-                        handles.clone(),
-                        post,
-                    )
-                })
-                .collect();
-            futures_util::future::join_all(submits).await;
         }
+        // Drain any replies still in flight before the task exits.
+        while inflight.next().await.is_some() {}
     })
 }
 
-/// Sign, send, and report one built post.
+/// Await one enqueued post's reply and report it to the engine.
 ///
 /// A successful reply becomes a [`PostResult::Statuses`]. A definitive failure
-/// (venue said no, or the frame never reached the socket) becomes
-/// [`PostResult::Rejected`] (terminal); only a sent request with no reliable
-/// answer becomes [`PostResult::Error`] (`Unknown`). The unknown-outcome
-/// `orderStatus` reconciliation runs in its own spawned task, so it never
-/// delays the exec writer (SPEC-0002 H-2, SPEC-0010 §10/§16). Never resends.
-async fn submit_post(
-    exchange: Arc<dyn ExchangeApi>,
+/// becomes [`PostResult::Rejected`] (terminal); a sent request with no reliable
+/// answer becomes [`PostResult::Error`] (`Unknown`), and its `orderStatus`
+/// reconciliation is spawned so it cannot delay the writer (SPEC-0002 H-2,
+/// SPEC-0010 §10/§16). Never resends.
+async fn finish_post(
+    handle: mev_hl_client::ReplyHandle,
     info: Arc<dyn InfoApi>,
     address: Option<String>,
     handles: InputHandles,
     post: UnsignedPost,
 ) {
-    let result = match exchange.submit(&post.action).await {
-        Ok(response) => match response.order_response() {
-            Ok(orders) => PostResult::Statuses(
-                orders
-                    .statuses
-                    .iter()
-                    .zip(orders.oids.iter())
-                    .map(|(status, oid)| OrderAck {
-                        status: map_venue_status(status),
-                        oid: *oid,
-                    })
-                    .collect(),
-            ),
-            // Non-order actions (cancels) carry no per-order statuses; their
-            // outcome arrives on the account stream.
-            Err(_) => PostResult::Statuses(SmallVec::new()),
-        },
-        Err(err) => mev_engine::exec::post_result_from_error(&err),
+    let req_id = post.req_id;
+    let (result, unknown) = match handle.wait().await {
+        Ok(response) => {
+            let result = match response.order_response() {
+                Ok(orders) => PostResult::Statuses(
+                    orders
+                        .statuses
+                        .iter()
+                        .zip(orders.oids.iter())
+                        .map(|(status, oid)| OrderAck {
+                            status: map_venue_status(status),
+                            oid: *oid,
+                        })
+                        .collect(),
+                ),
+                // Non-order actions (cancels) carry no per-order statuses; their
+                // outcome arrives on the account stream.
+                Err(_) => PostResult::Statuses(SmallVec::new()),
+            };
+            (result, false)
+        }
+        Err(err) => {
+            let result = mev_engine::exec::post_result_from_error(&err);
+            let unknown = matches!(result, PostResult::Error(_));
+            (result, unknown)
+        }
     };
-    let unknown = matches!(result, PostResult::Error(_));
     let update = AccountUpdate::PostAck {
         stamp: engine::now_stamp(),
-        req_id: post.req_id,
+        req_id,
         result,
     };
     if !handles.send_account(update) {
@@ -1804,5 +1824,213 @@ mod tests {
             Ok(AccountUpdate::ResolveUnknown { cloid: got, .. }) => assert_eq!(got, cloid),
             other => panic!("expected ResolveUnknown, got {other:?}"),
         }
+    }
+
+    /// One scripted reply for [`MockExchange`].
+    #[derive(Clone, Copy)]
+    struct Outcome {
+        delay: Duration,
+        fail: bool,
+    }
+
+    /// An [`ExchangeApi`] whose `enqueue` records order and returns a scripted
+    /// reply handle, so the writer's split enqueue/await can be tested.
+    struct MockExchange {
+        enqueued: Arc<Mutex<Vec<mev_hl_client::Action>>>,
+        outcomes: Arc<Mutex<std::collections::VecDeque<Outcome>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExchangeApi for MockExchange {
+        async fn submit(
+            &self,
+            action: &mev_hl_client::Action,
+        ) -> mev_core::error::Result<mev_hl_client::ActionResponse> {
+            self.enqueue(action).await?.wait().await
+        }
+
+        async fn enqueue(
+            &self,
+            action: &mev_hl_client::Action,
+        ) -> mev_core::error::Result<mev_hl_client::ReplyHandle> {
+            self.enqueued.lock().unwrap().push(action.clone());
+            let outcome = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Outcome {
+                    delay: Duration::ZERO,
+                    fail: false,
+                });
+            Ok(mev_hl_client::ReplyHandle::new(async move {
+                tokio::time::sleep(outcome.delay).await;
+                if outcome.fail {
+                    Err(mev_core::error::Error::UnknownOutcome("lost reply".into()))
+                } else {
+                    Ok(mev_hl_client::ActionResponse {
+                        value: serde_json::json!({"data": {"statuses": ["resting"]}}),
+                    })
+                }
+            }))
+        }
+    }
+
+    fn mock_exchange(outcomes: Vec<Outcome>) -> Arc<MockExchange> {
+        Arc::new(MockExchange {
+            enqueued: Arc::new(Mutex::new(Vec::new())),
+            outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
+        })
+    }
+
+    fn test_post(req_id: u64, action: mev_hl_client::Action) -> UnsignedPost {
+        UnsignedPost {
+            req_id,
+            action,
+            cloids: SmallVec::new(),
+        }
+    }
+
+    /// A never-dialing info client; recovery calls just fail and retry.
+    fn dead_info() -> Arc<dyn InfoApi> {
+        Arc::new(HttpInfo::with_base_url("http://127.0.0.1:1"))
+    }
+
+    #[tokio::test]
+    async fn a_post_during_a_slow_reply_is_enqueued_immediately() {
+        use mev_hl_client::{Action as VenueAction, Grouping};
+
+        let exchange = mock_exchange(vec![
+            Outcome {
+                delay: Duration::from_secs(5),
+                fail: false,
+            },
+            Outcome {
+                delay: Duration::ZERO,
+                fail: false,
+            },
+        ]);
+        let (handles, _inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let writer = spawn_exec_writer(rx, exchange.clone(), dead_info(), None, handles);
+
+        tx.send(test_post(1, VenueAction::CancelByCloid { cancels: vec![] }))
+            .unwrap();
+        let started = Instant::now();
+        tx.send(test_post(
+            2,
+            VenueAction::Order {
+                orders: vec![],
+                grouping: Grouping::Na,
+            },
+        ))
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while exchange.enqueued.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let queue_to_socket = started.elapsed();
+        assert_eq!(
+            exchange.enqueued.lock().unwrap().len(),
+            2,
+            "the second post must reach the socket while the first reply is pending"
+        );
+        assert!(
+            queue_to_socket < Duration::from_secs(1),
+            "queue-to-socket took {queue_to_socket:?}"
+        );
+
+        drop(tx);
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_is_enqueued_before_a_place_in_a_batch() {
+        use mev_hl_client::{Action as VenueAction, Grouping};
+
+        let exchange = mock_exchange(vec![]);
+        let (handles, _inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let writer = spawn_exec_writer(rx, exchange.clone(), dead_info(), None, handles);
+
+        tx.send(test_post(1, VenueAction::CancelByCloid { cancels: vec![] }))
+            .unwrap();
+        tx.send(test_post(
+            2,
+            VenueAction::Order {
+                orders: vec![],
+                grouping: Grouping::Na,
+            },
+        ))
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while exchange.enqueued.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let enqueued = exchange.enqueued.lock().unwrap();
+        assert_eq!(enqueued.len(), 2);
+        assert!(
+            matches!(enqueued[0], VenueAction::CancelByCloid { .. }),
+            "the cancel goes first"
+        );
+        assert!(
+            matches!(enqueued[1], VenueAction::Order { .. }),
+            "the place goes second"
+        );
+
+        drop(tx);
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn a_lost_reply_and_its_recovery_do_not_delay_the_next_post() {
+        use mev_hl_client::{Action as VenueAction, Grouping};
+
+        let exchange = mock_exchange(vec![
+            Outcome {
+                delay: Duration::from_millis(200),
+                fail: true,
+            },
+            Outcome {
+                delay: Duration::ZERO,
+                fail: false,
+            },
+        ]);
+        let (handles, _inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let writer = spawn_exec_writer(
+            rx,
+            exchange.clone(),
+            dead_info(),
+            Some("0xabc".into()),
+            handles,
+        );
+
+        let mut first = test_post(1, VenueAction::CancelByCloid { cancels: vec![] });
+        first.cloids.push(cloid_with(7));
+        tx.send(first).unwrap();
+        tx.send(test_post(
+            2,
+            VenueAction::Order {
+                orders: vec![],
+                grouping: Grouping::Na,
+            },
+        ))
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while exchange.enqueued.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            exchange.enqueued.lock().unwrap().len(),
+            2,
+            "recovery must not delay the next post"
+        );
+
+        drop(tx);
+        writer.abort();
     }
 }

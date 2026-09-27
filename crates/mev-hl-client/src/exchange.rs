@@ -7,6 +7,8 @@
 //! module owns the shared signed-envelope/response types and the [`WriteCore`]
 //! (gating, signing, nonce sequencing) both transports build on.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -223,6 +225,77 @@ impl ActionResponse {
     }
 }
 
+/// Parse a raw `post` reply into an [`ActionResponse`] (or a typed error).
+///
+/// Shared by the transports so the split enqueue/await path and the one-shot
+/// path classify replies the same way.
+pub fn parse_post_reply(reply: Value) -> Result<ActionResponse> {
+    match reply.get("type").and_then(Value::as_str) {
+        Some("action") => {
+            let payload = reply.get("payload").cloned().unwrap_or(Value::Null);
+            // The reply was received but could not be parsed: the order's
+            // outcome is ambiguous, so reconcile rather than reject.
+            let response: ExchangeResponse = serde_json::from_value(payload)
+                .map_err(|e| Error::UnknownOutcome(format!("undecodable post reply: {e}")))?;
+            if !response.is_ok() {
+                let message = response
+                    .error_message()
+                    .unwrap_or_else(|| "unknown".to_string());
+                return Err(Error::Exchange(message));
+            }
+            Ok(ActionResponse {
+                value: response.response.unwrap_or(Value::Null),
+            })
+        }
+        Some("error") => {
+            let message = reply
+                .get("payload")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            Err(Error::Exchange(message))
+        }
+        _ => Err(Error::UnknownOutcome(format!(
+            "unexpected post reply: {reply}"
+        ))),
+    }
+}
+
+/// A type-erased handle to one signed action's reply.
+///
+/// Enqueueing an action (signing + writing the frame) happens before the handle
+/// is returned, so a caller can enqueue in order and then await the replies
+/// concurrently (SPEC-0002 H-1, SPEC-0010 §12). Dropping the handle simply
+/// abandons the wait.
+pub struct ReplyHandle {
+    inner: Pin<Box<dyn Future<Output = Result<ActionResponse>> + Send>>,
+}
+
+impl ReplyHandle {
+    /// Wrap an arbitrary reply future.
+    pub fn new(fut: impl Future<Output = Result<ActionResponse>> + Send + 'static) -> Self {
+        Self {
+            inner: Box::pin(fut),
+        }
+    }
+
+    /// A handle already resolved to an outcome (dry-run, HTTP fallback).
+    pub fn ready(result: Result<ActionResponse>) -> Self {
+        Self::new(async move { result })
+    }
+
+    /// Await the reply.
+    pub async fn wait(self) -> Result<ActionResponse> {
+        self.inner.await
+    }
+}
+
+impl std::fmt::Debug for ReplyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReplyHandle { .. }")
+    }
+}
+
 /// Write API for HyperCore actions (SPEC-0002 §8).
 ///
 /// [`submit`](Self::submit) is the single primitive: every transport signs and
@@ -232,6 +305,17 @@ impl ActionResponse {
 pub trait ExchangeApi: Send + Sync {
     /// Submit a signed action envelope.
     async fn submit(&self, action: &Action) -> Result<ActionResponse>;
+
+    /// Sign and enqueue `action`, returning a handle that resolves its reply.
+    ///
+    /// The enqueue completes before this returns, so callers can enqueue in
+    /// order (e.g. cancels before places) and await the replies concurrently
+    /// (SPEC-0002 H-1). The default is the one-shot [`Self::submit`], which is
+    /// correct but not split (used by the REST fallback).
+    async fn enqueue(&self, action: &Action) -> Result<ReplyHandle> {
+        let response = self.submit(action).await?;
+        Ok(ReplyHandle::ready(Ok(response)))
+    }
 
     /// Place one or more orders and parse the per-order statuses.
     async fn place(&self, orders: Vec<OrderWire>) -> Result<OrderResponse> {
