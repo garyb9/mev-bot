@@ -31,6 +31,12 @@ use mev_core::error::{Error, Result};
 /// window; tune with [`NonceManager::with_max_future_drift`].
 pub const DEFAULT_MAX_FUTURE_DRIFT_MS: u64 = 60_000;
 
+/// The venue's outer nonce window on the future side (H-9: a nonce must be
+/// within `T + 1 day`). A persisted value past this cannot be one this bot
+/// legitimately sent, so it is treated as corruption and the writer fails
+/// closed. Set an hour under the venue limit to leave headroom for clock skew.
+pub const VENUE_MAX_FUTURE_MS: u64 = 86_400_000 - 3_600_000;
+
 /// Default look-ahead (in nonce space) persisted ahead of the last sent nonce
 /// by [`NonceLease`] (SPEC-0002 H-6). A 30 s reserve is far larger than the
 /// burst-ahead-of-clock drift of any realistic agent.
@@ -302,6 +308,11 @@ impl NonceLease {
     /// write-behind when the confirmed mark is half-spent.
     ///
     /// Returns an error (without sending) when durability cannot be guaranteed.
+    ///
+    /// Retry is driven by this call: if a persist fails and no further order is
+    /// prepared, no retry runs. That is fine — an idle core hands out no nonce,
+    /// so nothing can be lost — and it avoids spending persistence budget while
+    /// idle.
     pub fn cover(&self, nonce: u64, now_ms: u64) -> Result<()> {
         let durable = self.durable.load(Ordering::Acquire);
         // Trigger on the *confirmed* durable mark (not just the requested
@@ -321,6 +332,17 @@ impl NonceLease {
     /// Force a write-ahead horizon now (e.g. after a reject resync).
     pub fn force(&self, nonce: u64, now_ms: u64) {
         self.request(nonce, now_ms);
+    }
+
+    /// Rebase the durable and requested horizons after an operator reset of a
+    /// corrupt persisted value (SPEC-0002 H-6). Unlike [`Self::request`] this
+    /// may lower the horizons, so it must only run on the explicit reset path,
+    /// where the caller has already rewritten the database synchronously.
+    pub fn rebase(&self, horizon: u64, now_ms: u64) {
+        self.durable.store(horizon, Ordering::Release);
+        self.requested.store(horizon, Ordering::Release);
+        self.last_attempt_ms.store(now_ms, Ordering::Relaxed);
+        self.enqueue_failed.store(false, Ordering::Release);
     }
 
     fn maybe_request(&self, nonce: u64, now_ms: u64, durable: u64) {

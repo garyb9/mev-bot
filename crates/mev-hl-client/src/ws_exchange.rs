@@ -184,9 +184,14 @@ impl WsExchange {
         self
     }
 
-    /// Restore the persisted nonce high-water mark.
-    pub async fn restore_nonce(&self, last: u64) {
-        self.core.restore_nonce(last).await;
+    /// Restore the persisted nonce high-water mark (operator path).
+    pub async fn restore_nonce(&self, last: u64) -> Result<()> {
+        self.core.restore_nonce(last).await
+    }
+
+    /// Reset a corrupt persisted nonce (operator path).
+    pub async fn reset_nonce(&self) -> Result<()> {
+        self.core.reset_nonce().await
     }
 
     /// The current nonce high-water mark (for persistence).

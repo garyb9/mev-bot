@@ -47,9 +47,9 @@ pub mod names {
     /// Write-behind nonce persists dropped because the writer queue was full or
     /// the writer was gone (SPEC-0002 H-6).
     pub const NONCE_PERSIST_DROPPED_TOTAL: &str = "hl_nonce_persist_dropped_total";
-    /// Restored nonce leases clamped to the plausible future bound at resume
-    /// (SPEC-0002 H-6).
-    pub const NONCE_RESUME_CAPPED_TOTAL: &str = "hl_nonce_resume_capped_total";
+    /// Restored nonce leases beyond the venue's future window at resume: the bot
+    /// fails closed until an operator resets the nonce (SPEC-0002 H-6).
+    pub const NONCE_RESUME_CORRUPT_TOTAL: &str = "hl_nonce_resume_corrupt_total";
     /// Whether the dead-man's switch is currently armed (0/1).
     pub const DEADMAN_ARMED: &str = "hl_deadman_armed";
     /// Dead-man's switch arm/refresh submissions.

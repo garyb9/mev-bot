@@ -24,8 +24,7 @@ use mev_core::{
 };
 
 use crate::nonce::{
-    DEFAULT_MAX_FUTURE_DRIFT_MS, DEFAULT_NONCE_LEASE_MS, NONCE_WRITE_QUEUE, NonceLease,
-    NonceManager,
+    DEFAULT_NONCE_LEASE_MS, NONCE_WRITE_QUEUE, NonceLease, NonceManager, VENUE_MAX_FUTURE_MS,
 };
 use crate::order::{Action, CancelByCloidWire, CancelWire, OrderWire};
 use crate::signing::{AgentSigner, Signature};
@@ -388,6 +387,12 @@ pub struct WriteCore {
     /// Coalesced write-behind nonce persistence; absent when no store is
     /// attached, in which case no nonce is persisted (tests, `observe`).
     nonce_store: Option<NonceLease>,
+    /// Shared connection, kept only for the off-hot-path operator nonce reset
+    /// (`reset_nonce`).
+    nonce_db: Option<Arc<Mutex<Db>>>,
+    /// Set when the persisted nonce was beyond the venue's future window at
+    /// boot. `prepare` fails closed until an operator calls `reset_nonce`.
+    nonce_corrupt: std::sync::atomic::AtomicBool,
     clock: Arc<dyn Clock>,
     nonce_lease_ms: u64,
     gate: WriteGate,
@@ -416,6 +421,8 @@ impl WriteCore {
             signer,
             nonce: tokio::sync::Mutex::new(NonceManager::new()),
             nonce_store: None,
+            nonce_db: None,
+            nonce_corrupt: std::sync::atomic::AtomicBool::new(false),
             clock: Arc::new(SystemClock),
             nonce_lease_ms: DEFAULT_NONCE_LEASE_MS,
             gate,
@@ -440,47 +447,48 @@ impl WriteCore {
 
     /// Attach a durable nonce store and restore the persisted high-water mark.
     ///
-    /// The startup prime is `min(max(resumed, now) + lease, cap)`, at least
-    /// `resumed + 1`, where `cap = now + lease + max_future_drift`. That keeps a
-    /// full lease of headroom after a normal restart while a crash loop cannot
-    /// ratchet the horizon past the plausible bound (it grows by at most a lease
-    /// per restart until capped, then is stable). The restored value is capped
-    /// at `cap` (beyond it the value is implausible corruption, not a lease) and
-    /// becomes the drift guard's floor (SPEC-0002 H-6).
+    /// The bot **never resumes below the persisted value**: the manager starts
+    /// at `max(now, restored + 1)`. The restart prime is `max(restored, now +
+    /// lease)`, so a crash that sends nothing does not ratchet the horizon; a
+    /// fast restart with `restored >= now + lease` may refuse the first send
+    /// until the urgent write-behind refresh lands (milliseconds).
+    ///
+    /// A persisted value beyond the venue's future window
+    /// ([`VENUE_MAX_FUTURE_MS`]) cannot be one this bot sent: it is treated as
+    /// corruption, counted in `hl_nonce_resume_corrupt_total`, logged at
+    /// `error`, and the core **fails closed** until an operator calls
+    /// [`Self::reset_nonce`] (SPEC-0002 H-6). It is never silently clamped.
     pub fn with_nonce_db(mut self, db: Arc<Mutex<Db>>) -> Result<Self> {
         let now = self.clock.now_ms();
-        let (resumed, horizon) = {
+        let (resumed, horizon, corrupt) = {
             let guard = db
                 .lock()
                 .map_err(|_| Error::Config("db lock poisoned".into()))?;
             let restored = guard.nonce_last()?.unwrap_or(0);
-            let cap = now
-                .saturating_add(self.nonce_lease_ms)
-                .saturating_add(DEFAULT_MAX_FUTURE_DRIFT_MS);
-            let resumed = restored.min(cap);
-            if restored > cap {
-                metrics::counter!(mev_metrics::names::NONCE_RESUME_CAPPED_TOTAL).increment(1);
-                tracing::warn!(
+            let ceiling = now.saturating_add(VENUE_MAX_FUTURE_MS);
+            let corrupt = restored > ceiling;
+            if corrupt {
+                metrics::counter!(mev_metrics::names::NONCE_RESUME_CORRUPT_TOTAL).increment(1);
+                tracing::error!(
                     restored,
-                    cap,
-                    "persisted nonce lease beyond the plausible bound; clamping the resume floor"
+                    ceiling,
+                    "persisted nonce is beyond the venue future window; refusing to send until an operator resets the nonce"
                 );
             }
-            // Full lease headroom, but never past the plausible bound; always
-            // cover the first send after `resume(resumed)`.
-            let horizon = resumed
-                .max(now)
-                .saturating_add(self.nonce_lease_ms)
-                .min(cap)
-                .max(resumed.saturating_add(1));
-            guard.set_nonce_last(horizon)?;
-            (resumed, horizon)
+            let horizon = restored.max(now.saturating_add(self.nonce_lease_ms));
+            if !corrupt {
+                guard.set_nonce_last(horizon)?;
+            }
+            (restored, horizon, corrupt)
         };
-        let writer = DbWriter::spawn_shared(db, NONCE_WRITE_QUEUE);
+        let writer = DbWriter::spawn_shared(db.clone(), NONCE_WRITE_QUEUE);
         let durable = writer.nonce_hwm();
         let lease = NonceLease::new(writer, horizon, self.nonce_lease_ms, durable, now);
         self.nonce = tokio::sync::Mutex::new(NonceManager::resume(resumed));
         self.nonce_store = Some(lease);
+        self.nonce_db = Some(db);
+        self.nonce_corrupt
+            .store(corrupt, std::sync::atomic::Ordering::Release);
         Ok(self)
     }
 
@@ -510,20 +518,53 @@ impl WriteCore {
         self
     }
 
-    /// Restore a specific nonce high-water mark.
+    /// Restore a specific nonce high-water mark (explicit operator path).
     ///
-    /// Clamped to never go below the current in-memory high-water mark, so an
-    /// operator/manual resync cannot force a nonce reuse (SPEC-0002 H-6).
-    pub async fn restore_nonce(&self, last: u64) {
-        let restore = {
+    /// Clamped to never go below any known value (in-memory, requested, or
+    /// durable), so it cannot force a reuse. Also clears a prior corruption
+    /// fail-closed state and writes the new horizon synchronously so a restart
+    /// sees it (SPEC-0002 H-6).
+    pub async fn restore_nonce(&self, last: u64) -> Result<()> {
+        let floor = {
             let mut guard = self.nonce.lock().await;
-            let restore = last.max(guard.last());
-            *guard = NonceManager::resume(restore);
-            restore
+            let floor = guard.last().max(last);
+            *guard = NonceManager::resume(floor);
+            floor
         };
-        if let Some(store) = &self.nonce_store {
-            store.force(restore, self.clock.now_ms());
+        let known = self
+            .nonce_store
+            .as_ref()
+            .map_or(0, |store| store.durable().max(store.requested()));
+        self.rebase_nonce(floor.max(known)).await
+    }
+
+    /// Operator escape hatch for a corrupt persisted nonce: abandon history and
+    /// resume from the wall clock, clearing the fail-closed state (SPEC-0002
+    /// H-6). Intentionally allowed to lower the persisted value.
+    pub async fn reset_nonce(&self) -> Result<()> {
+        let now = self.clock.now_ms();
+        self.rebase_nonce(now).await
+    }
+
+    /// Write `restore` (and a lease ahead of it) to the durable store and rebase
+    /// the in-memory manager and lease. The synchronous write is safe here: this
+    /// is the explicit operator path, never the hot path.
+    async fn rebase_nonce(&self, restore: u64) -> Result<()> {
+        let now = self.clock.now_ms();
+        let horizon = restore.max(now.saturating_add(self.nonce_lease_ms));
+        if let Some(db) = &self.nonce_db {
+            let guard = db
+                .lock()
+                .map_err(|_| Error::Config("db lock poisoned".into()))?;
+            guard.set_nonce_last(horizon)?;
         }
+        *self.nonce.lock().await = NonceManager::resume(restore);
+        if let Some(store) = &self.nonce_store {
+            store.rebase(horizon, now);
+        }
+        self.nonce_corrupt
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// The current nonce high-water mark (for persistence and tests).
@@ -552,6 +593,15 @@ impl WriteCore {
             .signer
             .as_ref()
             .ok_or_else(|| Error::Config("no agent signer is configured".into()))?;
+        // Fail closed until an operator resets a corrupt persisted nonce.
+        if self
+            .nonce_corrupt
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::NotSent(
+                "persisted nonce is corrupt; an operator must reset the nonce".to_string(),
+            ));
+        }
         let now = self.clock.now_ms();
         let nonce = self.nonce.lock().await.next(now);
         let started = Instant::now();
@@ -704,9 +754,14 @@ impl HttpExchange {
         self
     }
 
-    /// Restore the persisted nonce high-water mark.
-    pub async fn restore_nonce(&self, last: u64) {
-        self.core.restore_nonce(last).await;
+    /// Restore the persisted nonce high-water mark (operator path).
+    pub async fn restore_nonce(&self, last: u64) -> Result<()> {
+        self.core.restore_nonce(last).await
+    }
+
+    /// Reset a corrupt persisted nonce (operator path).
+    pub async fn reset_nonce(&self) -> Result<()> {
+        self.core.reset_nonce().await
     }
 
     /// The current nonce high-water mark (for persistence).
@@ -958,14 +1013,26 @@ mod tests {
         assert!(persisted > first, "{persisted} must cover {first}");
 
         // A fresh instance restores the persisted high-water mark and never
-        // regresses.
+        // regresses. The first send may be refused until the write-behind lease
+        // refreshes (accepted); every sent nonce must exceed the previous one.
         let restarted = HttpExchange::with_base_url(server.uri(), Mode::Live, Some(signer()))
             .unwrap()
             .with_nonce_db(db.clone())
             .unwrap();
         let resumed = restarted.last_nonce().await;
         assert!(resumed >= first, "{resumed} must not be below {first}");
-        restarted.submit(&simple_action()).await.unwrap();
+        let mut advanced = false;
+        for _ in 0..50 {
+            match restarted.submit(&simple_action()).await {
+                Ok(_) => {
+                    advanced = true;
+                    break;
+                }
+                Err(Error::NotSent(_)) => {}
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(advanced, "the restarted instance must eventually send");
         assert!(restarted.last_nonce().await > resumed);
     }
 
@@ -1011,18 +1078,29 @@ mod tests {
             .with_nonce_lease(100)
             .with_nonce_db(db.clone())
             .unwrap();
-        for _ in 0..10 {
-            match restarted.prepare(&simple_action()).await.unwrap() {
-                Prepared::Send(request) => {
+        // The restored lease covers every sent nonce, so the first send after a
+        // fast restart may be refused until the urgent refresh lands (the
+        // accepted liveness cost); every send that does go out must be higher.
+        let mut advanced = 0;
+        for _ in 0..200 {
+            match restarted.prepare(&simple_action()).await {
+                Ok(Prepared::Send(request)) => {
                     assert!(
                         request.nonce > max_sent,
                         "restarted nonce {} reuses or regresses below {max_sent}",
                         request.nonce
                     );
+                    advanced += 1;
+                    if advanced == 10 {
+                        break;
+                    }
                 }
-                Prepared::DryRun(_) => panic!("live mode must send"),
+                Ok(Prepared::DryRun(_)) => panic!("live mode must send"),
+                Err(Error::NotSent(_)) => {}
+                Err(other) => panic!("unexpected error: {other:?}"),
             }
         }
+        assert_eq!(advanced, 10, "the restarted instance must resume sending");
     }
 
     #[tokio::test]
@@ -1241,15 +1319,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_persisted_lease_is_capped_on_resume() {
+    async fn corrupt_persisted_nonce_fails_closed_until_reset() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let clock = Arc::new(FixedClock::new(1_000_000));
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        // Persisted far beyond now + lease + max_future_drift: implausible.
+        // Beyond the venue's future window: it cannot be one we sent.
         db.lock()
             .unwrap()
-            .set_nonce_last(1_000_000 + 10_000_000)
+            .set_nonce_last(1_000_000 + VENUE_MAX_FUTURE_MS + 1)
             .unwrap();
 
         let core = metrics::with_local_recorder(&recorder, || {
@@ -1260,26 +1338,79 @@ mod tests {
                 .unwrap()
         });
 
-        let cap = 1_000_000 + DEFAULT_NONCE_LEASE_MS + DEFAULT_MAX_FUTURE_DRIFT_MS;
-        assert_eq!(core.last_nonce().await, cap);
+        // Fail closed: a typed refusal, and the corruption is counted.
+        assert!(matches!(
+            core.prepare(&simple_action()).await,
+            Err(Error::NotSent(_))
+        ));
         assert_eq!(
             counter_value(
                 snapshotter.snapshot(),
-                names::NONCE_RESUME_CAPPED_TOTAL,
+                names::NONCE_RESUME_CORRUPT_TOTAL,
                 None
             ),
             1
         );
+
+        // The explicit operator reset clears it and orders flow again.
+        core.reset_nonce().await.unwrap();
+        assert!(matches!(
+            core.prepare(&simple_action()).await.unwrap(),
+            Prepared::Send(_)
+        ));
     }
 
     #[tokio::test]
-    async fn restart_prime_is_bounded_across_a_crash_loop() {
+    async fn crash_loop_never_reuses_a_nonce() {
         let clock = Arc::new(FixedClock::new(1_000_000));
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        // now + lease + max_future_drift, plus the +1 needed to cover resume.
-        let bound = 1_000_000 + 100 + DEFAULT_MAX_FUTURE_DRIFT_MS + 1;
-        let mut last = 0u64;
-        for _ in 0..8 {
+        let mut sent: Vec<u64> = Vec::new();
+        for _ in 0..100 {
+            let core = WriteCore::new(Mode::Live, Some(signer()))
+                .unwrap()
+                .with_clock(clock.clone())
+                .with_nonce_lease(100)
+                .with_nonce_db(db.clone())
+                .unwrap();
+            let start = db.lock().unwrap().nonce_last().unwrap().unwrap_or(0);
+            let mut run_sends = 0u64;
+            // A send each run; the first attempt after a fast restart may be
+            // refused until the urgent refresh lands.
+            for _ in 0..160 {
+                match core.prepare(&simple_action()).await {
+                    Ok(Prepared::Send(request)) => {
+                        assert!(
+                            sent.iter().all(|&previous| request.nonce > previous),
+                            "nonce {} reused",
+                            request.nonce
+                        );
+                        sent.push(request.nonce);
+                        run_sends += 1;
+                    }
+                    Ok(Prepared::DryRun(_)) => panic!("live mode must send"),
+                    Err(Error::NotSent(_)) => {}
+                    Err(other) => panic!("unexpected error: {other:?}"),
+                }
+            }
+            drop(core); // drains and commits
+            let persisted = db.lock().unwrap().nonce_last().unwrap().unwrap_or(0);
+            assert!(persisted >= start, "the persisted mark regressed");
+            // Growth is driven by the sends in this run plus at most a lease of
+            // write-ahead, never a runaway.
+            assert!(
+                persisted <= start + run_sends + 2 * 100,
+                "persisted grew to {persisted} from {start} with {run_sends} sends"
+            );
+        }
+        assert!(!sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_after_a_committed_refresh_never_reuses() {
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let mut sent = Vec::new();
+        {
             let core = WriteCore::new(Mode::Live, Some(signer()))
                 .unwrap()
                 .with_clock(clock.clone())
@@ -1287,14 +1418,51 @@ mod tests {
                 .with_nonce_db(db.clone())
                 .unwrap();
             let prime = db.lock().unwrap().nonce_last().unwrap().unwrap();
-            assert!(prime >= last, "the restart prime must not regress");
-            assert!(prime <= bound, "prime {prime} must stay within {bound}");
-            // The first send after resume is covered by the prime.
-            assert!(matches!(
-                core.prepare(&simple_action()).await.unwrap(),
-                Prepared::Send(_)
-            ));
-            last = prime;
+            for _ in 0..160 {
+                if let Ok(Prepared::Send(request)) = core.prepare(&simple_action()).await {
+                    sent.push(request.nonce);
+                }
+            }
+            // Wait for a refresh to commit past the startup prime.
+            let mut persisted = prime;
+            for _ in 0..2_000 {
+                persisted = db.lock().unwrap().nonce_last().unwrap().unwrap();
+                if persisted > prime {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert!(persisted > prime, "a refresh should have committed");
+        }
+        let max_sent = *sent.iter().max().unwrap();
+        let restored = db.lock().unwrap().nonce_last().unwrap().unwrap();
+        assert!(
+            restored > max_sent,
+            "the persisted horizon {restored} must cover every sent nonce, max {max_sent}"
+        );
+
+        // Restart in the same frozen millisecond.
+        let restarted = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_clock(clock)
+            .with_nonce_lease(100)
+            .with_nonce_db(db.clone())
+            .unwrap();
+        let mut next = Vec::new();
+        for _ in 0..160 {
+            match restarted.prepare(&simple_action()).await {
+                Ok(Prepared::Send(request)) => next.push(request.nonce),
+                Ok(Prepared::DryRun(_)) => panic!("live mode must send"),
+                Err(Error::NotSent(_)) => {}
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(!next.is_empty());
+        for nonce in next {
+            assert!(
+                nonce > max_sent,
+                "restart nonce {nonce} reused <= {max_sent}"
+            );
         }
     }
 
