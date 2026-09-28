@@ -1,0 +1,64 @@
+# cargo-deny configuration (SPEC-0000 C-1).
+#
+# Checks: advisories, licenses, bans (including the retired `ethers` stack),
+# and sources. See https://embarkstudios.github.io/cargo-deny/ for the schema.
+
+[advisories]
+# Vulnerabilities are always errors and cannot be downgraded via config.
+#
+# RUSTSEC-2024-0436: `paste` is unmaintained. It is a transitive dependency of
+# `alloy-primitives` (through `syn-solidity`); the newest compatible release,
+# 1.7.3, still depends on it, and `paste` itself has no fixed version, so no
+# `cargo update -p paste` can clear this advisory.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained transitive dep of alloy-primitives; no fixed version reachable" },
+]
+
+[licenses]
+# Broadly allow only well-known, permissive licenses.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+# Non-standard licenses are allowed only for the exact crate that uses them.
+exceptions = [
+    # CDLA-Permissive-2.0 covers the curated root certificate bundle shipped by
+    # `webpki-roots` (and its 0.26 line, pulled in by tokio-tungstenite).
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
+
+[licenses.private]
+# Workspace crates are unpublished and share the workspace `MIT` license; they
+# do not need their own license entries.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+# `ethers` was removed when the workspace moved to Alloy (see AGENTS.md); fail
+# the build if any part of it re-enters the dependency graph.
+deny = [
+    { name = "ethers" },
+    { name = "ethers-core" },
+    { name = "ethers-providers" },
+    { name = "ethers-signers" },
+    { name = "ethers-contract" },
+    { name = "ethers-middleware" },
+]
+# Workspace-internal dependencies are path-only, so Cargo records their
+# requirement as `*`. Allow wildcard path dependencies for them.
+wildcards = "allow"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io is trusted; no unknown registries or git sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
