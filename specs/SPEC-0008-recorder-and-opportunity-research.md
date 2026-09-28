@@ -312,11 +312,11 @@ Used by study O5 (cross-venue lead-lag) and as fair-value references in O1/O3.
 
 | `src` | URL | Subscribe | Payload fields used | Keepalive |
 |---|---|---|---|---|
-| `binance-usdm` | `wss://fstream.binance.com/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/…` | streams encoded in the URL | `s, b, B, a, A, T` (transaction time), `E` (event time) | server pings; reply with pong (tungstenite does this automatically) |
-| `binance-spot` | `wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/…` | in the URL | `s, b, B, a, A` (no exchange timestamp: rely on `t_ns`) | same |
-| `bybit-linear` | `wss://stream.bybit.com/v5/public/linear` | `{"op":"subscribe","args":["orderbook.1.BTCUSDT",…]}` | `ts`, `data.b`, `data.a` | send `{"op":"ping"}` every 20 s |
+| `binance-usdm` | `wss://fstream.binance.com/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/…` | streams encoded in the URL | `s, b, B, a, A`, `T` (transaction time ms), `E` (event time ms); also `e, u, ps, st` | server sends a ping frame every 3 min; pong within 10 min (unsolicited pongs allowed); 24 h connection cap. Tungstenite auto-pongs. |
+| `binance-spot` | `wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/…` | in the URL | `u, s, b, B, a, A` (no `e`/timestamps: rely on `t_ns`) | server sends a ping frame every 20 s; pong within 1 min. Tungstenite auto-pongs. |
+| `bybit-linear` | `wss://stream.bybit.com/v5/public/linear` | `{"op":"subscribe","args":["orderbook.1.BTCUSDT",…]}` | `ts`/`cts` (ms), `data.b`/`data.a` (level arrays; top of book is `data.b[0]`/`data.a[0]`) | send `{"op":"ping"}` every 20 s; level 1 is snapshot-only and re-sends a snapshot after 3 s idle. |
 
-All three ⚠ verify (V-2): URLs, field names, and whether each venue is reachable from the chosen host region. Symbols are lowercased for Binance URLs. Reuse `RawWsConn` from R-3; only the subscribe and keepalive hooks differ.
+**Verified 2026-09-28 (V-2):** URLs, payload fields, and keepalive above match the official docs and live probes (one connect + first message each). All three are reachable from the dev machine used for this check (connect 0.6–0.8 s). The intended recorder host region is not chosen yet (V-4), so geo-blocking there is untested. Symbols are lowercased for Binance URLs, uppercase for Bybit. Reuse `RawWsConn` from R-3; only the subscribe and keepalive hooks differ.
 
 ### 9.1 Options and equities sources (tasks R-11, R-12, R-13)
 
@@ -432,10 +432,12 @@ Market naming in every table: HL perps `BTC`, HIP-3 `xyz:TSLA`, HL spot as `BASE
 |---|---|---|---|
 | HL perp (main dex), base tier | 4.5 bps | 1.5 bps | known (SPEC-0003 §5) |
 | HL spot, base tier | 7.0 bps | 4.0 bps | known (SPEC-0003 §5) |
-| HL HIP-3 perps | ? | ? | ⚠ verify (V-3): deployer-set / multiplier |
-| Binance USDⓈ-M, VIP0 | 5.0 bps | 2.0 bps | ⚠ verify (V-2) |
-| Bybit linear, VIP0 | 5.5 bps | 2.0 bps | ⚠ verify (V-2) |
+| HL HIP-3 perps | `4.5 × scaleIfHip3 × growthModeScale` → **9.0** (no growth) or **0.9** (growth) at scale 1.0 | `1.5 × scaleIfHip3 × growthModeScale` → **3.0** / **0.3** | known (V-3): per asset from `meta(dex)` (`deployerFeeScale`, `growthMode`); `scaleIfHip3 = scale+1 if scale<1 else 2×scale`; `growthModeScale = 0.1`. See §15. |
+| Binance USDⓈ-M, VIP0 | 5.0 bps | 2.0 bps | known (V-2): 0.050% / 0.020% Regular/VIP0; ×0.9 if BNB fee deduction is on |
+| Bybit linear, VIP0 | 5.5 bps | 2.0 bps | known (V-2): 0.0550% / 0.0200% VIP0; rates are region-dependent |
 | HyperEVM DEX swap | pool fee (per pool in `hyperevm-pools.toml`) + gas in HYPE | — | V-6 |
+
+Spot pairs between two spot quote assets (e.g. `USDT0/USDC`) get **80% lower taker fee and 80% smaller maker rebate/volume contribution** (`scaleIfStablePair = 0.2`); that leg is 1.4 bps taker at base tier. **Aligned quote assets** (20% lower taker, 50% larger maker rebate, 20% more volume contribution) do **not** exist on mainnet per the HIP-3 deployer-actions doc (V-3; aligned status is not exposed by `spotMeta`). All values are base tier; staking/referral discounts are separate multipliers.
 
 Additional cost terms:
 
@@ -600,8 +602,8 @@ Each study below maps to one or more tasks (S-1…S-23, tiered in §14.0–14.1)
 | Item | Detail |
 |---|---|
 | Hypothesis | Tokens quoted in several stablecoins on HyperCore spot (e.g. `X/USDC` and `X/USDT0`) plus the stable-vs-stable pair (e.g. `USDT0/USDC`) form triangles whose product departs from 1 by more than three spot taker fees. |
-| Data | `bbo` for `spot:quotes`; `markets` (quote tokens come from `spotMeta`, never hardcoded ⚠ verify the quote-token set in V-3) |
-| Signal | For each triangle and both directions: `product = Π (1 / ask or bid)` along the cycle; `gross_bps = (product − 1) × 1e4`; subtract 3 × spot taker. |
+| Data | `bbo` for `spot:quotes`; `markets` (quote tokens come from `spotMeta`, never hardcoded; V-3 observed USDC/USDT0/USDH/USDE, see §15) |
+| Signal | For each triangle and both directions: `product = Π (1 / ask or bid)` along the cycle; `gross_bps = (product − 1) × 1e4`; subtract the three legs' spot taker fees (the stable-vs-stable leg pays 80% less; see §13.2). |
 | Size | Minimum top-of-book notional across the 3 legs |
 | Special checks | Spot books can be thin: report the size distribution; episodes under the $10 minimum order notional don't count. |
 
@@ -788,7 +790,7 @@ Prior: in finsnap's backtests across its whole universe, **Bollinger Reversion**
 | Item | Detail |
 |---|---|
 | Hypothesis | A permissionless spot quote asset is backed by a slashable 200k-HYPE stake (3-year lock), slashable on validator vote if `QUOTE/USDC` fails its size/band conditions for a majority of 1-second samples over three days; aligned quote assets add stronger conditions. That creates a forced peg defender. Trade a quote asset away from par, betting on defense before the slashing clock. Separately, the real fee schedule changes O2: stable-vs-stable spot pairs have **80% lower taker fees**, and aligned quote assets **20% lower taker / 50% better maker**. |
-| Data | Spot `bbo` for quote assets and their base pairs, `markets`/`spotMeta`, `spotMetaAndAssetCtxs`; derived `quote_peg (t_ns, quote_token, quote_usdc_px, depth_within_band)`; aligned fee flags |
+| Data | Spot `bbo` for quote assets and their base pairs, `markets`/`spotMeta`, `spotMetaAndAssetCtxs`; derived `quote_peg (t_ns, quote_token, quote_usdc_px, depth_within_band)`; aligned fee flags (⚠ `spotMeta` does not expose aligned status; see V-3 in §15) |
 | Signal | §13.3 on `QUOTE/USDC` vs 1 (episode beyond a buffer) plus quote-asset triangles using the **actual per-pair fee multiplier**; hold the depeg trade to par with a time stop before the 3-day window. |
 | Latency | Low/medium. |
 | Special checks | Slashing is discretionary (validator vote), so the defender is incentivized, not guaranteed; a depeg can persist days; quote-asset books are thin (report size); new quote assets may have no USDC pair. This **extends O2**; the new content is the slashing mechanism and the fee correction. **Could fail:** validators may not slash; the deployer may not be able to defend; thin books cap size. |
@@ -940,8 +942,8 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | ID | Title | Tier | Size | Depends on | Status |
 |---|---|---|---|---|---|
 | V-1 | Verify HL WS/REST facts | T1 | S | — | ✅ |
-| V-2 | Verify CEX endpoints, fields, fees, reachability | T1 | S | — | ☐ |
-| V-3 | Verify HIP-3 fees and the spot quote-token set | T1 | S | — | ☐ |
+| V-2 | Verify CEX endpoints, fields, fees, reachability | T1 | S | — | ✅ |
+| V-3 | Verify HIP-3 fees and the spot quote-token set | T1 | S | — | ✅ |
 | V-4 | Measure latency from candidate regions; pick a host | T1 | M | R-6 (`hl probe latency`) | ☐ |
 | V-5 | Verify HyperEVM facts (blocks, mempool, gas, Core↔EVM transfers) | T1 | M | — | ☐ |
 | V-6 | Build the HyperEVM pool list | T2 | M | V-5 | ☐ |
@@ -972,7 +974,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | P-5 | Report template + `RANKING.md` generator | T1 | S | P-4 | ☐ |
 | P-6 | Slow-signal backtester (§13.8) | T3 | M | P-2, P-3, T3 gate | ☐ |
 | P-7 | Read-only import of finsnap's `option_snapshots` history (for O9a) | T3 | S | P-2, V-9, T3 gate | ☐ |
-| B-1 | Tardis free-days downloader | T1 | S | P-1 | ☐ |
+| B-1 | Tardis free-days downloader | T1 | S | P-1 | ✅ |
 | B-2 | Tardis → §13.1 normalizer with symbol mapping | T1 | M | B-1, P-1 | ☐ |
 | B-3 | HL REST funding + candles backfill + daily 1m candle poller | T1 | S | P-2 | ☐ |
 | B-4 | Binance/Bybit public dumps | T1 | M | P-2 | ☐ |
@@ -1268,10 +1270,10 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 | HL `candleSnapshot` shape / max / weight | `[{t,T,s,i,o,c,h,l,v,n}]` (`t`/`T` ms; prices/`v` strings; `n` number). Only the most recent ~5000 candles per interval are retained and a call returns at most that (observed 1m = 5182 over ~3.6 d, 1h = 5003 over ~208 d); `startTime` honored within retention; weight `20 + 1 per 60 items returned`. | docs info-endpoint + rate-limits + observed live 2026-09-28 | 2026-09-28 | V-1 |
 | HL `spotMetaAndAssetCtxs` row alignment | Response `[meta, ctxs]`; `ctxs` is indexed by the spot pair `index` (`meta.universe[].index`), **not** by position in `meta.universe`: 330 universe rows vs 885 ctx rows (indices 0–884); `ctxs[i].coin` matched pair `index == i` with 0 mismatches. Join on `universe[].index`, never array position. | observed live 2026-09-28 (POST /info `{"type":"spotMetaAndAssetCtxs"}`) | 2026-09-28 | V-1 |
 | `chronyc -c tracking` column order | `RefID, RefName, Stratum, RefTime, SystemTime, LastOffset, RMSOffset, Frequency, ResidualFreq, Skew, RootDelay, RootDispersion, UpdateInterval, LeapStatus` (SystemTime is column **4**, not 3). | chrony 4.5 `chronyc(1)` + chrony `client.c` `process_cmd_tracking` | 2026-09-28 | V-1 |
-| Binance/Bybit endpoints + fields | | | | V-2 |
-| Binance/Bybit VIP0 fees | | | | V-2 |
-| HIP-3 fee model + per-dex values | `taker = base(4.5 bp) × scaleIfHip3 × growthMode(0.1 if on) × (1−referral) × aligned scaling`; `scaleIfHip3 = deployerFeeScale+1` if <1 else ×2; growth mode cuts all-in fees ≥ 90%. Would change O1/O10 verdicts. | https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions | 2026-09-28 | V-3 (ideas review, verify) |
-| Spot quote tokens | No longer just USDC/USDT0: permissionless quote assets (200k HYPE staked, slashable) and aligned quote assets exist, each with peg/liquidity conditions. | https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/permissionless-spot-quote-assets, https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/aligned-quote-assets | 2026-09-28 | V-3 (ideas review, verify) |
+| Binance/Bybit endpoints + fields | Confirmed. `binance-usdm` `wss://fstream.binance.com/stream?streams=<sym-lower>@bookTicker` (combined; payload wrapped `{"stream","data"}`), data `{e,u,s,ps,b,B,a,A,T,E,st}` with `T`/`E` in ms. `binance-spot` `wss://stream.binance.com:9443/stream?streams=<sym-lower>@bookTicker`, data `{u,s,b,B,a,A}` (no `e`/timestamps). `bybit-linear` `wss://stream.bybit.com/v5/public/linear`, subscribe `{"op":"subscribe","args":["orderbook.1.BTCUSDT"]}`; level 1 is snapshot-only, re-sent after 3 s idle, `{topic,ts,type,data:{s,b[[px,sz]],a[[px,sz]],u,seq},cts}`. All three reachable from the dev machine 2026-09-28 (one connect + first message each; connects 0.6–0.8 s). Host-region reachability untested (V-4 pending). | docs (Binance Connect + Individual Symbol Book Ticker; Bybit Connect + Orderbook) + observed live 2026-09-28 (WS connect to each endpoint + first message) | 2026-09-28 | V-2 |
+| Binance/Bybit VIP0 fees | Binance USDⓈ-M Regular/VIP0: taker **0.050%**, maker **0.020%** (5.0/2.0 bps); ×0.9 (0.045%/0.018%) if BNB fee deduction is on. Bybit linear VIP0: taker **0.0550%**, maker **0.0200%** (5.5/2.0 bps); Bybit notes actual rates are region-dependent. | https://www.binance.com/en/support/faq/detail/360033544231, https://www.binance.com/en/fee/futureFee, https://www.bybit.com/en/help-center/article/Trading-Fee-Structure | 2026-09-28 | V-2 |
+| HIP-3 fee model + per-dex values | `taker = base(4.5 bps) × scaleIfHip3 × growthModeScale × (1−referral)`; `maker = 1.5 bps × scaleIfHip3 × growthModeScale` (positive maker only); `scaleIfHip3 = scale+1 if scale<1 else 2×scale`; `growthModeScale = 0.1` when growth mode is on. `deployerFeeScale` ∈ [0,3] ([0,10) in growth), set per asset. Live 2026-09-28 `meta(dex)`: xyz, flx, vntl, km, abcd, cash, mkts, io use scale 1.0 → 9.0/3.0 bps (0.9/0.3 bps in growth mode); hyna scale 0.1111 → 5.0/1.67 bps; para scale 0.5 → 6.75/2.25 bps (one asset). ~75% of HIP-3 listings are in growth mode. Aligned-quote collateral scaling does not apply (no aligned quote assets on mainnet). Would change O1/O10 verdicts. | https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions + observed live 2026-09-28 (`POST /info {"type":"meta","dex":"<dex>"}`) | 2026-09-28 | V-3 |
+| Spot quote tokens | Live 2026-09-28 `spotMeta` quote tokens actually used: **USDC** (index 0, canonical; 313 pairs), **USDT0** (268; 5 pairs), **USDH** (360; 11), **USDE** (235; 1); there is no `USDT` token. Every token exposes `deployerTradingFeeShare` (all 0.0 for these); it redirects the deployer's cut and does not change the user's fee, and quote-token deployers cannot set it. Permissionless quote assets need 8 wei / 2 sz decimals, zero deployer share, 200k HYPE staked (slashable; USDC/USDT exempt) and peg/liquidity conditions; aligned quote assets (AQAv1) need 1M HYPE staked total. | https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/permissionless-spot-quote-assets, https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/aligned-quote-assets + observed live 2026-09-28 (`POST /info {"type":"spotMeta"}`) | 2026-09-28 | V-3 |
 | Latency by region (p50/p90) | | | | V-4 |
 | HyperEVM blocks / gas / mempool / transfers | Fast blocks ~1 s / 3 M gas, slow ~1 min / 30 M gas; EVM→Core transfers land in the same L1 block, Core→EVM waits for the next EVM block. Two on-chain L1 mempools, next 8 nonces/address, pruned > 1 day; priority fees (gossip and order) are **burned**. | https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/dual-block-architecture, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/interaction-timings, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/priority-fees | 2026-09-28 | V-5 (ideas review, verify) |
 | Data volume per stream (MB/h raw, zst) | | | | V-7 |
@@ -1283,7 +1285,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 | HIP-3 stock-perp mechanics per dex | | | | V-12 |
 | finsnap `option_snapshots` coverage; options-history vendors; owner decision | | | | V-13 |
 | finsnap history imported (range, symbols) | | | | P-7 |
-| Spot quote-asset fee multipliers (ideas review) | Spot pairs between two quote assets have **80% lower taker fees**; aligned quote assets 20% lower taker / 50% better maker rebate. Changes O2's triangle threshold. | https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees, https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/aligned-quote-assets | 2026-09-28 | V-3 (ideas review, verify) |
+| Spot quote-asset fee multipliers | Spot pairs between two spot quote assets (`isStablePair`, e.g. `USDT0/USDC`) get **80% lower taker fee and 80% smaller maker rebates/volume contribution** (`scaleIfStablePair = 0.2`) → 1.4 bps taker at base. Aligned quote assets (AQAv1) get 20% lower taker, 50% larger maker rebate, 20% more volume contribution; AQAv2 has no fee benefit. The HIP-3 deployer-actions doc states there are currently **no aligned quote assets on mainnet** (aligned status is not exposed by `spotMeta`), so the aligned discount does not apply today. Changes O2's triangle threshold. | https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees, https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/aligned-quote-assets, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions | 2026-09-28 | V-3 |
 | Funding mechanics (ideas review) | Paid hourly at 1/8 of the computed 8 h rate; premium sampled every 5 s; cap **4%/hour**; payment = `position_size × oracle_price × rate` (oracle notional, not mark). O14 depends on this. | https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding | 2026-09-28 | V-3 (ideas review, verify) |
 | `perpDexs` funding fields (ideas review) | Returns `assetToStreamingOiCap` and `assetToFundingMultiplier`; deployers can set multipliers 0–10, interest ±1%/8 h, and clamps. | https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions | 2026-09-28 | V-3 (ideas review, verify) |
 | HL documented latency (ideas review) | Co-located median end-to-end 0.2 s, p99 0.9 s; ALO/cancel end-to-end ~380 ms (~2 blocks); write priority ≈45 ms per 1 bp; read gossip priority ≈25 ms per slot. | https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/optimizing-latency, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/priority-fees | 2026-09-28 | V-4 (ideas review, verify) |
@@ -1336,6 +1338,6 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
     - HyperEVM read precompiles on **mainnet** (docs describe testnet) ⚠ verify; gates O22.
     - HYPE on-chain option venues (Derive, Hypersurface, opt.fun, D2 HYPE++ vault) are third-party ⚠ verify; gates O23.
     - Whether HL's June-2026 WS throttling also changed the official S3 archive cadence is unverified.
-    - Binance/Bybit VIP0 fees and `predictedFundings` timing/weights remain open (V-2/V-3).
+    - ~~Binance/Bybit VIP0 fees~~ **Resolved 2026-09-28 (V-2):** 5.0/2.0 bps (Binance USDⓈ-M) and 5.5/2.0 bps (Bybit linear) at VIP0; see §15. `predictedFundings` timing/weights remain open (V-1 settled the shape; O7).
     - The docs state HyperCore order sequencing but not an explicit EVM block ordering rule; keep O8 Q2 open (source: `hyperliquid.gitbook.io/hyperliquid-docs/hypercore/order-book`).
     - §B claims already settled by V-1 (trades.users, `l2Book` fast mode, `candleSnapshot` retention, spot ctx channel, WS idle close, `chronyc` columns): no action; see §15.
