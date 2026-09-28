@@ -15,7 +15,47 @@ use std::thread::{self, JoinHandle};
 use tracing::{debug, error, warn};
 
 use super::{Db, FillRecord, FundingRecord, OpenOrderRecord, OrderRecord, PositionRecord};
+use crate::clock::{Clock, SystemClock};
 use crate::error::Result;
+
+/// Minimum interval between rate-limited logs for a full/closed write queue.
+const QUEUE_WARN_INTERVAL_MS: u64 = 10_000;
+
+/// Rate limiter for the queue-full/closed logs: emits at most one message per
+/// interval and reports how many were suppressed since the last one.
+#[derive(Debug)]
+struct WarnThrottle {
+    interval_ms: u64,
+    last_ms: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl WarnThrottle {
+    fn new(interval_ms: u64) -> Self {
+        Self {
+            interval_ms,
+            last_ms: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns `Some(suppressed)` when a message should be logged now, else
+    /// `None` after counting this call as suppressed.
+    fn should_log(&self, now_ms: u64) -> Option<u64> {
+        let last = self.last_ms.load(Ordering::Relaxed);
+        if now_ms >= last.saturating_add(self.interval_ms)
+            && self
+                .last_ms
+                .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            Some(self.suppressed.swap(0, Ordering::Relaxed))
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
 
 /// A command processed by the single writer thread.
 #[derive(Debug)]
@@ -90,6 +130,9 @@ pub struct DbWriter {
     tx: SyncSender<WriteCmd>,
     handle: Option<JoinHandle<()>>,
     nonce_hwm: Arc<AtomicU64>,
+    /// Rate-limits the queue-full/closed logs so a persistent failure cannot
+    /// flood the log on the hot path.
+    queue_warn: WarnThrottle,
 }
 
 impl DbWriter {
@@ -115,6 +158,7 @@ impl DbWriter {
             tx,
             handle: Some(handle),
             nonce_hwm,
+            queue_warn: WarnThrottle::new(QUEUE_WARN_INTERVAL_MS),
         }
     }
 
@@ -130,14 +174,18 @@ impl DbWriter {
         match self.tx.try_send(cmd) {
             Ok(()) => true,
             Err(TrySendError::Full(cmd)) => {
-                warn!(
-                    kind = cmd_kind(&cmd),
-                    "db writer queue full; dropping write"
-                );
+                if let Some(suppressed) = self.queue_warn.should_log(SystemClock.now_ms()) {
+                    warn!(
+                        kind = cmd_kind(&cmd),
+                        suppressed, "db writer queue full; dropping write"
+                    );
+                }
                 false
             }
             Err(TrySendError::Disconnected(_)) => {
-                error!("db writer thread has stopped");
+                if let Some(suppressed) = self.queue_warn.should_log(SystemClock.now_ms()) {
+                    error!(suppressed, "db writer thread has stopped");
+                }
                 false
             }
         }
@@ -361,6 +409,19 @@ mod tests {
         assert_eq!(hwm.load(Ordering::Acquire), 1_700_000_000_500);
         let db = Db::open(&path).unwrap();
         assert_eq!(db.nonce_last().unwrap(), Some(1_700_000_000_500));
+    }
+
+    #[test]
+    fn warn_throttle_logs_once_per_interval_and_counts_suppressed() {
+        let throttle = WarnThrottle::new(10_000);
+        // The first message logs immediately with nothing suppressed.
+        assert_eq!(throttle.should_log(1_000_000), Some(0));
+        // Within the interval, messages are counted, not logged.
+        assert_eq!(throttle.should_log(1_000_001), None);
+        assert_eq!(throttle.should_log(1_009_999), None);
+        // At the interval boundary the next message logs the suppressed count.
+        assert_eq!(throttle.should_log(1_010_000), Some(2));
+        assert_eq!(throttle.should_log(1_010_001), None);
     }
 
     #[test]

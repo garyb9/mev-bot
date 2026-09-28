@@ -540,8 +540,20 @@ impl WriteCore {
 
     /// Operator escape hatch for a corrupt persisted nonce: abandon history and
     /// resume from the wall clock, clearing the fail-closed state (SPEC-0002
-    /// H-6). Intentionally allowed to lower the persisted value.
+    /// H-6). Intentionally allowed to lower the persisted value, so it is
+    /// **gated on the boot corruption flag**: while that flag is clear, `prepare`
+    /// may have handed out nonces and a reset could force a reuse.
     pub async fn reset_nonce(&self) -> Result<()> {
+        if !self
+            .nonce_corrupt
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Config(
+                "refusing to reset the nonce: it is not flagged corrupt, so nonces \
+                 may already have been issued; restart to recover instead"
+                    .into(),
+            ));
+        }
         let now = self.clock.now_ms();
         self.rebase_nonce(now).await
     }
@@ -549,22 +561,40 @@ impl WriteCore {
     /// Write `restore` (and a lease ahead of it) to the durable store and rebase
     /// the in-memory manager and lease. The synchronous write is safe here: this
     /// is the explicit operator path, never the hot path.
+    ///
+    /// The durable atomic is lowered under the same lock the writer thread takes
+    /// to commit a nonce, so the database write and the atomic cannot be
+    /// observed apart: no writer commit interleaves between them.
     async fn rebase_nonce(&self, restore: u64) -> Result<()> {
         let now = self.clock.now_ms();
         let horizon = restore.max(now.saturating_add(self.nonce_lease_ms));
+        // Replace the in-memory manager first, so once the corrupt flag clears
+        // no prepare can still read the old (corrupt) high-water mark.
+        let mut manager = self.nonce.lock().await;
+        *manager = NonceManager::resume(restore);
         if let Some(db) = &self.nonce_db {
             let guard = db
                 .lock()
                 .map_err(|_| Error::Config("db lock poisoned".into()))?;
             guard.set_nonce_last(horizon)?;
-        }
-        *self.nonce.lock().await = NonceManager::resume(restore);
-        if let Some(store) = &self.nonce_store {
+            if let Some(store) = &self.nonce_store {
+                store.rebase(horizon, now);
+            }
+        } else if let Some(store) = &self.nonce_store {
             store.rebase(horizon, now);
         }
+        drop(manager);
         self.nonce_corrupt
             .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// Test-only: the confirmed durable and requested nonce horizons.
+    #[cfg(test)]
+    pub(crate) fn nonce_marks(&self) -> Option<(u64, u64)> {
+        self.nonce_store
+            .as_ref()
+            .map(|store| (store.durable(), store.requested()))
     }
 
     /// The current nonce high-water mark (for persistence and tests).
@@ -573,13 +603,25 @@ impl WriteCore {
     }
 
     /// Resync the nonce after a stale/duplicate/recent-window rejection.
-    pub async fn heal_nonce(&self) -> u64 {
+    ///
+    /// Errors while the corrupt fail-closed state is set: the resync path would
+    /// advance from a value known to be corrupt, so an operator reset is the only
+    /// correct recovery.
+    pub async fn heal_nonce(&self) -> Result<u64> {
+        if self
+            .nonce_corrupt
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::NotSent(
+                "persisted nonce is corrupt; an operator must reset it before resyncing".into(),
+            ));
+        }
         let now = self.clock.now_ms();
         let nonce = self.nonce.lock().await.on_reject(now);
         if let Some(store) = &self.nonce_store {
             store.force(nonce, now);
         }
-        nonce
+        Ok(nonce)
     }
 
     /// Sign the next envelope for `action`, gated and persisted for `live`.
@@ -603,7 +645,21 @@ impl WriteCore {
             ));
         }
         let now = self.clock.now_ms();
-        let nonce = self.nonce.lock().await.next(now);
+        let nonce = match self.nonce.lock().await.next(now) {
+            Ok(nonce) => nonce,
+            Err(err) => {
+                // The next candidate is beyond the venue's future window
+                // (corruption or a large backwards clock step). Fail closed and
+                // surface it like the boot corruption rule; the condition clears
+                // once the clock catches up.
+                metrics::counter!(mev_metrics::names::NONCE_RESUME_CORRUPT_TOTAL).increment(1);
+                tracing::error!(
+                    now,
+                    "next nonce is beyond the venue future window; refusing to send"
+                );
+                return Err(err);
+            }
+        };
         let started = Instant::now();
         let built = build_request(
             action,
@@ -621,8 +677,14 @@ impl WriteCore {
         }
         // Off the hot path: at most an atomic read and a `Copy` enqueue. The
         // write-behind lease guarantees a crash cannot reuse this nonce.
-        if let Some(store) = &self.nonce_store {
-            store.cover(nonce, now)?;
+        if let Some(store) = &self.nonce_store
+            && let Err(err) = store.cover(nonce, now)
+        {
+            // The nonce is not covered, so it will not be sent: free it so a
+            // stall does not burn through nonce space (cheap: the failure path
+            // only, and a no-op if a later prepare advanced past it).
+            self.nonce.lock().await.release(nonce);
+            return Err(err);
         }
         Ok(Prepared::Send(Box::new(request)))
     }
@@ -770,7 +832,7 @@ impl HttpExchange {
     }
 
     /// Resync the nonce after a stale/duplicate/recent-window rejection.
-    pub async fn heal_nonce(&self) -> u64 {
+    pub async fn heal_nonce(&self) -> Result<u64> {
         self.core.heal_nonce().await
     }
 
@@ -1361,22 +1423,105 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_loop_never_reuses_a_nonce() {
+    async fn reset_nonce_is_refused_while_not_corrupt() {
         let clock = Arc::new(FixedClock::new(1_000_000));
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let core = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_clock(clock)
+            .with_nonce_db(db)
+            .unwrap();
+        // Not corrupt: nonces may already have been issued, so a reset (which
+        // may lower the value) could force a reuse and must be refused.
+        match core.reset_nonce().await {
+            Err(Error::Config(message)) => {
+                assert!(message.contains("not flagged corrupt"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // The refusal must not disturb the send path.
+        assert!(matches!(
+            core.prepare(&simple_action()).await.unwrap(),
+            Prepared::Send(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn heal_nonce_is_refused_while_corrupt() {
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        db.lock()
+            .unwrap()
+            .set_nonce_last(1_000_000 + VENUE_MAX_FUTURE_MS + 1)
+            .unwrap();
+        let core = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_clock(clock)
+            .with_nonce_db(db)
+            .unwrap();
+        match core.heal_nonce().await {
+            Err(Error::NotSent(message)) => assert!(message.contains("corrupt"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_lowers_the_durable_and_requested_marks_together() {
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let corrupt = 1_000_000 + VENUE_MAX_FUTURE_MS + 1;
+        db.lock().unwrap().set_nonce_last(corrupt).unwrap();
+        let core = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_clock(clock)
+            .with_nonce_lease(100)
+            .with_nonce_db(db.clone())
+            .unwrap();
+        // At boot the in-memory marks are the corrupt value and nothing was
+        // sent, so the reset is allowed.
+        assert_eq!(core.nonce_marks(), Some((corrupt, corrupt)));
+        core.reset_nonce().await.unwrap();
+        // The database, the durable atomic, and the requested horizon all move
+        // together to the new lease: no stale higher request survives.
+        assert_eq!(core.nonce_marks(), Some((1_000_100, 1_000_100)));
+        assert_eq!(db.lock().unwrap().nonce_last().unwrap(), Some(1_000_100));
+        assert!(matches!(
+            core.prepare(&simple_action()).await.unwrap(),
+            Prepared::Send(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn crash_loop_never_reuses_a_nonce() {
+        use std::sync::atomic::AtomicU64;
+
+        // Deterministic and fast: a test channel stands in for the writer, the
+        // clock advances a lease per boot, and the write-behind is never
+        // committed (the worst case: every write-behind write is lost in the
+        // crash). The lease is small so the test does a handful of signs, not
+        // thousands.
+        let lease_ms = 4u64;
+        let mut restored = 1_000_000u64;
         let mut sent: Vec<u64> = Vec::new();
-        for _ in 0..100 {
+        for run in 0..100u64 {
+            let now = 1_000_000 + run * lease_ms;
+            let clock = Arc::new(FixedClock::new(now));
+            // The boot prime `max(restored, now + lease)` is written
+            // synchronously and is what the next boot restores.
+            let horizon = restored.max(now + lease_ms);
+            let durable = Arc::new(AtomicU64::new(0));
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
             let core = WriteCore::new(Mode::Live, Some(signer()))
                 .unwrap()
                 .with_clock(clock.clone())
-                .with_nonce_lease(100)
-                .with_nonce_db(db.clone())
-                .unwrap();
-            let start = db.lock().unwrap().nonce_last().unwrap().unwrap_or(0);
-            let mut run_sends = 0u64;
-            // A send each run; the first attempt after a fast restart may be
-            // refused until the urgent refresh lands.
-            for _ in 0..160 {
+                .with_nonce_lease(lease_ms)
+                .with_test_nonce_store(
+                    NonceLease::with_channel(tx, horizon, lease_ms, durable, now),
+                    restored,
+                );
+            // Enough attempts to spend the boot headroom and hit the
+            // write-behind/refusal path at least once.
+            for _ in 0..(lease_ms + 2) {
                 match core.prepare(&simple_action()).await {
                     Ok(Prepared::Send(request)) => {
                         assert!(
@@ -1385,69 +1530,78 @@ mod tests {
                             request.nonce
                         );
                         sent.push(request.nonce);
-                        run_sends += 1;
                     }
                     Ok(Prepared::DryRun(_)) => panic!("live mode must send"),
                     Err(Error::NotSent(_)) => {}
                     Err(other) => panic!("unexpected error: {other:?}"),
                 }
             }
-            drop(core); // drains and commits
-            let persisted = db.lock().unwrap().nonce_last().unwrap().unwrap_or(0);
-            assert!(persisted >= start, "the persisted mark regressed");
-            // Growth is driven by the sends in this run plus at most a lease of
-            // write-ahead, never a runaway.
-            assert!(
-                persisted <= start + run_sends + 2 * 100,
-                "persisted grew to {persisted} from {start} with {run_sends} sends"
-            );
+            // Crash: the next boot restores exactly the prime written above.
+            restored = horizon;
         }
-        assert!(!sent.is_empty());
+        assert!(!sent.is_empty(), "each boot must send from its prime");
     }
 
     #[tokio::test]
     async fn restart_after_a_committed_refresh_never_reuses() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
         let clock = Arc::new(FixedClock::new(1_000_000));
-        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let lease_ms = 100u64;
+        let restored = 1_000_000u64;
+        let horizon = restored.max(1_000_000 + lease_ms);
+        let durable = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let mut sent = Vec::new();
         {
             let core = WriteCore::new(Mode::Live, Some(signer()))
                 .unwrap()
                 .with_clock(clock.clone())
-                .with_nonce_lease(100)
-                .with_nonce_db(db.clone())
-                .unwrap();
-            let prime = db.lock().unwrap().nonce_last().unwrap().unwrap();
+                .with_nonce_lease(lease_ms)
+                .with_test_nonce_store(
+                    NonceLease::with_channel(tx, horizon, lease_ms, durable.clone(), 1_000_000),
+                    restored,
+                );
             for _ in 0..160 {
-                if let Ok(Prepared::Send(request)) = core.prepare(&simple_action()).await {
-                    sent.push(request.nonce);
+                match core.prepare(&simple_action()).await {
+                    Ok(Prepared::Send(request)) => sent.push(request.nonce),
+                    Ok(Prepared::DryRun(_)) => panic!("live mode must send"),
+                    Err(Error::NotSent(_)) => {}
+                    Err(other) => panic!("unexpected error: {other:?}"),
                 }
             }
-            // Wait for a refresh to commit past the startup prime.
-            let mut persisted = prime;
-            for _ in 0..2_000 {
-                persisted = db.lock().unwrap().nonce_last().unwrap().unwrap();
-                if persisted > prime {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-            assert!(persisted > prime, "a refresh should have committed");
         }
+        // Explicitly commit the highest queued refresh, as the writer thread
+        // does after a successful SQLite write.
+        let mut committed = horizon;
+        while let Ok(value) = rx.try_recv() {
+            committed = committed.max(value);
+        }
+        assert!(committed > horizon, "a refresh must have been enqueued");
+        durable.fetch_max(committed, Ordering::AcqRel);
         let max_sent = *sent.iter().max().unwrap();
-        let restored = db.lock().unwrap().nonce_last().unwrap().unwrap();
         assert!(
-            restored > max_sent,
-            "the persisted horizon {restored} must cover every sent nonce, max {max_sent}"
+            committed > max_sent,
+            "the committed horizon {committed} must cover every sent nonce, max {max_sent}"
         );
 
-        // Restart in the same frozen millisecond.
+        // Restart in the same frozen millisecond, restoring the committed mark.
+        let durable2 = Arc::new(AtomicU64::new(0));
+        let (tx2, rx2) = std::sync::mpsc::sync_channel(64);
         let restarted = WriteCore::new(Mode::Live, Some(signer()))
             .unwrap()
             .with_clock(clock)
-            .with_nonce_lease(100)
-            .with_nonce_db(db.clone())
-            .unwrap();
+            .with_nonce_lease(lease_ms)
+            .with_test_nonce_store(
+                NonceLease::with_channel(
+                    tx2,
+                    committed.max(1_000_000 + lease_ms),
+                    lease_ms,
+                    durable2.clone(),
+                    1_000_000,
+                ),
+                committed,
+            );
         let mut next = Vec::new();
         for _ in 0..160 {
             match restarted.prepare(&simple_action()).await {
@@ -1456,8 +1610,15 @@ mod tests {
                 Err(Error::NotSent(_)) => {}
                 Err(other) => panic!("unexpected error: {other:?}"),
             }
+            // Explicitly commit any queued refresh (the writer thread's job).
+            while let Ok(value) = rx2.try_recv() {
+                durable2.fetch_max(value, Ordering::AcqRel);
+            }
         }
-        assert!(!next.is_empty());
+        assert!(
+            !next.is_empty(),
+            "the restarted instance must resume sending"
+        );
         for nonce in next {
             assert!(
                 nonce > max_sent,

@@ -200,7 +200,7 @@ impl WsExchange {
     }
 
     /// Resync the nonce after a stale/duplicate/recent-window rejection.
-    pub async fn heal_nonce(&self) -> u64 {
+    pub async fn heal_nonce(&self) -> Result<u64> {
         self.core.heal_nonce().await
     }
 

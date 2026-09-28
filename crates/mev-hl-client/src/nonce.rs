@@ -1,15 +1,17 @@
-//! Nonce generation with self-healing (SPEC-0002 §5).
+//! Nonce generation with monotonic guarantees (SPEC-0002 §5).
 //!
 //! HyperCore nonces are client-supplied millisecond timestamps that must be
 //! strictly increasing per agent wallet and within a recent window; the venue
 //! validates but never assigns them. Because only monotonicity matters (not
 //! contiguity), the failure modes are narrow and recoverable:
 //!
-//! - **Too far in the future** — corruption or a backward clock step pushed
-//!   `last` beyond the venue's acceptance window. Such a value cannot have been
-//!   accepted, so it is safe to reclaim and resync to the wall clock ([`RESET`]).
 //! - **Behind / duplicate (stale, recent-window)** — the venue already saw a
 //!   higher nonce. [`NonceManager::on_reject`] resyncs to the clock and advances.
+//! - **Far future** — the next candidate would be beyond the venue's future
+//!   window (corruption, or a large backward clock step). A nonce at or below
+//!   one already issued is never handed out, so the manager **fails closed**
+//!   ([`VENUE_MAX_FUTURE_MS`]) instead of clamping down; the condition clears
+//!   once the clock catches up.
 //!
 //! Durability is write-behind ([`NonceLease`]): a high-water mark a *lease*
 //! ahead of what is sent is persisted off the hot path, at most once per second,
@@ -26,15 +28,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mev_core::db::writer::{DbWriter, WriteCmd};
 use mev_core::error::{Error, Result};
 
-/// Default maximum a nonce may run ahead of the wall clock. Beyond this the
-/// value is treated as corrupt and reclaimed. Conservative versus the venue's
-/// window; tune with [`NonceManager::with_max_future_drift`].
-pub const DEFAULT_MAX_FUTURE_DRIFT_MS: u64 = 60_000;
-
 /// The venue's outer nonce window on the future side (H-9: a nonce must be
-/// within `T + 1 day`). A persisted value past this cannot be one this bot
-/// legitimately sent, so it is treated as corruption and the writer fails
-/// closed. Set an hour under the venue limit to leave headroom for clock skew.
+/// within `T + 1 day`). A next candidate past this cannot be accepted by the
+/// venue, so the manager fails closed rather than clamping down. Set an hour
+/// under the venue limit to leave headroom for clock skew.
 pub const VENUE_MAX_FUTURE_MS: u64 = 86_400_000 - 3_600_000;
 
 /// Default look-ahead (in nonce space) persisted ahead of the last sent nonce
@@ -59,28 +56,6 @@ pub const NONCE_WARN_INTERVAL_MS: u64 = 1_000;
 /// most once per second.
 pub const NONCE_WRITE_QUEUE: usize = 64;
 
-/// Why a nonce was reset, for metrics/logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResetReason {
-    /// `last` had run implausibly far ahead of the clock.
-    FutureDrift,
-    /// The venue rejected a nonce as stale/duplicate/recent-window.
-    Rejected,
-    /// An operator forced a resync via the escape hatch.
-    Manual,
-}
-
-impl ResetReason {
-    /// Stable label for metrics.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ResetReason::FutureDrift => "future_drift",
-            ResetReason::Rejected => "rejected",
-            ResetReason::Manual => "manual",
-        }
-    }
-}
-
 /// Current wall-clock time in milliseconds.
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -89,15 +64,14 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Monotonic nonce source with self-healing.
+/// Monotonic nonce source.
+///
+/// The manager never hands out a nonce at or below the last one it handed out
+/// (or resumed from), even under a backwards clock step; a candidate past the
+/// venue's future window fails closed instead.
 #[derive(Debug, Clone)]
 pub struct NonceManager {
     last: u64,
-    /// Highest value known to have been legitimate (restored from the durable
-    /// lease). The future-drift guard measures against `max(now, floor)` so a
-    /// trusted write-behind restore is never mistaken for corruption.
-    floor: u64,
-    max_future_drift_ms: u64,
     resets: u64,
 }
 
@@ -110,18 +84,13 @@ impl Default for NonceManager {
 impl NonceManager {
     /// A fresh manager with no history.
     pub fn new() -> Self {
-        Self {
-            last: 0,
-            floor: 0,
-            max_future_drift_ms: DEFAULT_MAX_FUTURE_DRIFT_MS,
-            resets: 0,
-        }
+        Self { last: 0, resets: 0 }
     }
 
-    /// Restore the persisted high-water mark after a restart.
+    /// Restore an untrusted persisted high-water mark after a restart.
     ///
-    /// The value is treated as untrusted: the future-drift guard may reclaim it
-    /// if it is implausibly ahead of the clock.
+    /// The value is never lowered, but a candidate past the venue's future
+    /// window fails closed (see [`Self::next`]).
     pub fn restore(last: u64) -> Self {
         Self {
             last,
@@ -131,21 +100,13 @@ impl NonceManager {
 
     /// Resume from a trusted write-behind high-water mark (SPEC-0002 H-6).
     ///
-    /// Unlike [`Self::restore`], the restored value also becomes the drift
-    /// guard's floor: the persisted lease is intentionally ahead of the clock
-    /// and must not be reclaimed as if it were corrupt.
+    /// Equivalent to [`Self::restore`] now that the future-drift reclaim is
+    /// gone; kept as the distinct name for the trusted boot path.
     pub fn resume(hwm: u64) -> Self {
         Self {
             last: hwm,
-            floor: hwm,
             ..Self::new()
         }
-    }
-
-    /// Override the future-drift guard.
-    pub fn with_max_future_drift(mut self, ms: u64) -> Self {
-        self.max_future_drift_ms = ms;
-        self
     }
 
     /// The highest nonce handed out (persist this before sending).
@@ -158,17 +119,34 @@ impl NonceManager {
         self.resets
     }
 
-    /// Reserve the next nonce: strictly greater than the last, never behind the
-    /// clock, and never more than the drift guard ahead of it.
-    pub fn next(&mut self, now_ms: u64) -> u64 {
+    /// Reserve the next nonce: strictly greater than the last and never behind
+    /// the clock.
+    ///
+    /// Fails closed when the candidate would be beyond the venue's future window
+    /// ([`VENUE_MAX_FUTURE_MS`]): that can only mean the clock stepped far back
+    /// or the current value is corrupt, and no nonce at or below one already
+    /// handed out may be issued. The value is never clamped down.
+    pub fn next(&mut self, now_ms: u64) -> Result<u64> {
         let candidate = self.last.saturating_add(1).max(now_ms);
-        let baseline = now_ms.max(self.floor);
-        if candidate > baseline.saturating_add(self.max_future_drift_ms) {
-            // `last` is implausibly far ahead; the venue cannot have accepted it.
-            return self.reclaim(baseline, ResetReason::FutureDrift);
+        if candidate > now_ms.saturating_add(VENUE_MAX_FUTURE_MS) {
+            return Err(Error::NotSent(format!(
+                "next nonce {candidate} is beyond the venue future window \
+                 ({now_ms} + {VENUE_MAX_FUTURE_MS} ms); refusing to send"
+            )));
         }
         self.last = candidate;
-        candidate
+        Ok(candidate)
+    }
+
+    /// Undo a reservation from [`Self::next`] that will not be sent, so a
+    /// refused prepare does not burn a nonce (SPEC-0002 H-6).
+    ///
+    /// Only valid under the same lock that produced `nonce`, and only when
+    /// nothing has advanced past it; otherwise it is a no-op.
+    pub(crate) fn release(&mut self, nonce: u64) {
+        if self.last == nonce {
+            self.last = nonce.saturating_sub(1);
+        }
     }
 
     /// Resync after a stale/duplicate/recent-window rejection and return the
@@ -181,14 +159,14 @@ impl NonceManager {
         candidate
     }
 
-    /// Operator escape hatch: abandon history and resume from the wall clock.
+    /// Operator escape hatch for a **corrupt** persisted value: abandon history
+    /// and resume from the wall clock.
+    ///
+    /// May lower `last` (the corrupt value was never issued by this bot), so it
+    /// must only be reachable through the gated operator reset path, never from
+    /// the normal send path.
     pub fn reset(&mut self, now_ms: u64) -> u64 {
-        self.floor = now_ms;
-        self.reclaim(now_ms, ResetReason::Manual)
-    }
-
-    fn reclaim(&mut self, baseline: u64, _reason: ResetReason) -> u64 {
-        let candidate = baseline.saturating_add(1);
+        let candidate = now_ms.saturating_add(1);
         self.last = candidate;
         self.resets += 1;
         candidate
@@ -346,21 +324,25 @@ impl NonceLease {
     }
 
     fn maybe_request(&self, nonce: u64, now_ms: u64, durable: u64) {
-        // Coalesce to at most one write per interval, unless durability is at
-        // risk and we must extend the horizon immediately.
+        // A refresh that has been requested but not yet confirmed durable is
+        // pending; retry it on the short interval rather than piling more
+        // enqueues on top, even when the remaining headroom is low. Only an
+        // urgent request with nothing outstanding is sent immediately.
+        let pending = self.enqueue_failed.load(Ordering::Acquire)
+            || self.requested.load(Ordering::Acquire) > durable;
         let urgent = nonce.saturating_add(self.lease / 4) >= durable;
-        if !urgent {
-            let pending = self.enqueue_failed.load(Ordering::Acquire)
-                || self.requested.load(Ordering::Acquire) > durable;
-            let interval = if pending {
-                NONCE_RETRY_INTERVAL_MS
-            } else {
-                NONCE_WRITE_INTERVAL_MS
-            };
-            let last = self.last_attempt_ms.load(Ordering::Relaxed);
-            if now_ms < last.saturating_add(interval) {
-                return;
-            }
+        if urgent && !pending {
+            self.request(nonce, now_ms);
+            return;
+        }
+        let interval = if pending {
+            NONCE_RETRY_INTERVAL_MS
+        } else {
+            NONCE_WRITE_INTERVAL_MS
+        };
+        let last = self.last_attempt_ms.load(Ordering::Relaxed);
+        if now_ms < last.saturating_add(interval) {
+            return;
         }
         self.request(nonce, now_ms);
     }
@@ -418,35 +400,66 @@ mod tests {
     #[test]
     fn monotonic_within_same_millisecond() {
         let mut nonce = NonceManager::new();
-        let a = nonce.next(1_000);
-        let b = nonce.next(1_000);
-        let c = nonce.next(1_000);
+        let a = nonce.next(1_000).unwrap();
+        let b = nonce.next(1_000).unwrap();
+        let c = nonce.next(1_000).unwrap();
         assert_eq!((a, b, c), (1_000, 1_001, 1_002));
     }
 
     #[test]
     fn follows_wall_clock_when_it_advances() {
         let mut nonce = NonceManager::new();
-        assert_eq!(nonce.next(1_000), 1_000);
-        assert_eq!(nonce.next(5_000), 5_000);
+        assert_eq!(nonce.next(1_000).unwrap(), 1_000);
+        assert_eq!(nonce.next(5_000).unwrap(), 5_000);
         assert_eq!(nonce.last(), 5_000);
     }
 
     #[test]
     fn clock_regression_never_reuses() {
         let mut nonce = NonceManager::new();
-        let a = nonce.next(10_000);
-        let b = nonce.next(9_000); // clock stepped back
+        let a = nonce.next(10_000).unwrap();
+        let b = nonce.next(9_000).unwrap(); // clock stepped back
         assert!(b > a, "{b} must exceed {a}");
     }
 
     #[test]
-    fn far_future_last_self_heals() {
-        // Simulate corruption: `last` is a day ahead of the clock.
-        let mut nonce = NonceManager::restore(86_400_000).with_max_future_drift(60_000);
-        let healed = nonce.next(1_000_000);
-        assert_eq!(healed, 1_000_001);
-        assert_eq!(nonce.resets(), 1);
+    fn clock_step_back_never_lowers_a_running_nonce() {
+        let now = 1_000_000_000_000u64;
+        let mut nonce = NonceManager::new();
+        let a = nonce.next(now).unwrap();
+        // A 10-minute step back must not lower the next nonce.
+        let b = nonce.next(now - 600_000).unwrap();
+        assert!(b > a, "{b} must exceed {a}");
+        assert_eq!(nonce.last(), b);
+        // A step back beyond the venue's future window fails closed, unchanged.
+        let err = nonce.next(now - VENUE_MAX_FUTURE_MS - 1).unwrap_err();
+        assert!(matches!(err, Error::NotSent(_)), "got {err:?}");
+        assert_eq!(nonce.last(), b, "a refusal must not change the last nonce");
+    }
+
+    #[test]
+    fn far_future_last_fails_closed() {
+        // Simulate corruption: `last` is beyond the venue's future window.
+        let now = 1_000_000u64;
+        let mut nonce = NonceManager::restore(now + VENUE_MAX_FUTURE_MS + 1);
+        let err = nonce.next(now).unwrap_err();
+        assert!(matches!(err, Error::NotSent(_)), "got {err:?}");
+        assert_eq!(nonce.last(), now + VENUE_MAX_FUTURE_MS + 1);
+    }
+
+    #[test]
+    fn release_undoes_an_unsent_reservation() {
+        let mut nonce = NonceManager::restore(1_000);
+        let reserved = nonce.next(1_500).unwrap();
+        assert_eq!(reserved, 1_500);
+        nonce.release(reserved);
+        assert_eq!(nonce.last(), 1_499);
+        // The next reservation is still strictly above everything sent.
+        assert_eq!(nonce.next(1_500).unwrap(), 1_500);
+        // A stale release cannot drop below a later reservation.
+        let later = nonce.next(1_500).unwrap();
+        nonce.release(reserved);
+        assert_eq!(nonce.last(), later);
     }
 
     #[test]
@@ -466,18 +479,17 @@ mod tests {
     }
 
     #[test]
-    fn resume_trusts_the_lease_ahead_of_the_clock() {
-        // The persisted lease is intentionally ahead; the guard must not reclaim
-        // it as corruption.
-        let mut nonce = NonceManager::resume(30_000).with_max_future_drift(60_000);
-        assert_eq!(nonce.next(1_000), 30_001);
+    fn resume_never_lowers_the_persisted_lease() {
+        // The persisted lease is intentionally ahead; it is never reclaimed.
+        let mut nonce = NonceManager::resume(30_000);
+        assert_eq!(nonce.next(1_000).unwrap(), 30_001);
         assert_eq!(nonce.resets(), 0);
     }
 
     #[test]
     fn resume_follows_the_clock_once_it_passes() {
-        let mut nonce = NonceManager::resume(30_000).with_max_future_drift(60_000);
-        assert_eq!(nonce.next(40_000), 40_000);
+        let mut nonce = NonceManager::resume(30_000);
+        assert_eq!(nonce.next(40_000).unwrap(), 40_000);
     }
 
     #[test]
