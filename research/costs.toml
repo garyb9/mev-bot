@@ -1,0 +1,100 @@
+# research/costs.toml — every fee the SPEC-0008 studies use (task P-3).
+#
+# Values are base-tier bps (1 bp = 0.01%) and are data, never code: studies read
+# this file through `hlr.costs`, so no fee is hardcoded in a study (SPEC-0008
+# §13.2). Each venue carries a `source` and a `verified` date. HL and HIP-3
+# values are from V-3 (§15, observed live 2026-09-28); CEX values are from V-2
+# (§15). Staking/referral discounts and any per-account tier are separate
+# multipliers and are not applied here. Research only: never imported by, or
+# deployed with, the production bot.
+
+# Safety margin added to a trade's cost by default (SPEC-0008 §13.2, "Additional
+# cost terms"). Any study may override it per study.
+buffer_bps = 2.0
+
+# HL perp, main dex, base tier (SPEC-0008 §13.2, from SPEC-0003 §5).
+[hl]
+taker_bps = 4.5
+maker_bps = 1.5
+source = "SPEC-0003 §5"
+verified = "2026-09-28"
+
+# HL spot, base tier (SPEC-0008 §13.2, from SPEC-0003 §5). A pair between two
+# spot quote assets gets `stable_pair_scale` of the fee (SPEC-0008 §15 V-3: 80%
+# lower taker and 80% smaller maker), so USDT0/USDC is 7.0 × 0.2 = 1.4 bps taker
+# at base. `quote_assets` is the V-3 observed quote-token set; there is no USDT.
+[hl-spot]
+taker_bps = 7.0
+maker_bps = 4.0
+stable_pair_scale = 0.2
+quote_assets = ["USDC", "USDT0", "USDH", "USDE"]
+source = "SPEC-0003 §5; stable-pair scale and quote set: SPEC-0008 §15 V-3"
+verified = "2026-09-28"
+
+# HIP-3 perps (SPEC-0008 §13.2/§15 V-3). Per leg:
+#   taker = base_taker_bps × scaleIfHip3 × (growth_mode_scale if growth else 1)
+#   maker = base_maker_bps × scaleIfHip3 × (growth_mode_scale if growth else 1)
+#   scaleIfHip3 = deployer_fee_scale + 1 if deployer_fee_scale < 1 else 2×scale
+# implemented by `hlr.costs.hip3_fee_bps`.
+[hip3]
+base_taker_bps = 4.5
+base_maker_bps = 1.5
+growth_mode_scale = 0.1
+# V-3 observed ~75% of HIP-3 listings in growth mode (aggregate, 2026-09-28);
+# `meta(dex)` returns growthMode per listing, not as one flag per dex, so it is
+# not recorded per dex here. Callers pass `growth_mode` explicitly.
+growth_mode_share = 0.75
+source = "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees; https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions"
+verified = "2026-09-28"
+
+# Per-dex `deployerFeeScale` observed live 2026-09-28 via
+# POST /info {"type":"meta","dex":"<dex>"} (SPEC-0008 §15 V-3). scale 1.0 →
+# 9.0/3.0 bps (no growth) or 0.9/0.3 bps (growth); para 0.5 → 6.75/2.25;
+# hyna 0.1111 → 5.0/1.67.
+[hip3.dexes]
+xyz = 1.0
+flx = 1.0
+vntl = 1.0
+km = 1.0
+abcd = 1.0
+cash = 1.0
+mkts = 1.0
+io = 1.0
+hyna = 0.1111
+para = 0.5
+
+# Binance USDⓈ-M futures, VIP0: 0.050% / 0.020% (5.0/2.0 bps). With BNB fee
+# deduction on, both are ×0.9 → 4.5/1.8 bps (SPEC-0008 §15 V-2).
+[binance-usdm]
+taker_bps = 5.0
+maker_bps = 2.0
+bnb_discount_multiplier = 0.9
+source = "https://www.binance.com/en/fee/futureFee; https://www.binance.com/en/support/faq/detail/360033544231"
+verified = "2026-09-28"
+
+# Bybit linear, VIP0: 0.0550% / 0.0200% (5.5/2.0 bps); rates are
+# region-dependent (SPEC-0008 §15 V-2).
+[bybit-linear]
+taker_bps = 5.5
+maker_bps = 2.0
+source = "https://www.bybit.com/en/help-center/article/Trading-Fee-Structure"
+verified = "2026-09-28"
+
+# Additional cost terms (SPEC-0008 §13.2). Only `buffer_bps` (above) has a
+# numeric default in the spec; the rest are computed by the studies:
+#
+#   slippage  walk the `book` table for the intended size when available;
+#             otherwise cap the size at top-of-book (no walk). No default
+#             number — it is a function of the book.
+#   funding   funding_rate × notional per hourly settlement (sign by side).
+#   gas       gas_used × gas_price in HYPE × HYPE/USDC mid at that time.
+#   transfer  fixed cost + delay for Core<->EVM (O4 only), from V-5.
+#
+# HyperEVM (SPEC-0008 §13.2) is V-6: a DEX swap costs the pool fee (per pool in
+# config/hyperevm-pools.toml, built by V-6) + gas in HYPE. V-5 (gas/transfer
+# facts) and V-6 (pool list) are open, so there are no numbers yet. Placeholder
+# only — do not invent values.
+# [hyperevm]
+# pool_fee_bps = ...   # per pool, from config/hyperevm-pools.toml (V-6)
+# gas_used = ...
+# gas_price_hype = ...

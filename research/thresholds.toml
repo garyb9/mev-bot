@@ -1,0 +1,23 @@
+# research/thresholds.toml: owner-adjustable; re-run `uv run hlr-rank` after editing
+[capital]
+grid_usd     = [10_000, 25_000, 50_000, 100_000]   # small → medium
+headline_usd = 25_000                               # the capital used for the headline verdict
+
+[apr]
+target = 0.25    # ≥ target ⇒ PASS
+floor  = 0.10    # floor ≤ APR < target ⇒ MARGINAL; < floor ⇒ FAIL
+
+[quality]
+min_episodes_per_day = 10
+max_concentration    = 0.40
+min_coverage_pct     = 0.90
+robustness_buffer_multiplier = 2.0   # usd_per_day must stay > 0 with buffer_bps × this
+
+[latency]
+headline_ms = 250   # replace with measured (V-4 + H-7) when known
+
+# research/thresholds.toml (continued)
+[pilot]
+max_capital_usd = 10_000
+max_weeks       = 4
+max_loss_usd    = 1_000
