@@ -37,7 +37,9 @@ one merged file, because parquet cannot be appended and concatenating chunks for
 a merge makes polars' ``sink_parquet`` materialize the whole stream. A reader
 still loads a stream with one glob (``{source}*.parquet``). Re-running a
 partition overwrites its own ``recorder*`` parts and leaves the Tardis (B-2)
-parts untouched.
+parts untouched. A stale ``.normalize-tmp`` left under the output root by a
+crashed run is removed before and after a run, without following symlinks out of
+the root.
 
 Research only: never imported by, or deployed with, the trading bot. It reads no
 keys and no network.
@@ -426,6 +428,32 @@ def _drop_stale_parts(directory: Path, keep: set[str]) -> None:
             existing.unlink()
 
 
+#: Staging directory name a run must never leave behind.
+_TMP_DIR_NAME = ".normalize-tmp"
+
+
+def _remove_stale_tmp(out_root: Path) -> None:
+    """Remove a leftover ``.normalize-tmp`` directly under ``out_root``.
+
+    Called at the start of a run so a directory a crashed run left behind is
+    never read as output nor kept forever, and again after a successful run so
+    the final state is clean. Only the exact path ``out_root/.normalize-tmp`` is
+    considered: a symlink there is unlinked, not descended into, and inner
+    symlinks are unlinked rather than followed, so nothing outside the output
+    root can be deleted.
+    """
+    stale = out_root / _TMP_DIR_NAME
+    if not os.path.lexists(stale):
+        return
+    if stale.is_symlink() or not stale.is_dir():
+        stale.unlink()
+        return
+    try:
+        shutil.rmtree(stale)
+    except OSError as err:
+        raise NormalizeError(f"cannot remove stale `{stale}`: {err}") from err
+
+
 # --------------------------------------------------------------------------
 # Row helpers
 # --------------------------------------------------------------------------
@@ -792,6 +820,7 @@ def normalize(
             f"--from {date_from.isoformat()} is after --to {date_to.isoformat()}"
         )
     out_root = Path(out_dir)
+    _remove_stale_tmp(out_root)
 
     sink = _ParquetSink(out_root, flush_rows=flush_rows)
     trackers: dict[tuple[str, str], _GapTracker] = {}
@@ -836,7 +865,7 @@ def normalize(
             directory = out_root / table / f"date={day.isoformat()}"
             _drop_stale_parts(directory, produced.get(f"{table}|{day.isoformat()}", set()))
 
-    shutil.rmtree(out_root / ".normalize-tmp", ignore_errors=True)
+    _remove_stale_tmp(out_root)
     gap_files = sum(
         len(names) for key, names in produced.items() if key.startswith("gaps|")
     )

@@ -578,6 +578,87 @@ def test_rerun_drops_a_stale_stream_part(tmp_path: Path) -> None:
     assert [p.name for p in parts] == ["recorder.hl-ws.hl-ws-99.bbo.00000.parquet"]
 
 
+def test_stale_normalize_tmp_is_removed_and_ignored(tmp_path: Path) -> None:
+    root, out = tmp_path / "rec", tmp_path / "out"
+    write_segment(
+        root, "hl-ws", _DAY, "00", "hl-ws-01", [frame_env(1, _t(second=1), _bbo_frame())]
+    )
+    # A crashed run left junk in the staging dir, including a fake part.
+    stale = out / ".normalize-tmp" / "bbo" / f"date={_DAY}"
+    stale.mkdir(parents=True)
+    (stale / "recorder.hl-ws.hl-ws-01.bbo.00009.parquet").write_bytes(b"not parquet")
+    (out / ".normalize-tmp" / "leftover.txt").write_text("junk")
+
+    report = normalize(root, out, dt.date(2026, 9, 1), dt.date(2026, 9, 1), sources=("hl-ws",))
+
+    assert report.rows_for("bbo") == 1
+    assert not (out / ".normalize-tmp").exists()
+    parts = [p.name for p in (out / "bbo" / f"date={_DAY}").glob("recorder*.parquet")]
+    assert parts == ["recorder.hl-ws.hl-ws-01.bbo.00000.parquet"]
+    assert read(out, "bbo").height == 1
+
+
+def test_symlinked_normalize_tmp_target_is_not_touched(tmp_path: Path) -> None:
+    root, out = tmp_path / "rec", tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("keep")
+    out.mkdir()
+    (out / ".normalize-tmp").symlink_to(outside, target_is_directory=True)
+    # A same-named directory outside the output root must also survive.
+    sibling = tmp_path / ".normalize-tmp"
+    sibling.mkdir()
+    (sibling / "keep.txt").write_text("keep")
+    write_segment(
+        root, "hl-ws", _DAY, "00", "hl-ws-01", [frame_env(1, _t(second=1), _bbo_frame())]
+    )
+
+    normalize(root, out, dt.date(2026, 9, 1), dt.date(2026, 9, 1), sources=("hl-ws",))
+
+    assert sentinel.read_text() == "keep"
+    assert not (out / ".normalize-tmp").is_symlink()
+    assert not (out / ".normalize-tmp").exists()
+    assert (sibling / "keep.txt").read_text() == "keep"
+
+
+def test_normalize_tmp_inner_symlink_is_unlinked_not_followed(tmp_path: Path) -> None:
+    root, out = tmp_path / "rec", tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("keep")
+    stale = out / ".normalize-tmp"
+    stale.mkdir(parents=True)
+    (stale / "escape").symlink_to(outside, target_is_directory=True)
+    write_segment(
+        root, "hl-ws", _DAY, "00", "hl-ws-01", [frame_env(1, _t(second=1), _bbo_frame())]
+    )
+
+    normalize(root, out, dt.date(2026, 9, 1), dt.date(2026, 9, 1), sources=("hl-ws",))
+
+    assert sentinel.read_text() == "keep"
+    assert not stale.exists()
+
+
+def test_rerun_clears_a_stale_tmp_and_stays_idempotent(tmp_path: Path) -> None:
+    root, out = tmp_path / "rec", tmp_path / "out"
+    write_segment(
+        root, "hl-ws", _DAY, "00", "hl-ws-01", [frame_env(1, _t(second=1), _bbo_frame())]
+    )
+    normalize(root, out, dt.date(2026, 9, 1), dt.date(2026, 9, 1), sources=("hl-ws",))
+    first = read(out, "bbo")
+
+    # Simulate a crash between runs: recreate the staging dir.
+    (out / ".normalize-tmp").mkdir()
+    (out / ".normalize-tmp" / "junk.parquet").write_bytes(b"junk")
+    normalize(root, out, dt.date(2026, 9, 1), dt.date(2026, 9, 1), sources=("hl-ws",))
+
+    assert read(out, "bbo").equals(first)
+    assert not (out / ".normalize-tmp").exists()
+    assert list(out.rglob("*.tmp")) == []
+
+
 def test_small_flush_writes_one_bounded_part_per_batch(tmp_path: Path) -> None:
     root, out = tmp_path / "rec", tmp_path / "out"
     envelopes = [frame_env(seq, _t(second=seq), _bbo_frame()) for seq in range(1, 11)]
