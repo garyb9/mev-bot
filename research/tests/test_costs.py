@@ -7,6 +7,7 @@ the committed file fails here. Invalid-file cases write a small file under
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -19,10 +20,13 @@ from hlr.costs import (
     HL_SPOT,
     CostError,
     default_costs_path,
+    fee_bps,
+    gas_cost_usd,
     hip3_fee_bps,
     load_costs,
     maker_bps,
     round_trip_bps,
+    slippage_bps,
     taker_bps,
 )
 
@@ -205,4 +209,126 @@ def test_invalid_toml_raises(tmp_path: Path) -> None:
     path = tmp_path / "costs.toml"
     path.write_text("buffer_bps = [\n")
     with pytest.raises(CostError, match="invalid TOML"):
+        load_costs(path)
+
+
+# --------------------------------------------------------------------------
+# fee_bps: the spec-named entry point delegates to taker_bps/maker_bps
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("venue", "market"),
+    [
+        (HL_PERP, "BTC"),
+        (HL_SPOT, "PURR/USDC"),
+        (HL_SPOT, "USDT0/USDC"),
+        (HL_HIP3, "xyz:TSLA"),
+        (HL_HIP3, "hyna:BTC"),
+        (BINANCE_USDM, "BTCUSDT"),
+        (BYBIT_LINEAR, "BTCUSDT"),
+    ],
+)
+def test_fee_bps_matches_taker_and_maker(venue: str, market: str) -> None:
+    assert fee_bps(venue, market) == MC(taker_bps(venue, market))
+    assert fee_bps(venue, market, "taker") == MC(taker_bps(venue, market))
+    assert fee_bps(venue, market, "maker") == MC(maker_bps(venue, market))
+
+
+def test_fee_bps_rejects_unknown_liquidity() -> None:
+    with pytest.raises(CostError, match="liquidity"):
+        fee_bps(HL_PERP, "BTC", "both")
+
+
+# --------------------------------------------------------------------------
+# slippage_bps: book walk against the touch (SPEC-0008 §13.2)
+# --------------------------------------------------------------------------
+
+
+def test_slippage_inside_top_level_is_zero() -> None:
+    # Raw l2Book shape: (bids, asks), each a list of (px, sz) levels.
+    book = ([[100.0, 10.0]], [[101.0, 10.0]])
+    assert slippage_bps(book, "buy", 500.0) == MC(0.0)
+    assert slippage_bps(book, "sell", 500.0) == MC(0.0)
+
+
+def test_slippage_multi_level_buy() -> None:
+    # asks [100×1, 200×1]: 300 USD fills 1 @100 + 1 @200 ⇒ vwap 150,
+    # touch 100 ⇒ (150 − 100) / 100 × 1e4 = 5000 bps.
+    book = {"bids": [[99.0, 1.0]], "asks": [[100.0, 1.0], [200.0, 1.0]]}
+    assert slippage_bps(book, "buy", 300.0) == MC(5000.0)
+
+
+def test_slippage_partial_last_level_buy() -> None:
+    # asks [100×2, 200×2]: 300 USD fills 2 @100 + 0.5 @200 ⇒ vwap 120,
+    # touch 100 ⇒ (120 − 100) / 100 × 1e4 = 2000 bps.
+    book = {"bids": [[99.0, 1.0]], "asks": [[100.0, 2.0], [200.0, 2.0]]}
+    assert slippage_bps(book, "buy", 300.0) == MC(2000.0)
+
+
+def test_slippage_sell_side_walks_bids() -> None:
+    # bids [100×1, 90×1]: 190 USD fills 1 @100 + 1 @90 ⇒ vwap 95,
+    # touch 100 ⇒ (100 − 95) / 100 × 1e4 = 500 bps.
+    book = {"bids": [[100.0, 1.0], [90.0, 1.0]], "asks": [[101.0, 1.0]]}
+    assert slippage_bps(book, "sell", 190.0) == MC(500.0)
+
+
+def test_slippage_insufficient_depth_is_infinite() -> None:
+    book = {"bids": [[99.0, 1.0]], "asks": [[100.0, 1.0]]}
+    assert math.isinf(slippage_bps(book, "buy", 200.0))
+    assert math.isinf(slippage_bps(book, "sell", 200.0))
+
+
+def test_slippage_empty_book_is_infinite() -> None:
+    assert math.isinf(slippage_bps({"bids": [], "asks": []}, "buy", 1.0))
+
+
+def test_slippage_zero_notional_is_zero() -> None:
+    assert slippage_bps({"bids": [[99.0, 1.0]], "asks": [[100.0, 1.0]]}, "buy", 0.0) == MC(0.0)
+
+
+def test_slippage_rejects_bad_inputs() -> None:
+    book = {"bids": [[99.0, 1.0]], "asks": [[100.0, 1.0]]}
+    with pytest.raises(CostError, match="side"):
+        slippage_bps(book, "long", 1.0)
+    with pytest.raises(CostError, match="usd"):
+        slippage_bps(book, "buy", -1.0)
+    with pytest.raises(CostError, match="bids"):
+        slippage_bps({"asks": [[100.0, 1.0]]}, "buy", 1.0)
+    with pytest.raises(CostError, match="px"):
+        slippage_bps({"bids": [], "asks": [[0.0, 1.0]]}, "buy", 1.0)
+
+
+# --------------------------------------------------------------------------
+# gas_cost_usd: the §13.2 formula, no invented numbers
+# --------------------------------------------------------------------------
+
+
+def test_gas_cost_formula_with_explicit_numbers() -> None:
+    # 21000 gas × 1e-8 HYPE/gas × 40 USDC/HYPE = 0.0084 USDC.
+    assert gas_cost_usd(40.0, gas_used=21_000.0, gas_price_hype=1e-8) == MC(0.0084)
+
+
+def test_gas_cost_without_numbers_is_v6_pending() -> None:
+    # The committed costs.toml has no [hyperevm] table yet.
+    with pytest.raises(CostError, match="V-6 pending"):
+        gas_cost_usd(40.0)
+
+
+def test_gas_cost_reads_hyperevm_table_when_present(tmp_path: Path) -> None:
+    path = tmp_path / "costs.toml"
+    path.write_text(
+        default_costs_path().read_text()
+        + "\n[hyperevm]\ngas_used = 21000\ngas_price_hype = 0.00000001\n"
+    )
+    costs = load_costs(path)
+    assert costs.hyperevm is not None
+    assert costs.hyperevm.gas_used == MC(21_000.0)
+    assert gas_cost_usd(40.0, costs=costs) == MC(0.0084)
+
+
+def test_partial_hyperevm_table_raises(tmp_path: Path) -> None:
+    path = tmp_path / "costs.toml"
+    path.write_text(default_costs_path().read_text() + "\n[hyperevm]\ngas_used = 21000\n")
+    with pytest.raises(CostError, match="gas_price_hype"):
         load_costs(path)
