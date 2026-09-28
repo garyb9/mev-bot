@@ -316,7 +316,14 @@ impl WriterState {
         if self.stopped {
             return;
         }
-        if self.last_disk_check.elapsed() >= self.config.flush_interval {
+        // The disk guard can only be acted on while a segment is open: the
+        // `gap_start{reason:"disk"}` record is written into the current
+        // segment, so tripping before the first envelope has opened one would
+        // stop the stream and silently discard every later envelope with no
+        // gap at all (SPEC-0008 R-2). An idle writer with no segment has
+        // nothing to stop; the next envelope opens a segment and is written,
+        // then the guard trips on the following maintenance pass.
+        if self.current.is_some() && self.last_disk_check.elapsed() >= self.config.flush_interval {
             self.last_disk_check = Instant::now();
             if self.disk_low() {
                 self.stop_for_disk();
@@ -983,6 +990,43 @@ mod tests {
                 .iter()
                 .any(|env| env.kind == Kind::Frame && env.seq == 1),
             "envelopes after the disk guard must not be written"
+        );
+    }
+
+    #[test]
+    fn disk_guard_does_not_trip_before_any_segment_is_open() {
+        let tmp = temp_dir("disk-idle");
+        let dir = tmp.path();
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let mut cfg = config(dir, clock.clone(), "hl-ws", "hl-ws-01");
+        cfg.disk = Arc::new(FixedDiskSpace(0));
+        cfg.flush_interval = Duration::ZERO;
+
+        // An idle pass with no open segment must not stop the stream: the gap
+        // record is written into the current segment, so stopping here would
+        // discard every later envelope without ever recording a gap.
+        let mut state = WriterState::new(cfg);
+        state.maintenance();
+        assert!(!state.stopped, "disk guard tripped with no open segment");
+
+        // The first envelope opens a segment and is written; the next pass
+        // trips the guard and records the gap in that segment.
+        state
+            .write(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 0, "x"))
+            .unwrap();
+        state.maintenance();
+        assert!(
+            state.stopped,
+            "disk guard did not trip once a segment was open"
+        );
+        assert!(state.current.is_none());
+
+        let files = files_with_ext(&dir.join("testnet/hl-ws"), "zst");
+        assert_eq!(files.len(), 1);
+        assert!(
+            read_records(&files[0])
+                .iter()
+                .any(|env| env.kind == Kind::GapStart)
         );
     }
 
