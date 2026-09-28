@@ -968,7 +968,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | R-12 | `deribit` options summary source | T3-data | S | R-5, V-10 | ☐ |
 | R-13 | `equities` real-time quote source | T1 | M | R-3, V-11 | ☐ |
 | P-1 | `research/` scaffold + segment reader in Python | T1 | S | R-2 (format frozen) | ✅ |
-| P-2 | Normalizer → Parquet tables (§13.1) | T1 | M | P-1, V-1 | ☐ |
+| P-2 | Normalizer → Parquet tables (§13.1) | T1 | M | P-1, V-1 | ✅ |
 | P-3 | Cost model module + `costs.toml` + `thresholds.toml` | T1 | S | P-1, V-2, V-3 | ✅ |
 | P-4 | Episode detector + latency capture (§13.3–13.5) | T1 | M | P-2, P-3 | ☐ |
 | P-5 | Report template + `RANKING.md` generator | T1 | S | P-4 | ☐ |
