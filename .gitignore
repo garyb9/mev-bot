@@ -24,3 +24,10 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# Research toolkit (SPEC-0008 P-1): local venv, derived data, caches
+research/.venv/
+research/data/
+research/.pytest_cache/
+research/.ruff_cache/
+research/**/__pycache__/
