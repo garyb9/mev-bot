@@ -100,7 +100,7 @@ __all__ = [
 #: Nanoseconds per millisecond.
 MS_NS = 1_000_000
 #: Nanoseconds per UTC day.
-DAY_NS = 86_400 * MS_NS
+DAY_NS = 86_400 * 1_000 * MS_NS
 #: bps -> fraction.
 BPS_SCALE = 1e-4
 
