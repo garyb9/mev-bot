@@ -225,6 +225,8 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 
 **H-8 — `simulate` without keys.** SPEC-0000 §6 says `simulate` needs no keys, but `WriteCore::new` rejects `DryRun` without a signer. In `simulate` with no key, generate an ephemeral random signer (never persisted, logged as such). *Done when:* `hl run --mode simulate` starts with no key, and a test covers it.
 
+**H-8 resolved (2026-09-28).** Since SPEC-0010 E-5/E-6, `hl run --mode simulate` fills through `PaperExec` and never builds a `WriteCore`, so it already starts with no key (test `live_exchange_is_none_outside_live`). `AgentSigner::ephemeral` (OS CSPRNG, never persisted or logged) is added for when `simulate` signs on the engine thread (E-6), matching the glossary's "signed but never sent"; wiring it in belongs to E-6.
+
 **H-9 — Verify HL rules.** From the official docs, confirm: (1) the nonce rule (believed: the venue keeps the 100 highest nonces per signer; a new nonce must be above the smallest of them, unused, and within roughly (now − 2 days, now + 1 day)); (2) the `scheduleCancel` rules (minimum lead time; daily trigger limit; any eligibility requirement); (3) whether `orderStatus` accepts a `cloid`. Record each answer with its source in §5/§12, and fix any spec text that is wrong. *Done when:* each fact has a source link and date.
 
 **H-10 — Testnet round-trip.** Owner-run, or run by an agent only with an owner-provided **testnet** key (never a mainnet key). Place a far-from-mid ALO order, see it in `openOrders` and in `orderUpdates` (H-3), cancel it by `cloid`, and record submit→ack latency (H-7). Closes the open §15 item.
