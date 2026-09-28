@@ -1,0 +1,678 @@
+# Underlying mapping for the options / stock-perp studies (SPEC-0008 V-9).
+#
+# Source: live Hyperliquid HIP-3 metadata, 2026-09-28 (mainnet):
+#   POST /info {"type":"perpDexs"}
+#   POST /info {"type":"meta","dex":D} for every dex D in perpDexs
+#
+# Only currently-listed (isDelisted != true) markets are recorded in `hl`.
+# As of 2026-09-28 the dexes with listed markets are xyz, para, io and mkts;
+# flx, vntl, hyna, km, abcd and cash are fully delisted (empty l2Book) and are
+# intentionally omitted. Re-run the V-9 probe before trusting this file.
+#
+# Schema (SPEC-0008 section 13.9 O9):
+#   [UNDERLYING]
+#   hl      = list of HL markets (main dex "BTC" or HIP-3 "dex:COIN")
+#   options = Yahoo options symbol, "deribit:BTC|ETH", or "no-chain"
+#   equity  = real equity/ETF symbol fed to O10, or "no-chain"
+#
+# Non-equity HIP-3 underlyings (commodities, FX, Treasury yields, crypto
+# indices) are out of scope here and omitted: 10Y, 2Y, 30Y, BRENTOIL, BTCD, CL, COPPER, EUR, GBP, GOLD, JPY, NATGAS, OTHERS, PALLADIUM, PLATINUM, SILVER, TOTAL2.
+
+["AAOI"]
+hl = ["para:AAOI", "xyz:AAOI"]
+options = "AAOI"
+equity = "AAOI"
+
+["AAPL"]
+hl = ["xyz:AAPL"]
+options = "AAPL"
+equity = "AAPL"
+
+["AMAT"]
+hl = ["xyz:AMAT"]
+options = "AMAT"
+equity = "AMAT"
+
+["AMD"]
+hl = ["xyz:AMD"]
+options = "AMD"
+equity = "AMD"
+
+["AMZN"]
+hl = ["xyz:AMZN"]
+options = "AMZN"
+equity = "AMZN"
+
+["ARM"]
+hl = ["xyz:ARM"]
+options = "ARM"
+equity = "ARM"
+
+["ASML"]
+hl = ["xyz:ASML"]
+options = "ASML"
+equity = "ASML"
+
+["AVGO"]
+hl = ["para:AVGO", "xyz:AVGO"]
+options = "AVGO"
+equity = "AVGO"
+
+["BABA"]
+hl = ["xyz:BABA"]
+options = "BABA"
+equity = "BABA"
+
+["BB"]
+hl = ["xyz:BB"]
+options = "BB"
+equity = "BB"
+
+["BE"]
+hl = ["xyz:BE"]
+options = "BE"
+equity = "BE"
+
+["BMNR"]
+hl = ["xyz:BMNR"]
+options = "BMNR"
+equity = "BMNR"
+
+["BX"]
+hl = ["xyz:BX"]
+options = "BX"
+equity = "BX"
+
+["CIEN"]
+hl = ["para:CIEN"]
+options = "CIEN"
+equity = "CIEN"
+
+["CIFR"]
+hl = ["para:CIFR"]
+options = "CIFR"
+equity = "CIFR"
+
+["COHR"]
+hl = ["para:COHR"]
+options = "COHR"
+equity = "COHR"
+
+["COIN"]
+hl = ["xyz:COIN"]
+options = "COIN"
+equity = "COIN"
+
+["COST"]
+hl = ["xyz:COST"]
+options = "COST"
+equity = "COST"
+
+["CRCL"]
+hl = ["xyz:CRCL"]
+options = "CRCL"
+equity = "CRCL"
+
+["CRDO"]
+hl = ["para:CRDO"]
+options = "CRDO"
+equity = "CRDO"
+
+["CRWD"]
+hl = ["para:CRWD", "xyz:CRWD"]
+options = "CRWD"
+equity = "CRWD"
+
+["CRWV"]
+hl = ["xyz:CRWV"]
+options = "CRWV"
+equity = "CRWV"
+
+["CVX"]
+hl = ["xyz:CVX"]
+options = "CVX"
+equity = "CVX"
+
+["DELL"]
+hl = ["xyz:DELL"]
+options = "DELL"
+equity = "DELL"
+
+["DKNG"]
+hl = ["xyz:DKNG"]
+options = "DKNG"
+equity = "DKNG"
+
+["EBAY"]
+hl = ["xyz:EBAY"]
+options = "EBAY"
+equity = "EBAY"
+
+["GEV"]
+hl = ["xyz:GEV"]
+options = "GEV"
+equity = "GEV"
+
+["GLW"]
+hl = ["para:GLW"]
+options = "GLW"
+equity = "GLW"
+
+["GME"]
+hl = ["xyz:GME"]
+options = "GME"
+equity = "GME"
+
+["GOOGL"]
+hl = ["xyz:GOOGL"]
+options = "GOOGL"
+equity = "GOOGL"
+
+["GPRO"]
+hl = ["io:GPRO"]
+options = "GPRO"
+equity = "GPRO"
+
+["HIMS"]
+hl = ["xyz:HIMS"]
+options = "HIMS"
+equity = "HIMS"
+
+["HOOD"]
+hl = ["xyz:HOOD"]
+options = "HOOD"
+equity = "HOOD"
+
+["IBM"]
+hl = ["xyz:IBM"]
+options = "IBM"
+equity = "IBM"
+
+["INTC"]
+hl = ["xyz:INTC"]
+options = "INTC"
+equity = "INTC"
+
+["IONQ"]
+hl = ["io:IONQ"]
+options = "IONQ"
+equity = "IONQ"
+
+["IREN"]
+hl = ["para:IREN", "xyz:IREN"]
+options = "IREN"
+equity = "IREN"
+
+["LITE"]
+hl = ["xyz:LITE"]
+options = "LITE"
+equity = "LITE"
+
+["LLY"]
+hl = ["xyz:LLY"]
+options = "LLY"
+equity = "LLY"
+
+["LRCX"]
+hl = ["para:LRCX"]
+options = "LRCX"
+equity = "LRCX"
+
+["MELI"]
+hl = ["para:MELI"]
+options = "MELI"
+equity = "MELI"
+
+["META"]
+hl = ["xyz:META"]
+options = "META"
+equity = "META"
+
+["MRNA"]
+hl = ["xyz:MRNA"]
+options = "MRNA"
+equity = "MRNA"
+
+["MRVL"]
+hl = ["xyz:MRVL"]
+options = "MRVL"
+equity = "MRVL"
+
+["MSFT"]
+hl = ["xyz:MSFT"]
+options = "MSFT"
+equity = "MSFT"
+
+["MSTR"]
+hl = ["xyz:MSTR"]
+options = "MSTR"
+equity = "MSTR"
+
+["MU"]
+hl = ["xyz:MU"]
+options = "MU"
+equity = "MU"
+
+["NBIS"]
+hl = ["io:NBIS", "xyz:NBIS"]
+options = "NBIS"
+equity = "NBIS"
+
+["NET"]
+hl = ["para:NET", "xyz:NET"]
+options = "NET"
+equity = "NET"
+
+["NFLX"]
+hl = ["xyz:NFLX"]
+options = "NFLX"
+equity = "NFLX"
+
+["NOK"]
+hl = ["xyz:NOK"]
+options = "NOK"
+equity = "NOK"
+
+["NOW"]
+hl = ["xyz:NOW"]
+options = "NOW"
+equity = "NOW"
+
+["NVDA"]
+hl = ["xyz:NVDA"]
+options = "NVDA"
+equity = "NVDA"
+
+["ORCL"]
+hl = ["xyz:ORCL"]
+options = "ORCL"
+equity = "ORCL"
+
+["PLTR"]
+hl = ["xyz:PLTR"]
+options = "PLTR"
+equity = "PLTR"
+
+["QCOM"]
+hl = ["xyz:QCOM"]
+options = "QCOM"
+equity = "QCOM"
+
+["RDDT"]
+hl = ["para:RDDT", "xyz:RDDT"]
+options = "RDDT"
+equity = "RDDT"
+
+["RIVN"]
+hl = ["xyz:RIVN"]
+options = "RIVN"
+equity = "RIVN"
+
+["RKLB"]
+hl = ["xyz:RKLB"]
+options = "RKLB"
+equity = "RKLB"
+
+["SMCI"]
+hl = ["para:SMCI"]
+options = "SMCI"
+equity = "SMCI"
+
+["SNDK"]
+hl = ["io:SNDK", "xyz:SNDK"]
+options = "SNDK"
+equity = "SNDK"
+
+["SOFI"]
+hl = ["para:SOFI"]
+options = "SOFI"
+equity = "SOFI"
+
+["STX"]
+hl = ["para:STX"]
+options = "STX"
+equity = "STX"
+
+["TER"]
+hl = ["para:TER"]
+options = "TER"
+equity = "TER"
+
+["TSLA"]
+hl = ["xyz:TSLA"]
+options = "TSLA"
+equity = "TSLA"
+
+["TSM"]
+hl = ["xyz:TSM"]
+options = "TSM"
+equity = "TSM"
+
+["TTWO"]
+hl = ["para:TTWO"]
+options = "TTWO"
+equity = "TTWO"
+
+["USAR"]
+hl = ["xyz:USAR"]
+options = "USAR"
+equity = "USAR"
+
+["VST"]
+hl = ["para:VST"]
+options = "VST"
+equity = "VST"
+
+["WDC"]
+hl = ["xyz:WDC"]
+options = "WDC"
+equity = "WDC"
+
+["ZM"]
+hl = ["xyz:ZM"]
+options = "ZM"
+equity = "ZM"
+
+["EWJ"]
+hl = ["xyz:EWJ"]
+options = "EWJ"
+equity = "EWJ"
+
+["EWT"]
+hl = ["xyz:EWT"]
+options = "EWT"
+equity = "EWT"
+
+["EWY"]
+hl = ["io:EWY", "xyz:EWY"]
+options = "EWY"
+equity = "EWY"
+
+["EWZ"]
+hl = ["xyz:EWZ"]
+options = "EWZ"
+equity = "EWZ"
+
+["IGV"]
+hl = ["para:IGV"]
+options = "IGV"
+equity = "IGV"
+
+["KORU"]
+hl = ["xyz:KORU"]
+options = "KORU"
+equity = "KORU"
+
+["KSTR"]
+hl = ["xyz:KSTR"]
+options = "KSTR"
+equity = "KSTR"
+
+["MAGS"]
+hl = ["xyz:MAGS"]
+options = "MAGS"
+equity = "MAGS"
+
+["SMH"]
+hl = ["xyz:SMH"]
+options = "SMH"
+equity = "SMH"
+
+["SOXL"]
+hl = ["xyz:SOXL"]
+options = "SOXL"
+equity = "SOXL"
+
+["TLT"]
+hl = ["xyz:TLT"]
+options = "TLT"
+equity = "TLT"
+
+["URNM"]
+hl = ["xyz:URNM"]
+options = "URNM"
+equity = "URNM"
+
+["XBI"]
+hl = ["xyz:XBI"]
+options = "XBI"
+equity = "XBI"
+
+["XLE"]
+hl = ["xyz:XLE"]
+options = "XLE"
+equity = "XLE"
+
+["SMALL2000"]
+hl = ["mkts:SMALL2000"]
+options = "IWM"
+equity = "IWM"
+# Russell 2000 index; IWM is the proxy ETF
+
+["SP500"]
+hl = ["xyz:SP500"]
+options = "SPY"
+equity = "SPY"
+# S&P 500 index; SPY is the proxy ETF, not the index itself
+
+["US500"]
+hl = ["mkts:US500"]
+options = "SPY"
+equity = "SPY"
+# S&P 500 index; SPY is the proxy ETF
+
+["USTECH"]
+hl = ["mkts:USTECH"]
+options = "QQQ"
+equity = "QQQ"
+# Nasdaq-100 index; QQQ is the proxy ETF
+
+["BTC"]
+hl = ["BTC"]
+options = "deribit:BTC"
+equity = "no-chain"
+# main-dex perp; crypto options on Deribit
+
+["ETH"]
+hl = ["ETH"]
+options = "deribit:ETH"
+equity = "no-chain"
+# main-dex perp; crypto options on Deribit
+
+["ANSEM"]
+hl = ["para:ANSEM"]
+options = "no-chain"
+equity = "no-chain"
+# unidentified; possibly a memecoin, not a stock
+
+["ANTH"]
+hl = ["io:ANTH"]
+options = "no-chain"
+equity = "no-chain"
+# Anthropic, private (no listed options)
+
+["BIRD"]
+hl = ["xyz:BIRD"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed (ticker collisions)
+
+["BOT"]
+hl = ["xyz:BOT"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed
+
+["CBRS"]
+hl = ["xyz:CBRS"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed
+
+["CXMT"]
+hl = ["xyz:CXMT"]
+options = "no-chain"
+equity = "no-chain"
+# Chinese memory maker (ChangXin), no US listing
+
+["DRAM"]
+hl = ["io:DRAM", "xyz:DRAM"]
+options = "no-chain"
+equity = "no-chain"
+# memory-sector index/product; no confirmed US ticker
+
+["GIGADEV"]
+hl = ["xyz:GIGADEV"]
+options = "no-chain"
+equity = "no-chain"
+# Chinese (GigaDevice), no US listing
+
+["HYUNDAI"]
+hl = ["xyz:HYUNDAI"]
+options = "no-chain"
+equity = "no-chain"
+# Korean listing, no US options chain
+
+["JP225"]
+hl = ["xyz:JP225"]
+options = "no-chain"
+equity = "no-chain"
+# Nikkei 225 index; proxy ETF not decided here
+
+["KIOXIA"]
+hl = ["xyz:KIOXIA"]
+options = "no-chain"
+equity = "no-chain"
+# Japanese listing, no US options chain
+
+["KR200"]
+hl = ["xyz:KR200"]
+options = "no-chain"
+equity = "no-chain"
+# KOSPI 200 index; proxy ETF not decided here
+
+["LYTE"]
+hl = ["xyz:LYTE"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed
+
+["MINIMAX"]
+hl = ["xyz:MINIMAX"]
+options = "no-chain"
+equity = "no-chain"
+# Chinese AI startup, no US listing
+
+["NCLD"]
+hl = ["xyz:NCLD"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed
+
+["OAI"]
+hl = ["io:OAI"]
+options = "no-chain"
+equity = "no-chain"
+# OpenAI, private (no listed options)
+
+["OURA"]
+hl = ["xyz:OURA"]
+options = "no-chain"
+equity = "no-chain"
+# Oura Health, private (no listed options)
+
+["PURRDAT"]
+hl = ["xyz:PURRDAT"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed (HYPE-ecosystem product?)
+
+["QNT"]
+hl = ["xyz:QNT"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed (Quant crypto token?)
+
+["SHAZ"]
+hl = ["xyz:SHAZ"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed
+
+["SHEIN"]
+hl = ["xyz:SHEIN"]
+options = "no-chain"
+equity = "no-chain"
+# foreign/private, no US options chain
+
+["SKHX"]
+hl = ["xyz:SKHX"]
+options = "no-chain"
+equity = "no-chain"
+# SK Hynix, Korean listing, no US options chain
+
+["SKHY"]
+hl = ["xyz:SKHY"]
+options = "no-chain"
+equity = "no-chain"
+# SK Hynix, Korean listing, no US options chain
+
+["SMSN"]
+hl = ["xyz:SMSN"]
+options = "no-chain"
+equity = "no-chain"
+# Samsung, Korean listing, no US options chain
+
+["SNXX"]
+hl = ["xyz:SNXX"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed (leveraged index?)
+
+["SOFTBANK"]
+hl = ["xyz:SOFTBANK"]
+options = "no-chain"
+equity = "no-chain"
+# Japanese listing, no US options chain
+
+["SPCX"]
+hl = ["xyz:SPCX"]
+options = "no-chain"
+equity = "no-chain"
+# SpaceX, private (no listed options)
+
+["STRC"]
+hl = ["xyz:STRC"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed
+
+["TREAD"]
+hl = ["para:TREAD"]
+options = "no-chain"
+equity = "no-chain"
+# identity unconfirmed
+
+["UNITREE"]
+hl = ["para:UNITREE", "xyz:UNITREE"]
+options = "no-chain"
+equity = "no-chain"
+# Chinese robot maker, no US listing
+
+["USBOND"]
+hl = ["mkts:USBOND"]
+options = "no-chain"
+equity = "no-chain"
+# US bond index; proxy ETF not decided here
+
+["XYZ100"]
+hl = ["xyz:XYZ100"]
+options = "no-chain"
+equity = "no-chain"
+# xyz's own index; mapping to a US index ETF unconfirmed
+
+["ZHIPU"]
+hl = ["xyz:ZHIPU"]
+options = "no-chain"
+equity = "no-chain"
+# Chinese AI (Zhipu); no US listing
