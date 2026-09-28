@@ -88,6 +88,7 @@ __all__ = [
     "render_ranking",
     "render_report",
     "top_episodes",
+    "valid_backfill_sources",
     "write_daily_chart",
 ]
 
@@ -393,9 +394,10 @@ def grade_study(
     """Recompute one study's verdict against the thresholds (§13.6, §13.10).
 
     Runs entirely off the front-matter metrics, so a thresholds edit changes the
-    verdict without regenerating the report. A malformed report (bad day split,
-    missing days, malformed capital list) is graded INCONCLUSIVE with the reason
-    rather than raising, so one bad report never aborts a ranking run. Never
+    verdict without regenerating the report. A malformed report (bad front-matter,
+    bad day split, missing days, malformed capital or metric shapes) is graded
+    INCONCLUSIVE with the reason rather than raising, so one bad report never
+    aborts a ranking run. Errors only ever yield INCONCLUSIVE, never PASS. Never
     raises for a zero-episode study: it grades FAIL and stays in the ranking.
     """
     th = thresholds if thresholds is not None else load_thresholds()
@@ -415,55 +417,78 @@ def grade_study(
     try:
         days = _as_int(front_matter.get("days"), "days")
         _check_day_counts(front_matter, days)
+        if valid_backfill_sources(front_matter) is None:
+            raise ReportError("front-matter `backfill_sources` must be a list of strings")
         capital_runs = _capital_runs(front_matter)
     except ReportError as err:
         validation_error = str(err)
     day_count = days if days is not None else 0
 
-    lat = _ceiling_latency(_latency_grid(front_matter, th), th.latency.headline_ms)
-    run = _exact_run(capital_runs, float(th.capital.headline_usd))
-    cap = float(run.get("capital_usd")) if run is not None else None
-    oos = run.get("oos", []) if run else []
-    variant = (
-        HEADLINE_VARIANT
-        if lat is not None and _find_row(oos, lat, HEADLINE_VARIANT) is not None
-        else None
-    )
-    row = _find_row(oos, lat, variant) if variant else None
+    lat: int | None = None
+    run: Mapping[str, Any] | None = None
+    cap: float | None = None
+    variant: str | None = None
+    row: Mapping[str, Any] | None = None
+    concentration = robust = coverage = apr = apr_ci_lo = usd_per_day = None
+    naive_apr = naive_usd = in_apr = None
+    score = 0.0
+    apr_by_capital: tuple[tuple[float, float | None, float | None], ...] = ()
+    extraction_error: str | None = None
+    try:
+        lat = _ceiling_latency(_latency_grid(front_matter, th), th.latency.headline_ms)
+        run = _exact_run(capital_runs, float(th.capital.headline_usd))
+        cap = float(run.get("capital_usd")) if run is not None else None
+        oos = run.get("oos", []) if run else []
+        variant = (
+            HEADLINE_VARIANT
+            if lat is not None and _find_row(oos, lat, HEADLINE_VARIANT) is not None
+            else None
+        )
+        row = _find_row(oos, lat, variant) if variant else None
 
-    concentration = _optional_float(row.get("concentration")) if row else None
-    robust = _optional_float(row.get("usd_per_day_robust")) if row else None
-    coverage = _optional_float(front_matter.get("coverage_pct"))
+        concentration = _optional_float(row.get("concentration")) if row else None
+        robust = _optional_float(row.get("usd_per_day_robust")) if row else None
+        coverage = _optional_float(front_matter.get("coverage_pct"))
 
-    apr = _optional_float(row.get("apr")) if row else None
-    apr_ci_lo = _optional_float(row.get("apr_ci90_lo")) if row else None
-    usd_per_day = _optional_float(row.get("usd_per_day")) if row else None
-    naive_row = _find_row(oos, lat, "naive") if oos and lat is not None else None
-    naive_apr = _optional_float(naive_row.get("apr")) if naive_row else None
-    naive_usd = _optional_float(naive_row.get("usd_per_day")) if naive_row else None
-    is_row = (
-        _find_row(run.get("in_sample", []), lat, variant) if run and variant else None
-    )
-    in_apr = _optional_float(is_row.get("apr")) if is_row else None
+        apr = _optional_float(row.get("apr")) if row else None
+        apr_ci_lo = _optional_float(row.get("apr_ci90_lo")) if row else None
+        usd_per_day = _optional_float(row.get("usd_per_day")) if row else None
+        naive_row = _find_row(oos, lat, "naive") if oos and lat is not None else None
+        naive_apr = _optional_float(naive_row.get("apr")) if naive_row else None
+        naive_usd = _optional_float(naive_row.get("usd_per_day")) if naive_row else None
+        is_row = (
+            _find_row(run.get("in_sample", []), lat, variant) if run and variant else None
+        )
+        in_apr = _optional_float(is_row.get("apr")) if is_row else None
 
-    score = (
-        (usd_per_day or 0.0) * (1.0 - concentration)
-        if concentration is not None
-        else 0.0
-    )
-    apr_by_capital = _apr_by_capital(capital_runs, th, lat)
+        score = (
+            (usd_per_day or 0.0) * (1.0 - concentration)
+            if concentration is not None
+            else 0.0
+        )
+        apr_by_capital = _apr_by_capital(capital_runs, th, lat)
+    except (ReportError, TypeError, ValueError, AttributeError, KeyError) as err:
+        extraction_error = f"malformed metrics in front-matter: {err}"
+        lat = run = cap = variant = row = None
+        concentration = robust = coverage = apr = apr_ci_lo = usd_per_day = None
+        naive_apr = naive_usd = in_apr = None
+        score = 0.0
+        apr_by_capital = ()
 
     min_days = _MIN_DAYS_PRELIM if preliminary else _MIN_DAYS_FINAL
     verdict: str
-    if validation_error is not None:
+    if front_matter.get("_digest_issue"):
+        verdict = INCONCLUSIVE
+        reasons.append(str(front_matter["_digest_issue"]))
+    elif validation_error is not None:
         verdict = INCONCLUSIVE
         reasons.append(validation_error)
+    elif extraction_error is not None:
+        verdict = INCONCLUSIVE
+        reasons.append(extraction_error)
     elif day_count < min_days:
         verdict = INCONCLUSIVE
         reasons.append(f"only {day_count} valid day(s); need >= {min_days} for this report")
-    elif front_matter.get("_digest_issue"):
-        verdict = INCONCLUSIVE
-        reasons.append(str(front_matter["_digest_issue"]))
     elif lat is None:
         verdict = INCONCLUSIVE
         reasons.append(
@@ -1103,6 +1128,9 @@ def episode_provenance(
     (mixed inputs are therefore non-forward). The ``fidelity`` column is
     informational only: it is reported as the fidelity class but never forces a
     study out of the forward lane.
+
+    Note: studies built on the ``bars`` table have ``source`` values ``mid`` /
+    ``trade`` / ``candle`` (not ``recorder``), so they are never forward.
     """
     if not frames:
         return "unknown", (), None
@@ -1342,16 +1370,32 @@ def _require_date_list(front_matter: Mapping[str, Any], key: str) -> list[_dt.da
     return dates
 
 
+def valid_backfill_sources(front_matter: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Return ``backfill_sources`` as strings, or ``None`` when absent/invalid.
+
+    A missing field is ``()`` (forward-compatible); a field that is present but
+    not a list of strings (for example the number ``5``) is invalid and must be
+    treated as unknown rather than iterated.
+    """
+    raw = front_matter.get("backfill_sources")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(source, str) for source in raw):
+        return None
+    return tuple(raw)
+
+
 def is_forward(front_matter: Mapping[str, Any]) -> bool:
     """Whether the front-matter proves forward provenance (§13.11).
 
     Decided by ``source`` only: exactly ``data_source == "forward"`` with no
     backfill sources. The fidelity class is informational and never disqualifies a
-    forward study.
+    forward study. A malformed ``backfill_sources`` is not forward.
     """
+    sources = valid_backfill_sources(front_matter)
     return (
         str(front_matter.get("data_source", "unknown")) == "forward"
-        and not (front_matter.get("backfill_sources") or [])
+        and sources == ()
     )
 
 
@@ -1360,7 +1404,7 @@ def _qualifier(front_matter: Mapping[str, Any]) -> str:
     parts: list[str] = []
     if front_matter.get("fidelity_class"):
         parts.append(str(front_matter["fidelity_class"]))
-    parts.extend(str(source) for source in (front_matter.get("backfill_sources") or []))
+    parts.extend(valid_backfill_sources(front_matter) or ())
     return f"{HIST_PRELIM} ({'; '.join(parts)})" if parts else HIST_PRELIM
 
 

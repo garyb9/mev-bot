@@ -511,6 +511,80 @@ def test_rank_survives_malformed_capital_block(tmp_path: Path) -> None:
     (reports / "O1-o1.md").write_text(render_front_matter(front_matter) + "\n# body\n")
     result = grade_study(scan_reports(reports)[0], thresholds=thresholds(tmp_path))
     assert result.verdict == INCONCLUSIVE
+    assert any("capital_usd" in reason for reason in result.reasons)
+
+
+def corrupt_shape(which: str) -> dict[str, Any]:
+    """Return an otherwise-passing O2 front-matter with one malformed shape."""
+    front_matter = make_fm("O2", apr=0.5, ci_lo=0.5)
+    if which == "latency_grid":
+        front_matter["latency_grid_ms"] = ["abc"]
+    elif which == "row_latency_ms":
+        front_matter["capital"][0]["oos"][0]["latency_ms"] = "250"
+    elif which == "oos_not_a_list":
+        front_matter["capital"][0]["oos"] = 5
+    elif which == "oos_bad_rows":
+        front_matter["capital"][0]["oos"] = ["x"]
+    elif which == "backfill_sources_not_a_list":
+        front_matter["backfill_sources"] = 5
+    else:  # pragma: no cover - guards the parametrize list
+        raise AssertionError(which)
+    return front_matter
+
+
+@pytest.mark.parametrize(
+    "which",
+    [
+        "latency_grid",
+        "row_latency_ms",
+        "oos_not_a_list",
+        "oos_bad_rows",
+        "backfill_sources_not_a_list",
+    ],
+)
+def test_malformed_shape_is_inconclusive_and_sibling_still_ranks(
+    tmp_path: Path, which: str
+) -> None:
+    th = thresholds(tmp_path)
+    good = make_fm("O1", apr=0.5, ci_lo=0.5)
+    ranked = rank_studies([corrupt_shape(which), good], thresholds=th)
+    by_id = {result.study_id: result for result in ranked}
+    assert by_id["O2"].verdict == INCONCLUSIVE
+    assert by_id["O2"].reasons
+    assert by_id["O1"].verdict == PASS
+
+
+def test_invalid_front_matter_json_is_inconclusive_and_sibling_still_ranks(
+    tmp_path: Path,
+) -> None:
+    reports = tmp_path / "reports"
+    write_reports(reports, make_fm("O1", apr=0.5, ci_lo=0.5))
+    (reports / "O2-bad.md").write_text("---\n{not valid json}\n---\n# body\n")
+    scanned = scan_reports(reports)
+    assert len(scanned) == 2
+    ranked = rank_studies(scanned, thresholds=thresholds(tmp_path))
+    by_id = {result.study_id: result for result in ranked}
+    assert by_id["O2"].verdict == INCONCLUSIVE
+    assert any("front-matter" in reason for reason in by_id["O2"].reasons)
+    assert by_id["O1"].verdict == PASS
+
+    text, count = build_ranking(reports, thresholds_file(tmp_path))
+    assert count == 2
+    assert "O2" in text
+
+    out = tmp_path / "out" / "RANKING.md"
+    code = main(
+        [
+            "--reports-dir",
+            str(reports),
+            "--thresholds",
+            str(thresholds_file(tmp_path)),
+            "--out",
+            str(out),
+        ]
+    )
+    assert code == 0
+    assert out.is_file()
 
 
 def test_render_report_when_headline_capital_not_run(tmp_path: Path) -> None:

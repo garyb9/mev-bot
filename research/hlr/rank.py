@@ -30,6 +30,7 @@ from hlr.report import (
     parse_front_matter,
     rank_studies,
     render_ranking,
+    valid_backfill_sources,
 )
 from hlr.thresholds import ThresholdError, default_thresholds_path, load_thresholds
 
@@ -48,9 +49,9 @@ def scan_reports(reports_dir: str | Path) -> list[dict[str, Any]]:
     its episode parquet and sha256 digest next to it; the digest is re-checked,
     provenance is re-derived from the parquet's ``source``/``fidelity`` columns
     (overriding the front-matter), and the declared episode counts and date range
-    are verified. Any problem is recorded on ``_digest_issue`` so
-    :func:`hlr.report.grade_study` returns INCONCLUSIVE. A malformed report raises
-    :class:`hlr.report.ReportError` naming the file.
+    are verified. A problem with one report never aborts the run: parse and
+    validation errors are recorded on ``_digest_issue`` and the report is kept so
+    :func:`hlr.report.grade_study` returns INCONCLUSIVE with the reason.
     """
     directory = Path(reports_dir)
     studies: list[dict[str, Any]] = []
@@ -60,12 +61,27 @@ def scan_reports(reports_dir: str | Path) -> list[dict[str, Any]]:
             continue
         try:
             front_matter = parse_front_matter(text)
-        except ReportError as err:
-            raise ReportError(f"{path}: {err}") from err
+        except (ReportError, TypeError, ValueError, AttributeError, KeyError) as err:
+            studies.append(_malformed_front_matter(path, f"invalid front-matter: {err}"))
+            continue
         front_matter["_report_path"] = str(path)
-        front_matter["_digest_issue"] = _validate_episodes(front_matter, directory)
+        try:
+            front_matter["_digest_issue"] = _validate_episodes(front_matter, directory)
+        except (ReportError, TypeError, ValueError, AttributeError, KeyError) as err:
+            front_matter["_digest_issue"] = f"could not validate episode data: {err}"
         studies.append(front_matter)
     return studies
+
+
+def _malformed_front_matter(path: Path, reason: str) -> dict[str, Any]:
+    """A minimal report dict for a file whose front-matter could not be parsed."""
+    return {
+        "study_id": path.stem.split("-", 1)[0] or path.stem,
+        "slug": "",
+        "title": path.name,
+        "_report_path": str(path),
+        "_digest_issue": reason,
+    }
 
 
 def _validate_episodes(front_matter: dict[str, Any], directory: Path) -> str | None:
@@ -93,11 +109,13 @@ def _validate_episodes(front_matter: dict[str, Any], directory: Path) -> str | N
     if canonical_digest(frame) != digest:
         return "episode parquet digest does not match the report"
 
-    _merge_provenance(front_matter, frame)
+    provenance_issue = _merge_provenance(front_matter, frame)
+    if provenance_issue is not None:
+        return provenance_issue
     return _consistency_issue(front_matter, frame)
 
 
-def _merge_provenance(front_matter: dict[str, Any], frame: pl.DataFrame) -> None:
+def _merge_provenance(front_matter: dict[str, Any], frame: pl.DataFrame) -> str | None:
     """Set the stricter of the declared and parquet-derived provenance.
 
     The front-matter is the floor: a parquet can never upgrade a study to
@@ -105,8 +123,15 @@ def _merge_provenance(front_matter: dict[str, Any], frame: pl.DataFrame) -> None
     to be forward; otherwise the stricter (backfill, or unknown if either is
     unknown) label is kept, and the declared backfill sources are preserved
     (they include the robustness re-runs' provenance, which is not in the
-    parquet).
+    parquet). A malformed declared ``backfill_sources`` is a problem: the study is
+    set to unknown and a reason is returned so grading is INCONCLUSIVE.
     """
+    declared_sources = valid_backfill_sources(front_matter)
+    if declared_sources is None:
+        front_matter["data_source"] = "unknown"
+        front_matter["backfill_sources"] = []
+        front_matter["fidelity_class"] = None
+        return "front-matter `backfill_sources` must be a list of strings"
     declared_forward = is_forward(front_matter)
     declared_source = str(front_matter.get("data_source", "unknown"))
     derived_source, derived_sources, derived_fidelity = episode_provenance([frame])
@@ -116,24 +141,20 @@ def _merge_provenance(front_matter: dict[str, Any], frame: pl.DataFrame) -> None
     elif declared_source == "unknown" or derived_source == "unknown":
         data_source, backfill, fidelity = "unknown", (), None
     else:
-        merged = sorted(
-            {str(source) for source in (front_matter.get("backfill_sources") or [])}
-            | set(derived_sources)
-        )
+        merged = sorted(set(declared_sources) | set(derived_sources))
         data_source, backfill = "backfill", tuple(merged)
         fidelity = front_matter.get("fidelity_class") or derived_fidelity
     front_matter["data_source"] = data_source
     front_matter["backfill_sources"] = list(backfill)
     front_matter["fidelity_class"] = fidelity
+    return None
 
 
 def _consistency_issue(front_matter: Mapping[str, Any], frame: pl.DataFrame) -> str | None:
     """Verify the parquet's date range and per-capital episode counts match."""
-    declared = {
-        str(value)
-        for value in list(front_matter.get("in_sample_dates") or [])
-        + list(front_matter.get("oos_dates") or [])
-    }
+    declared = _string_set(front_matter.get("in_sample_dates")) | _string_set(
+        front_matter.get("oos_dates")
+    )
     if "date" not in frame.columns:
         return "episode parquet has no date column"
     frame_dates = {str(value) for value in frame["date"].to_list()}
@@ -172,6 +193,13 @@ def _safe_float(value: Any) -> float | None:
     if math.isnan(number) or math.isinf(number):
         return None
     return number
+
+
+def _string_set(value: Any) -> set[str]:
+    """Return a list's items as strings; anything that is not a list is empty."""
+    if not isinstance(value, list):
+        return set()
+    return {str(item) for item in value}
 
 
 def _declared_episodes(block: Mapping[str, Any]) -> int | None:
