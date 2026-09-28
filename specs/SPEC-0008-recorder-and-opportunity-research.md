@@ -473,7 +473,9 @@ Per episode, record:
 | `t_start, t_end, duration_ms` | Timing |
 | `peak_net_bps`, `start_net_bps` | Size of the edge |
 | `size_usd_at_start` | Capturable notional at `t_start` |
-| `captured_L` for each latency `L` | `net_bps(t_start + L) × size_usd(t_start + L)` **if** the episode is still open at `t_start + L`, else `0` (missed) |
+| `captured_L` for each latency `L` | `net_bps(t_start + L) / 1e4 × size_L` (USD) **if** the episode is still open at `t_start + L` with `net_bps(t_start + L) > 0`, else `0` (missed) |
+
+**Capture sizing (clarified 2026-09-28, P-4 review).** The order is sized when the decision is made, not re-sized at the fill: `size_L = min(size_usd(t_start), size_usd(t_start + L))`, so a book that deepens after the signal cannot enlarge the order. With fill competition (§13.10) the size is `min(max_notional, max(0, displayed − traded_notional))`: the cap binds *after* the competing notional is subtracted. Every lookup at `t_start + L` is a backward as-of read (only data available at that time). `net_bps` must already include both legs' fees and `slippage_bps` at the capped size; the detector (`hlr.episodes`) applies no costs itself.
 
 ### 13.4 Latency grid
 
