@@ -7,6 +7,7 @@ Nothing touches the network or ``research/data/``.
 
 from __future__ import annotations
 
+import datetime as _dt
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from hlr.report import (
     rank_studies,
     render_front_matter,
     render_ranking,
+    render_report,
 )
 from hlr.thresholds import FAIL, MARGINAL, PASS, Thresholds, load_thresholds
 
@@ -204,9 +206,42 @@ def make_fm(
     }
 
 
+def attach_episode_file(
+    front_matter: dict[str, Any], directory: Path, *, source: str | None = None
+) -> str:
+    """Write a parquet whose counts and dates match ``front_matter`` and set its digest."""
+    directory.mkdir(parents=True, exist_ok=True)
+    parquet_name = f"{front_matter['study_id']}-{front_matter['slug']}-episodes.parquet"
+    declared_values = list(front_matter.get("in_sample_dates", [])) + list(
+        front_matter.get("oos_dates", [])
+    )
+    declared = [_dt.date.fromisoformat(value) for value in declared_values]
+    resolved = source if source is not None else front_matter.get("data_source")
+    runs: dict[float, pl.DataFrame] = {}
+    for block in front_matter["capital"]:
+        capital = float(block["capital_usd"])
+        expected = 0
+        for sample in ("in_sample", "oos"):
+            rows = block.get(sample) or []
+            if rows:
+                expected += int(rows[0].get("episodes", 0))
+        dates = [declared[index % len(declared)] for index in range(expected)]
+        frame = pl.DataFrame({"date": dates})
+        if resolved in ("forward", "recorder"):
+            frame = frame.with_columns(pl.lit("recorder").alias("source"))
+        elif resolved in ("backfill", "tardis"):
+            frame = frame.with_columns(pl.lit("tardis").alias("source"))
+        runs[capital] = frame
+    front_matter["episode_parquet"] = parquet_name
+    front_matter["episode_digest"] = episode_digest(runs)
+    canonical_episodes(runs).write_parquet(directory / parquet_name)
+    return parquet_name
+
+
 def write_reports(directory: Path, *front_matters: dict[str, Any]) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for front_matter in front_matters:
+        attach_episode_file(front_matter, directory)
         text = render_front_matter(front_matter) + "\n# body\n"
         (directory / f"{front_matter['study_id']}-{front_matter['slug']}.md").write_text(text)
 
@@ -414,6 +449,41 @@ def test_days_must_equal_sample_dates(tmp_path: Path) -> None:
         grade_study(front_matter, thresholds=thresholds(tmp_path))
 
 
+def test_day_split_must_be_disjoint_and_chronological(tmp_path: Path) -> None:
+    th = thresholds(tmp_path)
+    missing = make_fm(days=20)
+    del missing["oos_dates"]
+    with pytest.raises(ReportError, match="oos_dates"):
+        grade_study(missing, thresholds=th)
+
+    duplicated = make_fm(days=20)
+    duplicated["oos_dates"] = duplicated["oos_dates"][:-1] + [duplicated["oos_dates"][0]]
+    with pytest.raises(ReportError, match="duplicate"):
+        grade_study(duplicated, thresholds=th)
+
+    overlapping = make_fm(days=20)
+    overlapping["oos_dates"] = [overlapping["in_sample_dates"][-1], *overlapping["oos_dates"]]
+    with pytest.raises(ReportError):
+        grade_study(overlapping, thresholds=th)
+
+    reversed_split = make_fm(days=20)
+    reversed_split["in_sample_dates"], reversed_split["oos_dates"] = (
+        reversed_split["oos_dates"],
+        reversed_split["in_sample_dates"],
+    )
+    with pytest.raises(ReportError, match="chronological"):
+        grade_study(reversed_split, thresholds=th)
+
+
+def test_render_report_when_headline_capital_not_run(tmp_path: Path) -> None:
+    front_matter = make_fm(capital=30_000.0)  # default headline capital is 25k
+    result = grade_study(front_matter, thresholds=thresholds(tmp_path))
+    assert result.verdict == INCONCLUSIVE
+    assert result.headline_capital_usd is None
+    text = render_report(front_matter)  # must not raise on a None headline capital
+    assert "INCONCLUSIVE" in text
+
+
 # --------------------------------------------------------------------------
 # End-to-end: re-grade, scan, CLI, determinism
 # --------------------------------------------------------------------------
@@ -451,24 +521,58 @@ def test_regrade_after_headline_latency_change(tmp_path: Path) -> None:
 
 
 def test_rank_digest_mismatch_is_inconclusive(tmp_path: Path) -> None:
-    runs = {25_000.0: pl.DataFrame({"t_start": [1, 2], "size_usd_at_start": [1.0, 1.0]})}
+    reports = tmp_path / "reports"
+    write_reports(reports, make_fm("O1", apr=0.5, ci_lo=0.5))
+    th = thresholds(tmp_path)
+    assert grade_study(scan_reports(reports)[0], thresholds=th).verdict != INCONCLUSIVE
+
+    # Tampering with the parquet changes the digest (and the count) -> INCONCLUSIVE.
+    pl.DataFrame({"date": [_dt.date(2024, 1, 1)], "capital_usd": [25_000.0]}).write_parquet(
+        reports / "O1-o1-episodes.parquet"
+    )
+    assert grade_study(scan_reports(reports)[0], thresholds=th).verdict == INCONCLUSIVE
+
+
+def test_missing_declared_parquet_is_inconclusive(tmp_path: Path) -> None:
+    reports = tmp_path / "reports"
+    write_reports(reports, make_fm("O1", apr=0.5, ci_lo=0.5))
+    (reports / "O1-o1-episodes.parquet").unlink()
+    assert grade_study(scan_reports(reports)[0], thresholds=thresholds(tmp_path)).verdict == (
+        INCONCLUSIVE
+    )
+
+
+def test_missing_digest_fields_is_inconclusive(tmp_path: Path) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    front_matter = make_fm("O1", apr=0.5, ci_lo=0.5)  # no digest, no parquet
+    (reports / "O1-o1.md").write_text(render_front_matter(front_matter) + "\n# body\n")
+    assert grade_study(scan_reports(reports)[0], thresholds=thresholds(tmp_path)).verdict == (
+        INCONCLUSIVE
+    )
+
+
+def test_parquet_provenance_overrides_front_matter(tmp_path: Path) -> None:
+    reports = tmp_path / "reports"
+    front_matter = make_fm("O1", apr=0.60, ci_lo=0.60, data_source="forward")
+    attach_episode_file(front_matter, reports, source="tardis")
+    (reports / "O1-o1.md").write_text(render_front_matter(front_matter) + "\n# body\n")
+    scanned = scan_reports(reports)
+    assert scanned[0]["data_source"] == "backfill"
+    result = grade_study(scanned[0], thresholds=thresholds(tmp_path))
+    assert result.verdict == MARGINAL
+    assert result.qualifier is not None and result.qualifier.startswith(HIST_PRELIM)
+
+
+def test_parquet_episode_count_mismatch_is_inconclusive(tmp_path: Path) -> None:
     reports = tmp_path / "reports"
     front_matter = make_fm("O1", apr=0.5, ci_lo=0.5)
-    front_matter["episode_digest"] = episode_digest(runs)
-    front_matter["episode_parquet"] = "O1-episodes.parquet"
-    write_reports(reports, front_matter)
-
-    # A parquet that does not match the digest flips the study to INCONCLUSIVE.
-    pl.DataFrame({"t_start": [99], "size_usd_at_start": [1.0]}).write_parquet(
-        reports / "O1-episodes.parquet"
+    attach_episode_file(front_matter, reports)
+    front_matter["capital"][0]["oos"][0]["episodes"] += 1
+    (reports / "O1-o1.md").write_text(render_front_matter(front_matter) + "\n# body\n")
+    assert grade_study(scan_reports(reports)[0], thresholds=thresholds(tmp_path)).verdict == (
+        INCONCLUSIVE
     )
-    scanned = scan_reports(reports)
-    assert scanned[0]["_digest_mismatch"] is True
-    assert grade_study(scanned[0], thresholds=thresholds(tmp_path)).verdict == INCONCLUSIVE
-
-    # The matching parquet leaves grading unchanged.
-    canonical_episodes(runs).write_parquet(reports / "O1-episodes.parquet")
-    assert scan_reports(reports)[0]["_digest_mismatch"] is False
 
 
 def test_scan_ignores_non_study_files(tmp_path: Path) -> None:

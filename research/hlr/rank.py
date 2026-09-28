@@ -24,6 +24,7 @@ from hlr.report import (
     RANKING_FILENAME,
     ReportError,
     canonical_digest,
+    episode_provenance,
     parse_front_matter,
     rank_studies,
     render_ranking,
@@ -41,10 +42,13 @@ def default_reports_dir() -> Path:
 def scan_reports(reports_dir: str | Path) -> list[dict[str, Any]]:
     """Read the front-matter of every ``O*.md`` report in ``reports_dir``.
 
-    Sorted by path so the scan itself is deterministic. If a report names its
-    episode parquet and that file sits next to it, the digest is re-checked and a
-    mismatch is recorded so :func:`hlr.report.grade_study` returns INCONCLUSIVE.
-    A malformed report raises :class:`hlr.report.ReportError` naming the file.
+    Sorted by path so the scan itself is deterministic. Every report must declare
+    its episode parquet and sha256 digest next to it; the digest is re-checked,
+    provenance is re-derived from the parquet's ``source``/``fidelity`` columns
+    (overriding the front-matter), and the declared episode counts and date range
+    are verified. Any problem is recorded on ``_digest_issue`` so
+    :func:`hlr.report.grade_study` returns INCONCLUSIVE. A malformed report raises
+    :class:`hlr.report.ReportError` naming the file.
     """
     directory = Path(reports_dir)
     studies: list[dict[str, Any]] = []
@@ -57,30 +61,90 @@ def scan_reports(reports_dir: str | Path) -> list[dict[str, Any]]:
         except ReportError as err:
             raise ReportError(f"{path}: {err}") from err
         front_matter["_report_path"] = str(path)
-        front_matter["_digest_mismatch"] = _digest_mismatch(front_matter, directory)
+        front_matter["_digest_issue"] = _validate_episodes(front_matter, directory)
         studies.append(front_matter)
     return studies
 
 
-def _digest_mismatch(front_matter: Mapping[str, Any], directory: Path) -> bool:
-    """Whether the report's named episode parquet is present and does not match.
+def _validate_episodes(front_matter: dict[str, Any], directory: Path) -> str | None:
+    """Re-check a report's declared episode data; return a problem reason or None.
 
-    An absent parquet cannot be checked, so it is not a mismatch; a present but
-    unreadable one is.
+    Enforces (in order): both digest fields declared, the parquet present and
+    readable, the digest matching, then re-derives provenance from the parquet and
+    verifies the declared per-capital episode counts and date range. Provenance
+    fields are written back onto ``front_matter`` so grading uses the parquet, not
+    a caller-asserted value.
     """
+    digest = front_matter.get("episode_digest")
     parquet = front_matter.get("episode_parquet")
-    if not parquet:
-        return False
+    if not digest or not parquet:
+        return "report does not declare its episode data (episode_digest/episode_parquet)"
     candidate = Path(str(parquet))
     if not candidate.is_absolute():
         candidate = directory / candidate
     if not candidate.is_file():
-        return False
+        return f"declared episode parquet {parquet} is missing next to the report"
     try:
         frame = pl.read_parquet(candidate)
     except (OSError, pl.exceptions.PolarsError, ValueError):
-        return True
-    return canonical_digest(frame) != front_matter.get("episode_digest")
+        return f"episode parquet {parquet} is unreadable"
+    if canonical_digest(frame) != digest:
+        return "episode parquet digest does not match the report"
+
+    data_source, sources, fidelity = episode_provenance([frame])
+    front_matter["data_source"] = data_source
+    front_matter["backfill_sources"] = list(sources)
+    front_matter["fidelity_class"] = fidelity
+    return _consistency_issue(front_matter, frame)
+
+
+def _consistency_issue(front_matter: Mapping[str, Any], frame: pl.DataFrame) -> str | None:
+    """Verify the parquet's date range and per-capital episode counts match."""
+    declared = {
+        str(value)
+        for value in list(front_matter.get("in_sample_dates") or [])
+        + list(front_matter.get("oos_dates") or [])
+    }
+    if "date" not in frame.columns:
+        return "episode parquet has no date column"
+    frame_dates = {str(value) for value in frame["date"].to_list()}
+    outside = sorted(frame_dates - declared)
+    if outside:
+        return f"episode parquet has dates outside the declared range: {outside}"
+
+    blocks = front_matter.get("capital")
+    if not isinstance(blocks, list) or not blocks:
+        return None
+    if "capital_usd" not in frame.columns:
+        return "episode parquet has no capital_usd column"
+    for block in blocks:
+        if not isinstance(block, dict):
+            return "front-matter capital entry is malformed"
+        capital = float(block.get("capital_usd"))
+        expected = _declared_episodes(block)
+        if expected is None:
+            continue
+        actual = frame.filter(pl.col("capital_usd").cast(pl.Float64) == capital).height
+        if actual != expected:
+            return (
+                f"episode parquet has {actual} episodes at capital ${capital:,.0f} "
+                f"but the report declares {expected}"
+            )
+    return None
+
+
+def _declared_episodes(block: Mapping[str, Any]) -> int | None:
+    """Sum a capital block's declared in-sample and out-of-sample episode counts."""
+    total = 0
+    found = False
+    for sample in ("in_sample", "oos"):
+        rows = block.get(sample)
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            value = rows[0].get("episodes")
+            if isinstance(value, int) and not isinstance(value, bool):
+                total += value
+                found = True
+    return total if found else None
 
 
 def build_ranking(

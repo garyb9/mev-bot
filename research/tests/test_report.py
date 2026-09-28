@@ -8,22 +8,27 @@ network or ``research/data/``.
 from __future__ import annotations
 
 import datetime as _dt
+from pathlib import Path
 
 import polars as pl
 import pytest
 
 from hlr.episodes import EpisodeConfig, detect_episodes
+from hlr.rank import scan_reports
 from hlr.report import (
+    HIST_PRELIM,
     ReportError,
     build_front_matter,
     build_report,
     canonical_digest,
     episode_digest,
+    grade_study,
     parse_front_matter,
     render_front_matter,
     render_report,
     top_episodes,
 )
+from hlr.thresholds import MARGINAL, PASS, load_thresholds
 
 MS = 1_000_000
 DAY = 86_400_000 * MS  # milliseconds per day -> nanoseconds
@@ -239,3 +244,97 @@ def test_missing_date_column_raises() -> None:
     episodes = synthetic_episodes([0, 1, 2, 3, 4]).drop("date")
     with pytest.raises(ReportError, match="date"):
         build(episodes)
+
+
+def passing_episodes(days: int = 20, per_day: int = 12, *, mixed: bool = False) -> pl.DataFrame:
+    """A synthetic study dense enough to clear every §13.6 gate, with provenance."""
+    times: list[int] = []
+    net: list[float] = []
+    size: list[float] = []
+    compete: list[float] = []
+    sources: list[str] = []
+    for index in range(days):
+        for slot in range(per_day):
+            base = BASE_NS + index * DAY + slot * 10_000 * MS
+            times += [base, base + 400 * MS, base + 2_000 * MS, base + 2_001 * MS]
+            net += [5.0, 5.0, -1.0, -1.0]
+            size += [5_000.0, 5_000.0, 5_000.0, 5_000.0]
+            compete += [0.0, 0.0, 0.0, 0.0]
+            source = "tardis" if mixed and index % 2 else "recorder"
+            sources += [source, source, source, source]
+    frame = pl.DataFrame(
+        {
+            "t_ns": times,
+            "net_bps": net,
+            "size_usd": size,
+            "compete_usd": compete,
+            "source": sources,
+        }
+    )
+    config = EpisodeConfig(latencies_ms=(100, 250, 500), jitter=True, jitter_seed=0)
+    return detect_episodes(
+        frame,
+        net_bps="net_bps",
+        size_usd="size_usd",
+        config=config,
+        compete_usd="compete_usd",
+    )
+
+
+def test_detect_episodes_carries_provenance() -> None:
+    episodes = passing_episodes(days=1, per_day=1)
+    assert "source" in episodes.columns
+    assert set(episodes["source"].to_list()) == {"recorder"}
+    # An input without the provenance columns stays without them.
+    assert "source" not in synthetic_episodes([0]).columns
+
+
+def test_recorder_study_can_reach_pass_end_to_end(tmp_path: Path) -> None:
+    episodes = passing_episodes()
+    reports = tmp_path / "reports"
+    text = build_report(
+        study_id="O1",
+        slug="pass",
+        title="Pass",
+        hypothesis="h",
+        implementation_cost="M",
+        days=20,
+        coverage_pct=0.99,
+        capital_runs={25_000.0: episodes},
+        max_notional={25_000.0: 5_000.0},
+        robustness_runs={25_000.0: episodes},
+        all_dates=[day(i) for i in range(20)],
+        latencies_ms=(100, 250, 500),
+        episode_parquet="O1-pass-episodes.parquet",
+        reports_dir=reports,
+    )
+    (reports / "O1-pass.md").write_text(text)
+    scanned = scan_reports(reports)
+    assert scanned[0]["_digest_issue"] is None
+    assert scanned[0]["data_source"] == "forward"
+    assert grade_study(scanned[0], thresholds=load_thresholds()).verdict == PASS
+
+
+def test_mixed_provenance_cannot_pass_end_to_end() -> None:
+    episodes = passing_episodes(mixed=True)
+    values = build(
+        episodes,
+        days=20,
+        all_dates=[day(i) for i in range(20)],
+        latencies_ms=(100, 250, 500),
+        max_notional={25_000.0: 5_000.0},
+        robustness_runs={25_000.0: episodes},
+    )
+    assert values["data_source"] == "backfill"
+    result = grade_study(values, thresholds=load_thresholds())
+    assert result.verdict == MARGINAL
+    assert result.qualifier is not None and result.qualifier.startswith(HIST_PRELIM)
+
+
+def test_provenance_checks_robustness_tables() -> None:
+    episodes = synthetic_episodes([0, 1, 2, 3, 4]).with_columns(
+        pl.lit("recorder").alias("source")
+    )
+    without_source = synthetic_episodes([0, 1, 2, 3, 4])
+    values = build(episodes, robustness_runs={25_000.0: without_source})
+    assert values["data_source"] == "unknown"

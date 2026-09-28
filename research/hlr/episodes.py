@@ -238,6 +238,9 @@ def detect_episodes(
     ``duration_ms``, ``peak_net_bps``, ``start_net_bps``, ``size_usd_at_start``),
     a UTC ``date``, and ``captured*_{L}``/``open*_{L}`` per grid latency (plus
     ``competed*_{L}``, per-latency ``markout_{L}_{h}s`` and the jitter variants).
+    When the input frame carries ``source``/``fidelity`` columns, each episode also
+    records their value at ``t_start`` (so a study's data provenance survives into
+    the episode table; mixed inputs yield episodes with mixed provenance).
     Sorted by ``t_start``.
     """
     source = frame.collect() if isinstance(frame, pl.LazyFrame) else frame
@@ -254,6 +257,12 @@ def detect_episodes(
 
     work = source.with_row_index("_row")
     work = work.sort([time_col, "_row"], maintain_order=True)
+
+    provenance_cols = [name for name in ("source", "fidelity") if name in source.columns]
+    if provenance_cols:
+        work = work.with_columns(
+            [pl.col(name).cast(pl.Utf8, strict=False).alias(name) for name in provenance_cols]
+        )
 
     work = work.with_columns(
         [
@@ -297,7 +306,11 @@ def detect_episodes(
     episodes = _merge_runs(final, config.merge_ms, config.stale_ms * MS_NS, time_col)
     if episodes.height == 0:
         return _empty_episodes(
-            config, compete_usd is not None, mid is not None and direction is not None
+            config,
+            compete_usd is not None,
+            mid is not None and direction is not None,
+            has_source="source" in source.columns,
+            has_fidelity="fidelity" in source.columns,
         )
 
     episodes = _capture_grid(
@@ -531,21 +544,22 @@ def _merge_runs(
     tagged = frame.with_columns(pl.col("core").rle_id().alias("_rid")).join(
         runs.select("_rid", "_gid"), on="_rid", how="left"
     )
+    aggregations: list[pl.Expr] = [
+        pl.col(time_col).first().alias("t_start"),
+        pl.col("_row_valid_end").max().alias("t_end"),
+        pl.col("net_bps").max().alias("peak_net_bps"),
+        pl.col("net_bps").first().alias("start_net_bps"),
+        pl.col("size_usd").first().alias("size_usd_at_start"),
+    ]
+    if "direction" in frame.columns:
+        aggregations.append(pl.col("direction").first().alias("direction"))
+    for name in ("source", "fidelity"):
+        if name in frame.columns:
+            aggregations.append(pl.col(name).first().alias(name))
     return (
         tagged.filter(pl.col("core"))
         .group_by("_gid")
-        .agg(
-            t_start=pl.col(time_col).first(),
-            t_end=pl.col("_row_valid_end").max(),
-            peak_net_bps=pl.col("net_bps").max(),
-            start_net_bps=pl.col("net_bps").first(),
-            size_usd_at_start=pl.col("size_usd").first(),
-            direction=(
-                pl.col("direction").first()
-                if "direction" in frame.columns
-                else pl.lit(None)
-            ).alias("direction"),
-        )
+        .agg(aggregations)
         .drop("_gid")
         .sort("t_start")
     )
@@ -611,7 +625,7 @@ def _capture_grid(
                 "size_usd_at_start"
             )
         )
-    return episodes.drop("direction")
+    return episodes.drop("direction") if "direction" in episodes.columns else episodes
 
 
 def _add_capture(
@@ -790,6 +804,9 @@ def _empty_episodes(
     config: EpisodeConfig,
     compete: bool,
     markout: bool,
+    *,
+    has_source: bool = False,
+    has_fidelity: bool = False,
 ) -> pl.DataFrame:
     """Build a correctly typed zero-row episode frame."""
     schema: dict[str, pl.DataType] = {
@@ -801,6 +818,10 @@ def _empty_episodes(
         "size_usd_at_start": pl.Float64,
         "date": pl.Date,
     }
+    if has_source:
+        schema["source"] = pl.Utf8
+    if has_fidelity:
+        schema["fidelity"] = pl.Utf8
     for lat in config.latencies_ms:
         schema[f"open_{lat}"] = pl.Boolean
         schema[f"captured_{lat}"] = pl.Float64

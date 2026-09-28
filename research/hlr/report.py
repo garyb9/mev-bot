@@ -79,6 +79,7 @@ __all__ = [
     "canonical_digest",
     "canonical_episodes",
     "episode_digest",
+    "episode_provenance",
     "grade_study",
     "parse_front_matter",
     "rank_studies",
@@ -254,10 +255,9 @@ def build_front_matter(
     if days != len(dates):
         raise ReportError(f"days ({days}) must equal len(all_dates) ({len(dates)})")
     in_sample, out_sample = oos_split(dates)
-    if days != len(in_sample) + len(out_sample):
-        raise ReportError("days must equal in-sample plus out-of-sample days")
     sorted_capitals = sorted(float(c) for c in capital_runs)
-    data_source, backfill_sources = _provenance(capital_runs)
+    provenance_frames = list(capital_runs.values()) + list((robustness_runs or {}).values())
+    data_source, backfill_sources, derived_fidelity = episode_provenance(provenance_frames)
 
     capital_blocks: list[dict[str, Any]] = []
     for capital in sorted_capitals:
@@ -340,7 +340,7 @@ def build_front_matter(
             "preliminary": bool(preliminary),
             "data_source": data_source,
             "backfill_sources": list(backfill_sources),
-            "fidelity_class": fidelity_class,
+            "fidelity_class": derived_fidelity if derived_fidelity is not None else fidelity_class,
             "episode_digest": digest,
             "episode_parquet": episode_parquet,
             "headline_latency_ms": int(headline_latency_ms),
@@ -447,9 +447,9 @@ def grade_study(
     if days < min_days:
         verdict = INCONCLUSIVE
         reasons.append(f"only {days} valid day(s); need >= {min_days} for this report")
-    elif bool(front_matter.get("_digest_mismatch")):
+    elif front_matter.get("_digest_issue"):
         verdict = INCONCLUSIVE
-        reasons.append("episode parquet digest does not match the report")
+        reasons.append(str(front_matter["_digest_issue"]))
     elif lat is None:
         verdict = INCONCLUSIVE
         reasons.append(
@@ -624,9 +624,9 @@ def render_report(front_matter: Mapping[str, Any]) -> str:
     lines += [
         "",
         (
-            f"- Headline cell: L = {verdict.headline_latency_ms} ms, "
-            f"capital = ${verdict.headline_capital_usd:,.0f}, "
-            f"variant = `{verdict.headline_variant}`"
+            f"- Headline cell: L = {_fmt_cell(verdict.headline_latency_ms)} ms, "
+            f"capital = {_fmt_usd(verdict.headline_capital_usd)}, "
+            f"variant = `{verdict.headline_variant or HEADLINE_VARIANT}`"
         ),
         f"- Pre-registration git SHA: `{fm.get('prereg_sha') or ''}`",
         f"- Cells scanned (K): {fm.get('cells_K')}",
@@ -1076,24 +1076,38 @@ def episode_digest(capital_runs: Mapping[float, pl.DataFrame]) -> str:
     return canonical_digest(canonical_episodes(capital_runs))
 
 
-def _provenance(capital_runs: Mapping[float, pl.DataFrame]) -> tuple[str, tuple[str, ...]]:
-    """Derive ``(data_source, backfill_sources)`` from table ``source`` columns.
+def episode_provenance(
+    frames: Sequence[pl.DataFrame],
+) -> tuple[str, tuple[str, ...], str | None]:
+    """Derive ``(data_source, backfill_sources, fidelity_class)`` from the tables.
 
-    A ``recorder`` source is the forward lane; any other source (or no source
-    column at all, which cannot be proven forward) is conservatively backfill.
+    Every input table (capital runs and the buffered-cost robustness re-runs) must
+    carry a ``source`` column; if any frame lacks one its provenance cannot be
+    proven and the study is ``unknown`` (conservative: HIST-PRELIM). A
+    ``recorder`` source is the forward lane; any other source, or any non-null
+    ``fidelity`` value, is backfill. Mixed inputs therefore yield a non-forward
+    study.
     """
-    found_column = False
+    if not frames:
+        return "unknown", (), None
+    if any("source" not in frame.columns for frame in frames):
+        return "unknown", (), None
     sources: set[str] = set()
-    for frame in capital_runs.values():
-        if "source" in frame.columns:
-            found_column = True
-            sources.update(str(value) for value in frame["source"].unique().to_list())
-    if not found_column:
-        return "unknown", ()
+    fidelities: set[str] = set()
+    for frame in frames:
+        source_column = frame["source"]
+        if source_column.null_count() > 0:
+            return "unknown", (), None
+        sources.update(str(value) for value in source_column.unique().to_list())
+        if "fidelity" in frame.columns:
+            fidelities.update(
+                str(value) for value in frame["fidelity"].drop_nulls().unique().to_list()
+            )
     non_recorder = tuple(sorted(source for source in sources if source != "recorder"))
-    if non_recorder:
-        return "backfill", non_recorder
-    return "forward", ()
+    fidelity_class = ", ".join(sorted(fidelities)) if fidelities else None
+    if non_recorder or fidelities:
+        return "backfill", non_recorder, fidelity_class
+    return "forward", (), None
 
 
 def top_episodes(
@@ -1245,16 +1259,52 @@ def _nearest_capital_of(
 
 
 def _check_day_counts(front_matter: Mapping[str, Any], days: int) -> None:
-    """Verify ``days`` equals the in-sample plus out-of-sample day lists (§13.5)."""
-    in_dates = front_matter.get("in_sample_dates")
-    oos_dates = front_matter.get("oos_dates")
-    if in_dates is None and oos_dates is None:
-        return
-    total = len(in_dates or []) + len(oos_dates or [])
+    """Validate the chronological 60/40 day split declared by the front-matter.
+
+    Both ``in_sample_dates`` and ``oos_dates`` are required; they must be
+    duplicate-free, disjoint, and strictly ordered (every in-sample day before
+    every out-of-sample day), and together account for ``days``. Anything else
+    raises :class:`ReportError`.
+    """
+    in_dates = _require_date_list(front_matter, "in_sample_dates")
+    oos_dates = _require_date_list(front_matter, "oos_dates")
+    total = len(in_dates) + len(oos_dates)
     if total != days:
         raise ReportError(
             f"days ({days}) must equal in_sample_dates + oos_dates ({total})"
         )
+    overlap = set(in_dates) & set(oos_dates)
+    if overlap:
+        raise ReportError(f"in_sample_dates and oos_dates overlap: {sorted(overlap)}")
+    if in_dates and oos_dates and max(in_dates) >= min(oos_dates):
+        raise ReportError(
+            "in_sample_dates must be strictly before oos_dates (chronological split)"
+        )
+
+
+def _require_date_list(front_matter: Mapping[str, Any], key: str) -> list[_dt.date]:
+    """Return a front-matter date list as parsed dates, raising on any problem.
+
+    The key must exist and be a list; an empty list is allowed (a one-day study
+    has no out-of-sample days), but every entry must be a valid, unique ISO date.
+    """
+    raw = front_matter.get(key)
+    if not isinstance(raw, list):
+        raise ReportError(f"front-matter is missing the `{key}` list")
+    dates: list[_dt.date] = []
+    for value in raw:
+        if isinstance(value, _dt.date):
+            dates.append(value)
+        elif isinstance(value, str):
+            try:
+                dates.append(_dt.date.fromisoformat(value))
+            except ValueError as err:
+                raise ReportError(f"`{key}` has an invalid date {value!r}") from err
+        else:
+            raise ReportError(f"`{key}` must contain ISO dates, got {value!r}")
+    if len(set(dates)) != len(dates):
+        raise ReportError(f"`{key}` contains duplicate dates")
+    return dates
 
 
 def _is_forward(front_matter: Mapping[str, Any]) -> bool:
