@@ -156,6 +156,21 @@ enum Command {
         #[command(subcommand)]
         cmd: ProbeCmd,
     },
+    /// Nonce maintenance (SPEC-0002 H-6).
+    Nonce {
+        #[command(subcommand)]
+        cmd: NonceCmd,
+    },
+}
+
+/// Subcommands of `hl nonce`.
+#[derive(Subcommand)]
+enum NonceCmd {
+    /// Rewrite a corrupt persisted nonce so the bot can send again.
+    ///
+    /// Only valid when the stored value is beyond the venue's future window
+    /// (the fail-closed startup error). Does not load or need any key.
+    Reset,
 }
 
 /// Subcommands of `hl record`.
@@ -373,7 +388,47 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
                 record::probe_latency(network.map(Into::into), count).await
             }
         },
+        Command::Nonce { cmd } => match cmd {
+            NonceCmd::Reset => nonce_reset(network),
+        },
     }
+}
+
+/// Reset a corrupt persisted nonce (SPEC-0002 H-6).
+///
+/// Opens the configured SQLite directly — no agent key and no signer are needed
+/// to rewrite a `meta` row. Refuses unless the stored value is corrupt by the
+/// same rule the bot boots with (beyond `now +` the venue's future window), so
+/// it can never force a reuse while the bot is trading. Mirrors the in-process
+/// reset's new value: `now +` the write-behind lease.
+fn nonce_reset(network: Option<NetworkArg>) -> Result<()> {
+    let config = Config::load(ConfigOverrides {
+        network: network.map(Into::into),
+        ..Default::default()
+    })?;
+    reset_nonce_row(&config.db_path)
+}
+
+/// The testable core of `hl nonce reset`: rewrite `db_path`'s nonce row only if
+/// it is corrupt, printing the old and new values.
+fn reset_nonce_row(db_path: &std::path::Path) -> Result<()> {
+    use mev_hl_client::nonce::{DEFAULT_NONCE_LEASE_MS, VENUE_MAX_FUTURE_MS};
+
+    let db = Db::open(db_path)?;
+    let now = SystemClock.now_ms();
+    let old = db.nonce_last()?.unwrap_or(0);
+    let ceiling = now.saturating_add(VENUE_MAX_FUTURE_MS);
+    if old <= ceiling {
+        anyhow::bail!(
+            "refusing to reset: persisted nonce {old} is not beyond the venue future \
+             window ({ceiling}); the bot is not in the fail-closed corruption state"
+        );
+    }
+    let new = now.saturating_add(DEFAULT_NONCE_LEASE_MS);
+    db.set_nonce_last(new)?;
+    println!("nonce reset: old={old} new={new} ({})", db_path.display());
+    println!("the venue may reject a few orders until its seen-nonce window rolls past {old}");
+    Ok(())
 }
 
 /// Resolve the configured kill-switch flag file and write/remove it
@@ -1451,5 +1506,36 @@ mod tests {
             };
             assert!(live_exchange(&config).unwrap().is_none(), "{mode:?}");
         }
+    }
+
+    #[test]
+    fn nonce_reset_rewrites_only_a_corrupt_row() {
+        use mev_hl_client::nonce::{DEFAULT_NONCE_LEASE_MS, VENUE_MAX_FUTURE_MS};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hlbot.db");
+
+        // A normal stored value must be left alone.
+        Db::open(&path).unwrap().set_nonce_last(1_000).unwrap();
+        assert!(
+            reset_nonce_row(&path).is_err(),
+            "a non-corrupt row must be refused"
+        );
+        assert_eq!(Db::open(&path).unwrap().nonce_last().unwrap(), Some(1_000));
+
+        // A corrupt value (beyond the venue future window) is rewritten. Leave
+        // a margin so the forward-moving wall clock cannot make it non-corrupt
+        // between here and the reset.
+        let now = SystemClock.now_ms();
+        Db::open(&path)
+            .unwrap()
+            .set_nonce_last(now + VENUE_MAX_FUTURE_MS + 60_000)
+            .unwrap();
+        reset_nonce_row(&path).unwrap();
+        let rewritten = Db::open(&path).unwrap().nonce_last().unwrap().unwrap();
+        assert!(
+            rewritten >= now && rewritten <= now + DEFAULT_NONCE_LEASE_MS + 60_000,
+            "{rewritten} should be the new lease, not the corrupt value"
+        );
     }
 }

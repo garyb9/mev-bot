@@ -115,12 +115,44 @@ reuse a nonce.
 
 ## Nonce errors
 
-Symptom: `live` submissions rejected with a stale/duplicate nonce. Fix:
+The bot persists a nonce **high-water mark a lease ahead of what it sends**
+(`meta.nonce.last`), so a crash cannot reuse a nonce. Two distinct symptoms:
+
+**1. Stale/duplicate nonce rejects (the venue saw a higher nonce).** Fix:
 
 1. Ensure only one process uses the agent wallet.
 2. Confirm NTP/chrony is healthy (`timedatectl`); the clock must not regress.
 3. Restart the bot; the nonce state machine advances past the last value.
 4. If it persists, rotate to a fresh agent wallet.
+
+**2. Corrupt persisted nonce (fail-closed startup).** On boot, a persisted value
+beyond the venue's future window (`T + 1 day`) cannot be one this bot sent. The
+bot logs at `error` (search for `persisted nonce is beyond the venue future
+window`), increments `hl_nonce_resume_corrupt_total`, and **refuses every order**
+(`not sent: persisted nonce is corrupt…`) until it is reset. The bot will not
+clamp or issue a lower nonce on its own. Reset it explicitly:
+
+```sh
+# Stop the bot first so it does not rewrite the row.
+kill -TERM "$(pgrep -f 'hl run')"
+
+# Rewrites a *corrupt* row to now + the write-behind lease. Opens the
+# configured SQLite (HL_DB_PATH) directly; needs no agent key.
+hl nonce reset
+
+# Then restart; the first logs should show "starting", not the corruption error.
+hl run --mode live
+```
+
+`hl nonce reset` refuses unless the stored value is actually corrupt by the
+rule above, so it cannot force a reuse while the bot is trading. A normal
+nonce reset (`HttpExchange::reset_nonce`/`WsExchange::reset_nonce`) is likewise
+gated on the corruption state.
+
+After a reset the venue may reject a few orders (nonce stale/duplicate) until
+its window of the 100 highest seen nonces rolls past the old corrupt value; the
+self-heal resync then advances normally. If rejects continue for more than a few
+seconds, see symptom 1.
 
 ## Key rotation
 
