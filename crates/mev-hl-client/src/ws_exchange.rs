@@ -914,13 +914,15 @@ mod tests {
             .unwrap();
         exchange.submit(&action()).await.unwrap();
         let first = exchange.last_nonce().await;
-        assert_eq!(db.lock().unwrap().nonce_last().unwrap(), Some(first));
+        // The durable value is the write-ahead lease, so it covers the send.
+        let persisted = db.lock().unwrap().nonce_last().unwrap().unwrap();
+        assert!(persisted > first, "{persisted} must cover {first}");
 
         let restarted = WsExchange::with_url(url, Mode::Live, Some(signer()))
             .unwrap()
             .with_nonce_db(db.clone())
             .unwrap();
-        assert_eq!(restarted.last_nonce().await, first);
+        assert!(restarted.last_nonce().await >= persisted);
     }
 
     #[tokio::test]

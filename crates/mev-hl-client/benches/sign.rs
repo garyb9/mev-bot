@@ -16,14 +16,16 @@
 //! MEV_BENCH_QUICK=1 cargo bench -p mev-hl-client --bench sign
 //! ```
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use futures_util::{SinkExt, StreamExt};
 use mev_core::config::Mode;
+use mev_core::db::Db;
 use mev_hl_client::order::limit_order;
 use mev_hl_client::signing::AgentSigner;
-use mev_hl_client::{Action, ExchangeApi, Tif, WsExchange, build_request};
+use mev_hl_client::{Action, ExchangeApi, Tif, WriteCore, WsExchange, build_request};
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -126,6 +128,34 @@ async fn spawn_mock_venue() -> String {
     format!("ws://{addr}")
 }
 
+/// Full `WriteCore::prepare` stage for a live send with a durable nonce store:
+/// nonce reservation + persistence + build/msgpack/sign. This is the H-6 path
+/// whose persistence moved off the hot path (SPEC-0002 H-6).
+fn prepare_live_nonce_store(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let signer = AgentSigner::from_hex(BENCH_AGENT_KEY, true).expect("bench signer");
+    let db = Arc::new(Mutex::new(Db::open_in_memory().expect("nonce db")));
+    let core = WriteCore::new(Mode::Live, Some(signer))
+        .expect("write core")
+        .with_nonce_db(db)
+        .expect("nonce store");
+    let action = order_action(1);
+    assert!(
+        runtime.block_on(core.prepare(&action)).is_ok(),
+        "prepare must succeed before benchmarking"
+    );
+
+    c.bench_function("prepare/live_nonce_store", |b| {
+        b.iter(|| {
+            let prepared = runtime.block_on(core.prepare(black_box(&action)));
+            black_box(prepared.is_ok());
+        })
+    });
+}
+
 fn ws_post_round_trip(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -151,6 +181,6 @@ fn ws_post_round_trip(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = criterion_config();
-    targets = sign_one, sign_batch_10, ws_post_round_trip
+    targets = sign_one, sign_batch_10, prepare_live_nonce_store, ws_post_round_trip
 }
 criterion_main!(benches);

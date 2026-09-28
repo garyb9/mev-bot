@@ -17,12 +17,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use mev_core::{
+    clock::{Clock, SystemClock},
     config::{Mode, Network},
-    db::Db,
+    db::{Db, writer::DbWriter},
     error::{Error, Result},
 };
 
-use crate::nonce::{NonceManager, now_ms};
+use crate::nonce::{DEFAULT_NONCE_LEASE_MS, NONCE_WRITE_QUEUE, NonceLease, NonceManager};
 use crate::order::{Action, CancelByCloidWire, CancelWire, OrderWire};
 use crate::signing::{AgentSigner, Signature};
 
@@ -368,16 +369,20 @@ pub trait ExchangeApi: Send + Sync {
 pub enum Prepared {
     /// Signed but must not be sent (`simulate` mode).
     DryRun(Box<ExchangeRequest>),
-    /// Signed, nonce persisted, ready to send (`live` mode).
+    /// Signed, nonce covered by the durable lease, ready to send (`live` mode).
     Send(Box<ExchangeRequest>),
 }
 
 /// Shared write path used by every transport: mode gating, EIP-712 signing,
-/// nonce sequencing, and durable high-water-mark persistence (SPEC-0002 §5).
+/// nonce sequencing, and write-behind lease persistence (SPEC-0002 §5, H-6).
 pub struct WriteCore {
     signer: Option<AgentSigner>,
     nonce: tokio::sync::Mutex<NonceManager>,
-    db: Option<Arc<Mutex<Db>>>,
+    /// Coalesced write-behind nonce persistence; absent when no store is
+    /// attached, in which case no nonce is persisted (tests, `observe`).
+    nonce_store: Option<NonceLease>,
+    clock: Arc<dyn Clock>,
+    nonce_lease_ms: u64,
     gate: WriteGate,
     expires_after: Option<u64>,
     vault_address: Option<String>,
@@ -403,7 +408,9 @@ impl WriteCore {
         Ok(Self {
             signer,
             nonce: tokio::sync::Mutex::new(NonceManager::new()),
-            db: None,
+            nonce_store: None,
+            clock: Arc::new(SystemClock),
+            nonce_lease_ms: DEFAULT_NONCE_LEASE_MS,
             gate,
             expires_after: None,
             vault_address: None,
@@ -411,20 +418,41 @@ impl WriteCore {
         })
     }
 
+    /// Inject the clock used for nonce generation (tests).
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Override the write-ahead nonce lease (in nonce space). Values below 4 are
+    /// clamped so the half-lease refresh threshold stays meaningful.
+    pub fn with_nonce_lease(mut self, lease_ms: u64) -> Self {
+        self.nonce_lease_ms = lease_ms.max(4);
+        self
+    }
+
     /// Attach a durable nonce store and restore the persisted high-water mark.
+    ///
+    /// The startup prime writes `max(restored, now) + lease` synchronously
+    /// (once, off the hot path); every later persist is write-behind. The
+    /// nonce manager resumes from the restored value and the drift guard treats
+    /// that value as a trusted floor (SPEC-0002 H-6).
     pub fn with_nonce_db(mut self, db: Arc<Mutex<Db>>) -> Result<Self> {
-        let restored = {
+        let now = self.clock.now_ms();
+        let (restored, horizon) = {
             let guard = db
                 .lock()
                 .map_err(|_| Error::Config("db lock poisoned".into()))?;
-            guard.nonce_last()?
+            let restored = guard.nonce_last()?.unwrap_or(0);
+            let horizon = restored.max(now).saturating_add(self.nonce_lease_ms);
+            guard.set_nonce_last(horizon)?;
+            (restored, horizon)
         };
-        let mut manager = NonceManager::new();
-        if let Some(last) = restored {
-            manager = NonceManager::restore(last);
-        }
-        self.nonce = tokio::sync::Mutex::new(manager);
-        self.db = Some(db);
+        let writer = DbWriter::spawn_shared(db, NONCE_WRITE_QUEUE);
+        let durable = writer.nonce_hwm();
+        let lease = NonceLease::new(writer, horizon, self.nonce_lease_ms, durable, now);
+        self.nonce = tokio::sync::Mutex::new(NonceManager::resume(restored));
+        self.nonce_store = Some(lease);
         Ok(self)
     }
 
@@ -445,32 +473,27 @@ impl WriteCore {
         self
     }
 
-    /// Restore the persisted nonce high-water mark.
+    /// Restore a specific nonce high-water mark.
     pub async fn restore_nonce(&self, last: u64) {
-        *self.nonce.lock().await = NonceManager::restore(last);
+        *self.nonce.lock().await = NonceManager::resume(last);
+        if let Some(store) = &self.nonce_store {
+            store.force(last, self.clock.now_ms());
+        }
     }
 
-    /// The current nonce high-water mark (for persistence).
+    /// The current nonce high-water mark (for persistence and tests).
     pub async fn last_nonce(&self) -> u64 {
         self.nonce.lock().await.last()
     }
 
     /// Resync the nonce after a stale/duplicate/recent-window rejection.
     pub async fn heal_nonce(&self) -> u64 {
-        let nonce = self.nonce.lock().await.on_reject(now_ms());
-        let _ = self.persist_nonce(nonce);
-        nonce
-    }
-
-    /// Write the nonce high-water mark to the durable store, if attached.
-    fn persist_nonce(&self, nonce: u64) -> Result<()> {
-        if let Some(db) = &self.db {
-            let guard = db
-                .lock()
-                .map_err(|_| Error::Config("db lock poisoned".into()))?;
-            guard.set_nonce_last(nonce)?;
+        let now = self.clock.now_ms();
+        let nonce = self.nonce.lock().await.on_reject(now);
+        if let Some(store) = &self.nonce_store {
+            store.force(nonce, now);
         }
-        Ok(())
+        nonce
     }
 
     /// Sign the next envelope for `action`, gated and persisted for `live`.
@@ -484,7 +507,8 @@ impl WriteCore {
             .signer
             .as_ref()
             .ok_or_else(|| Error::Config("no agent signer is configured".into()))?;
-        let nonce = self.nonce.lock().await.next(now_ms());
+        let now = self.clock.now_ms();
+        let nonce = self.nonce.lock().await.next(now);
         let started = Instant::now();
         let built = build_request(
             action,
@@ -500,8 +524,11 @@ impl WriteCore {
         if self.gate == WriteGate::DryRun {
             return Ok(Prepared::DryRun(Box::new(request)));
         }
-        // Persist before sending so a crash cannot reuse this nonce.
-        self.persist_nonce(nonce)?;
+        // Off the hot path: at most an atomic read and a `Copy` enqueue. The
+        // write-behind lease guarantees a crash cannot reuse this nonce.
+        if let Some(store) = &self.nonce_store {
+            store.cover(nonce, now)?;
+        }
         Ok(Prepared::Send(Box::new(request)))
     }
 }
@@ -710,6 +737,7 @@ mod tests {
     use crate::order::{Action, Grouping, Tif, limit_order};
     use crate::test_metrics::histogram_samples;
     use metrics_util::debugging::DebuggingRecorder;
+    use mev_core::clock::FixedClock;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
@@ -879,7 +907,9 @@ mod tests {
             .unwrap();
         exchange.submit(&simple_action()).await.unwrap();
         let first = exchange.last_nonce().await;
-        assert_eq!(db.lock().unwrap().nonce_last().unwrap(), Some(first));
+        // The durable value is the write-ahead lease, so it covers what was sent.
+        let persisted = db.lock().unwrap().nonce_last().unwrap().unwrap();
+        assert!(persisted > first, "{persisted} must cover {first}");
 
         // A fresh instance restores the persisted high-water mark and never
         // regresses.
@@ -887,9 +917,123 @@ mod tests {
             .unwrap()
             .with_nonce_db(db.clone())
             .unwrap();
-        assert_eq!(restarted.last_nonce().await, first);
+        let resumed = restarted.last_nonce().await;
+        assert!(resumed >= first, "{resumed} must not be below {first}");
         restarted.submit(&simple_action()).await.unwrap();
-        assert!(restarted.last_nonce().await > first);
+        assert!(restarted.last_nonce().await > resumed);
+    }
+
+    #[tokio::test]
+    async fn write_behind_nonce_survives_a_crash_without_a_flush() {
+        // A fixed clock: the burst runs faster than 1/ms, so sent nonces run
+        // ahead of the wall clock and the clock never advances to catch up.
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+
+        let mut sent = Vec::new();
+        let prime;
+        {
+            let core = WriteCore::new(Mode::Live, Some(signer()))
+                .unwrap()
+                .with_clock(clock.clone())
+                .with_nonce_lease(100)
+                .with_nonce_db(db.clone())
+                .unwrap();
+            prime = db.lock().unwrap().nonce_last().unwrap().unwrap();
+            for _ in 0..40 {
+                match core.prepare(&simple_action()).await.unwrap() {
+                    Prepared::Send(request) => sent.push(request.nonce),
+                    Prepared::DryRun(_) => panic!("live mode must send"),
+                }
+            }
+            // The burst fit inside the startup lease, so nothing was enqueued
+            // write-behind: the database still holds only the lease.
+            assert_eq!(db.lock().unwrap().nonce_last().unwrap(), Some(prime));
+            // "Crash": drop without a graceful flush. Crash safety must not
+            // depend on the per-order nonces.
+        }
+        let max_sent = *sent.iter().max().unwrap();
+        assert_eq!(sent.len(), 40);
+        assert!(
+            max_sent < prime,
+            "{max_sent} must fit inside the lease {prime}"
+        );
+
+        let restarted = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_clock(clock)
+            .with_nonce_lease(100)
+            .with_nonce_db(db.clone())
+            .unwrap();
+        for _ in 0..10 {
+            match restarted.prepare(&simple_action()).await.unwrap() {
+                Prepared::Send(request) => {
+                    assert!(
+                        request.nonce > max_sent,
+                        "restarted nonce {} reuses or regresses below {max_sent}",
+                        request.nonce
+                    );
+                }
+                Prepared::DryRun(_) => panic!("live mode must send"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_refresh_is_persisted_write_behind() {
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let core = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_clock(clock)
+            .with_nonce_lease(100)
+            .with_nonce_db(db.clone())
+            .unwrap();
+        let prime = db.lock().unwrap().nonce_last().unwrap().unwrap();
+
+        // Send enough to spend the half-lease: a refresh is scheduled
+        // write-behind and the durable horizon advances past the prime.
+        for _ in 0..80 {
+            assert!(matches!(
+                core.prepare(&simple_action()).await.unwrap(),
+                Prepared::Send(_)
+            ));
+        }
+
+        let mut persisted = prime;
+        for _ in 0..2_000 {
+            persisted = db.lock().unwrap().nonce_last().unwrap().unwrap();
+            if persisted > prime {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(persisted > prime, "write-behind refresh should persist");
+    }
+
+    #[tokio::test]
+    async fn prepare_does_not_write_the_database_synchronously() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        // A lease far larger than the test burst guarantees no refresh is due.
+        let core = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_nonce_lease(1_000_000)
+            .with_nonce_db(db.clone())
+            .unwrap();
+        let prime = db.lock().unwrap().nonce_last().unwrap().unwrap();
+        let before = core.last_nonce().await;
+
+        for _ in 0..50 {
+            assert!(matches!(
+                core.prepare(&simple_action()).await.unwrap(),
+                Prepared::Send(_)
+            ));
+        }
+
+        // Nonces advanced in memory, but the durable value is still the startup
+        // prime: persistence went to the writer channel, not the database.
+        assert!(core.last_nonce().await > before);
+        assert_eq!(db.lock().unwrap().nonce_last().unwrap(), Some(prime));
     }
 
     #[tokio::test]

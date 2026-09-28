@@ -201,7 +201,7 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 | H-3 | Account stream (`orderUpdates`, `userFills`, `userEvents`) | T1 | M | SPEC-0008 R-3 | ✅ |
 | H-4 | Dead-man's switch policy (arm only when needed; fail closed) | **T0** | S | H-1 | ✅ |
 | H-5 | Apply `bbo` to `MarketState` | T1 | S | — | ✅ |
-| H-6 | Nonce persistence off the hot path | T1 | S | H-9 | ☐ |
+| H-6 | Nonce persistence off the hot path | T1 | S | H-9 | ✅ |
 | H-7 | Latency instrumentation + sign/submit benchmarks | T1 | M | H-1 | ✅ |
 | H-8 | `simulate` without keys (ephemeral signer) | T1 | S | — | ✅ |
 | H-9 | Verify the HL nonce and `scheduleCancel` rules | **T0** | S | — | ✅ |

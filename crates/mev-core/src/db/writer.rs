@@ -7,7 +7,9 @@
 //! backpressure to trading.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use tracing::{debug, error, warn};
@@ -68,6 +70,13 @@ pub enum WriteCmd {
         /// Open-order rows.
         records: Vec<OpenOrderRecord>,
     },
+    /// Persist an agent nonce high-water mark (write-ahead, SPEC-0002 H-6).
+    ///
+    /// A `Copy` payload: coalescing write-behind, never a per-order allocation.
+    Nonce {
+        /// The high-water mark to persist.
+        nonce: u64,
+    },
     /// Stop the writer after draining everything queued ahead of it.
     Shutdown,
 }
@@ -77,20 +86,39 @@ pub enum WriteCmd {
 pub struct DbWriter {
     tx: SyncSender<WriteCmd>,
     handle: Option<JoinHandle<()>>,
+    nonce_hwm: Arc<AtomicU64>,
 }
 
 impl DbWriter {
     /// Spawn the writer with a bounded queue of `capacity` commands.
     pub fn spawn(db: Db, capacity: usize) -> Self {
+        Self::spawn_shared(Arc::new(Mutex::new(db)), capacity)
+    }
+
+    /// Spawn the writer over a shared connection.
+    ///
+    /// Lets several actors (the recorder, the nonce write-behind) serialize
+    /// their writes through one connection while sharing a single in-memory
+    /// database in tests.
+    pub fn spawn_shared(db: Arc<Mutex<Db>>, capacity: usize) -> Self {
         let (tx, rx) = sync_channel(capacity.max(1));
+        let nonce_hwm = Arc::new(AtomicU64::new(0));
+        let thread_hwm = nonce_hwm.clone();
         let handle = thread::Builder::new()
             .name("db-writer".to_string())
-            .spawn(move || run(db, &rx))
+            .spawn(move || run(db, &rx, &thread_hwm))
             .expect("spawn db-writer thread");
         Self {
             tx,
             handle: Some(handle),
+            nonce_hwm,
         }
+    }
+
+    /// The shared durable nonce high-water mark, published by the writer thread
+    /// after each successful [`WriteCmd::Nonce`] (SPEC-0002 H-6).
+    pub fn nonce_hwm(&self) -> Arc<AtomicU64> {
+        self.nonce_hwm.clone()
     }
 
     /// Enqueue a command without blocking. Returns `false` if the queue was full
@@ -145,24 +173,34 @@ fn cmd_kind(cmd: &WriteCmd) -> &'static str {
         WriteCmd::Funding { .. } => "funding",
         WriteCmd::Positions { .. } => "positions",
         WriteCmd::OpenOrders { .. } => "open_orders",
+        WriteCmd::Nonce { .. } => "nonce",
         WriteCmd::Shutdown => "shutdown",
     }
 }
 
-fn run(db: Db, rx: &Receiver<WriteCmd>) {
+fn run(db: Arc<Mutex<Db>>, rx: &Receiver<WriteCmd>, nonce_hwm: &AtomicU64) {
     let mut seqs: HashMap<i64, u64> = HashMap::new();
     while let Ok(cmd) = rx.recv() {
         if matches!(cmd, WriteCmd::Shutdown) {
             break;
         }
-        if let Err(err) = apply(&db, &mut seqs, cmd) {
+        let result = match db.lock() {
+            Ok(guard) => apply(&guard, &mut seqs, nonce_hwm, cmd),
+            Err(_) => Err(crate::error::Error::Config("db lock poisoned".into())),
+        };
+        if let Err(err) = result {
             error!(error = %err, "db write failed");
         }
     }
     debug!("db writer stopped");
 }
 
-fn apply(db: &Db, seqs: &mut HashMap<i64, u64>, cmd: WriteCmd) -> Result<()> {
+fn apply(
+    db: &Db,
+    seqs: &mut HashMap<i64, u64>,
+    nonce_hwm: &AtomicU64,
+    cmd: WriteCmd,
+) -> Result<()> {
     match cmd {
         WriteCmd::Event {
             session_id,
@@ -194,6 +232,11 @@ fn apply(db: &Db, seqs: &mut HashMap<i64, u64>, cmd: WriteCmd) -> Result<()> {
             ts_ms,
             records,
         } => db.insert_open_orders(session_id, ts_ms, &records)?,
+        WriteCmd::Nonce { nonce } => {
+            db.set_nonce_last(nonce)?;
+            // Publish only after the write is durable, and never regress it.
+            nonce_hwm.fetch_max(nonce, Ordering::AcqRel);
+        }
         WriteCmd::Shutdown => {}
     }
     Ok(())
@@ -276,6 +319,22 @@ mod tests {
             vec![0, 1, 2]
         );
         assert_eq!(events[2].kind, "ctx");
+    }
+
+    #[test]
+    fn persists_nonce_high_water_mark() {
+        let (_dir, path) = temp_path("nonce");
+        let db = Db::open(&path).unwrap();
+        let writer = DbWriter::spawn(db, 4);
+        let hwm = writer.nonce_hwm();
+        assert!(writer.try_send(WriteCmd::Nonce {
+            nonce: 1_700_000_000_000
+        }));
+        writer.shutdown();
+        // The marker is published only after the write is durable.
+        assert_eq!(hwm.load(Ordering::Acquire), 1_700_000_000_000);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.nonce_last().unwrap(), Some(1_700_000_000_000));
     }
 
     #[test]
