@@ -76,7 +76,7 @@ Components and where they live:
 | HyperEVM pool source | `crates/mev-recorder/src/sources/evm.rs` | Rust | R-9 |
 | Deployment | `deploy/recorder/`, `RUNBOOK.md` | systemd / docs | R-10 |
 | Research toolkit | `research/hlr/` | Python | P-1…P-5 |
-| Studies + reports | `research/studies/`, `research/reports/` | Python / Markdown | S-1…S-11b |
+| Studies + reports | `research/studies/`, `research/reports/` | Python / Markdown | S-1…S-23 |
 
 **Decision — Python for research.** Research uses Python 3.12 + `uv` + `polars` (+ `duckdb` where SQL is easier). Rationale: much faster iteration for analysis, and research code never touches money paths. Production stays Rust. Research code must not be imported by, or deployed with, the bot.
 
@@ -477,6 +477,8 @@ Per episode, record:
 
 Every latency-sensitive number is reported for **L ∈ {10, 50, 100, 250, 500, 1000} ms**. `L` is the time from the first data that reveals the episode to our orders arriving at the venue. The **headline** latency is **L = 250 ms** until measurements replace it: network RTT from V-4 plus internal tick-to-order from SPEC-0002 H-7 ([`docs/GOAL.md`](../docs/GOAL.md) §5.2). Because speed is a project priority, every report also states the **minimum latency at which the study still passes** (the "latency requirement").
 
+**Reveal delay (backfill).** Historical data carries the exchange's timestamp, not our receive time: Tardis's Tokyo collector observed HL `bbo` arriving p1 173 / p50 229 / p90 319 ms after the HL exchange time (BTC, 2026-09-01; histdata review). Backfilled studies must add the measured HL publish lag to every `L` (a study parameter, B-9) or run on `local_timestamp`; V-4 measures the lag from our host.
+
 ### 13.5 Study metrics (same columns in every report)
 
 | Metric | Definition |
@@ -487,9 +489,14 @@ Every latency-sensitive number is reported for **L ∈ {10, 50, 100, 250, 500, 1
 | `duration_ms` | p50 / p90 of episode durations |
 | `peak_net_bps` | p50 / p90 |
 | `capture_rate_L` | Share of episodes still open at `+L` |
+| `capture_naive_L` / `capture_adj_L` | Naive (still-open) vs competition-adjusted capture (§13.10; the displayed size at the episode price minus what someone else traded in `[t_start, t_start+L]`). The verdict uses `capture_adj_L`. |
 | `usd_per_day_L` | Σ `captured_L` / days, at the study's `max_notional` |
+| `usd_per_day_L_ci90` | 90% CI of `usd_per_day_L` from a day-block bootstrap (resample days, 2,000 draws; §13.10) |
+| `cells_K` | Number of (pair × cell) combinations scanned in the grid; the headline is the OOS-selected cell with no re-selection (§13.10) |
 | `capital_usd` | Capital needed to run the strategy at that notional (both legs, margin at 3× unless stated). Evaluated at every point of the **capital grid** in `research/thresholds.toml` (default $10k / $25k / $50k / $100k): `max_notional` scales with capital, but capture is capped by the book size available in each episode, so APR usually falls as capital grows. |
 | `apr_L` | `usd_per_day_L × 365 / capital_usd`, reported for each capital grid point |
+| `apr_L_ci90` | 90% CI of `apr_L`; the lower bound gates PASS (§13.6) |
+| `markout_1s` / `markout_10s` | Median mid move over +1 s / +10 s after the hypothetical fill (adverse selection; §13.10) |
 | `best_capital_usd` | The grid point with the highest `usd_per_day_L` that still meets the APR floor |
 | `concentration` | Share of total PnL from the single best day (robustness; > 50% is a red flag) |
 | `competition_hint` | p50 duration < 100 ms ⇒ "latency-competitive"; > 2 s ⇒ "slow / capacity-bound" |
@@ -523,10 +530,12 @@ Each study gets one verdict, evaluated at the headline latency **and** the headl
 
 | Verdict | Rule | Meaning |
 |---|---|---|
-| **PASS** | `apr_L ≥ apr.target` **and** every `[quality]` criterion holds | Build it (candidate for M5) |
+| **PASS** | `apr_L ≥ apr.target` **and** the 90% CI lower bound of `apr_L` ≥ `apr.floor` **and** every `[quality]` criterion holds | Build it (candidate for M5) |
 | **MARGINAL** | `apr.floor ≤ apr_L < apr.target` **and** every `[quality]` criterion holds | Acceptable. Build it if it's cheap to implement, stacks with a PASS strategy on shared infrastructure, or nothing passes. |
 | **FAIL** | `apr_L < apr.floor`, **or** any `[quality]` criterion fails | Don't build it (re-test later if conditions change) |
 | **INCONCLUSIVE** | Not enough data (`days`/`coverage_pct` too low) | Keep recording; re-run |
+
+For fast (episode) studies the verdict uses the out-of-sample (last 40%), competition-adjusted, jittered-latency numbers (§13.10), not the in-sample point estimate; a study whose point estimate is ≥ target but whose 90% CI lower bound is < floor is **MARGINAL**, not PASS.
 
 **Pilot allowance.** The owner may approve a **time-boxed, small-capital live pilot** for a study that is MARGINAL, or INCONCLUSIVE with a positive point estimate, when the owner has an independent prior (e.g. discretionary trading experience). This matches GOAL §9 gate G1.5. A pilot needs: an ADR entry naming the study and the cap; capital ≤ `[pilot].max_capital_usd`; duration ≤ `[pilot].max_weeks`; a hard stop at `[pilot].max_loss_usd`; and the G2 safety gate already passed. Pilot results are fed back into the study report as realized-vs-expected.
 
@@ -546,11 +555,13 @@ Every study writes `research/reports/O{n}-{slug}.md` with exactly these sections
 
 1. **Hypothesis** (one paragraph)
 2. **Data**: date range, tables, markets, `coverage_pct`, gaps excluded
-3. **Method**: which legs, the `net_bps` formula, parameters (`buffer_bps`, `max_notional`, `stale_ms`), anything that departs from §13
-4. **Results**: the §13.5 metrics table, latency-grid table, per-day bar chart (PNG in `research/reports/img/`), top-10 episodes table
+3. **Method**: which legs, the `net_bps` formula, parameters (`buffer_bps`, `max_notional`, `stale_ms`), the **pre-registration git SHA** from `research/REGISTRY.md`, anything that departs from §13
+4. **Results**: the §13.5 metrics table, latency-grid table, per-day bar chart (PNG in `research/reports/img/`), top-10 episodes table, **artifact counts** (excluded vs counted), and **sensitivity rows** (clock-skew shift, jittered latency, buffer × multiplier)
 5. **Sanity checks**: at least 3 of the largest episodes inspected by hand against raw frames; is each real, or a data artifact?
 6. **Verdict**: PASS / MARGINAL / FAIL / INCONCLUSIVE against §13.6 (and §13.8 for slow-signal studies), the APR at each capital grid point, implementation cost S/M/L, and the main risks
 7. **Reproduce**: the exact command(s) and git SHA
+
+Backfill runs are stamped `PRELIMINARY (backfill: <sources>)` and carry the `HIST-PRELIM` qualifier (§13.11).
 
 ### 13.8 Slow-signal method (task P-6; used by O9, O10 Part B, and optionally O6/O7)
 
@@ -571,7 +582,7 @@ Episodes (§13.3) fit fast dislocations. **Directional signals held for hours or
 
 ### 13.9 The studies
 
-Each study below maps to one or more tasks (S-1…S-11b, tiered in §14.0–14.1). Fast studies depend on P-1…P-5, slow-signal parts also on P-6, plus the data listed.
+Each study below maps to one or more tasks (S-1…S-23, tiered in §14.0–14.1). Fast studies depend on P-1…P-5, slow-signal parts also on P-6, plus the data listed.
 
 ### O1 — HIP-3 / main-dex same-underlying dislocations (task S-1)
 
@@ -695,6 +706,215 @@ Prior: in finsnap's backtests across its whole universe, **Bollinger Reversion**
 | History | Part B 1h: HL candle history (months). Parts A and B sub-hour: forward-recorded bars. Stock-proxy pre-check: the V-11 provider's multi-year stock minute bars can test Part B's rule on the underlying stocks right away (like O9a). |
 | Pre-registration | Parameters above are the complete grid, fixed now. Report every cell; the headline is the out-of-sample result of the cell chosen on the in-sample 60%. |
 
+### O12 — Oracle-update timing and mark-price trigger cascade (task S-12)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | The oracle is republished by validators every ~3 s as a stake-weighted median of 8 CEX spot prices (weights Binance 3, OKX/Bybit 2, others 1); mark price derives from it. Between ticks `oraclePx` can lag a fast CEX move, and TP/SL triggers plus some liquidations fire in a burst at/after the next tick. Trade (a) the HL perp when the oracle/book has not repriced after a > fees+buffer move on the high-weight CEXs, and (b) rest ALO to receive the post-tick burst and exit on reversion. |
+| Data | `ctx` (`oraclePx`, `markPx`, funding; plus `fastAssetCtxs` for faster `markPx`/`midPx`) ⚠ verify, `bbo`, `trades`, CEX `bbo`; derived `oracle_updates (t_ns, market, oracle_px, mark_px, tick_index_est)` |
+| Signal | Fast (§13.3). Fair = weighted-median CEX mid (documented weights). Episode when `sign(fair − oraclePx)` persists and `\|fair − oraclePx\| > fees + buffer`. Also an event study at inferred oracle-tick boundaries (first frame whose `oraclePx` changes); headline `L` is tick-aligned, not a flat 250 ms. |
+| Latency | High (a race). §13.4 grid plus jittered latency; report the minimum passing `L`. |
+| Special checks | Infer tick cadence from data (never assume exactly 3 s); `markPx` blends book state, so an `oraclePx` lag may not be tradable; CEX feeds must be fresh and clock skew < 1 ms (±25 ms sensitivity); exclude episodes within 1 s of a gap/reconnect. **Could fail:** the tradable mark reprices faster than the oracle; MMs stack ALO on the burst (prioritized over taker); the lag is tiny unless a high-weight venue gaps. |
+| Prereq | V-1, R-8 |
+
+### O13 — HIP-3 deployer-oracle stair-step / stale fallback (task S-13)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | HIP-3 oracles are pushed by the deployer (`setOracle`) at most once per 2.5 s ("expected every 3 s") and the mark move is clamped to 1% per update (prices clamped to 10× start-of-day); a stale mark falls back to the local mark after 10 s. When the real underlying gaps, the perp can only walk toward it at ≤ 1%/update. Trade the perp toward external fair while the clamp/staleness binds, and fade the one-way stair-step when the underlying stalls. |
+| Data | `ctx` (`oraclePx`, `markPx`, `premium`), `bbo`, `equity_quotes`/CEX, `markets`; derived `hip3_oracle_updates (t_ns, dex, coin, oracle_px, mark_px, dt_since_prev)`; `perpDexs` (deployer, caps, funding multipliers) |
+| Signal | Episodes (§13.3) vs `fair_external` (V-11/V-12 reference) net of the true HIP-3 deployer fee scale; detect clamp-limited moves (\|Δmark\| ≈ 1%) and time since the last update. Also a §13.8 "convergence completion" event study. |
+| Latency | Medium (stair-steps persist seconds–minutes); `L` = 250 ms–1 s. |
+| Special checks | Exclude `haltTrading`/settled periods; `externalPerpPx` is node-only, so infer it from the external feed; verify the clamp is on the **mark**, not the oracle; per-dex behavior is heterogeneous. **Could fail:** convergence (1%/2.5 s) is too fast to cover two taker fees; the deployer widens/stops updates exactly when it matters; funding on the lagging dex eats the edge. |
+| Prereq | V-12 |
+
+### O14 — Funding-settlement timing (hourly print) (task S-14)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | Funding settles hourly at 1/8 of the computed 8 h rate, which is the average premium sampled every 5 s plus a clamped interest component; the payment uses the **oracle** notional, so the next hourly print is largely known before settlement. Harvest a large known print with a short delta-managed position, and trade the predictable pre-settlement hedging flow. |
+| Data | `ctx`, `funding_hist`, `bbo`, `trades`; `perpDexs` + deployer actions (multipliers, interest, clamps); derived `funding_params` |
+| Signal | Event study around each hourly boundary for Δ ∈ {60, 30, 10, 3, 1} min: mid path and "enter at T−Δ, exit at T+Δ'" net of 2×taker + funding. Compare predicted (trailing premium average) vs realized (`funding_hist`); test hedging the price risk on a correlated perp. |
+| Latency | Low/medium; report at `L` = 1 s. |
+| Special checks | Separate funding PnL from mark-to-market and report both; check the print is not already in a persistent basis (then it is O7); bucket rates at the 4%/h cap separately (possible deployer manipulation). **Could fail:** baseline funding (~1.25 bp/h) is below 9 bp round-trip taker outside extremes; unwinding into the post-settlement crowd gives back the print; rates flip sign often. |
+| Prereq | V-3, V-12 |
+
+### O15 — Liquidation-cluster ladder (forward map) (task S-15)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | `clearinghouseState` exposes every address's positions and `liquidationPx`; aggregating public positions gives a per-coin liquidation ladder. When price approaches a cluster the forced flow is partly predictable: rest ALO just beyond a large cluster to receive it and exit on reversion, or lean after the cluster starts triggering and take profit on exhaustion. |
+| Data | `positions (t_ns, user, dex, coin, szi, entry_px, liquidation_px, margin_used, leverage_type, account_value)` from `clearinghouseState` per watched address or node outputs; `ctx`, `bbo`, `trades` |
+| Signal | Build the ladder continuously; event study keyed on "distance to next cluster" and "cluster notional / ADV". Measure overshoot, reversion speed, and PnL of (a) ALO inside the cascade and (b) taker lean, net of taker. |
+| Latency | High for entering a triggered cascade; medium/low for the ALO variant. |
+| Special checks | `liquidationPx` is a moving target (funding, cross-margin, top-ups): report the map's error. The public API is one address per call and WS caps at **10 users/connection**, so full coverage needs the node/S3 or the ladder is a biased sample. Separate book liquidations from backstop/HLP and ADL. **Could fail:** margin moves stale the map during volatility; the 30 s cooldown and 20%-per-block partial-liquidation rule slow cascades; HLP internalizes the flow. |
+| Prereq | New public-positions/node source, V-1 |
+
+### O16 — Public TWAP-flow prediction (task S-16)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | TWAP orders are public chain state: `twapStates`/`userTwapHistory`/`userTwapSliceFills` expose `executedSz`, total `sz`, `minutes`, `randomize`, `reduceOnly`, and slices are ≥ 30 s apart with "catch-up" slices up to 3× normal (3% slippage cap). Front-load risk on the side a visibly-behind TWAP must trade, or provide liquidity into the catch-up slice and fade the ending. |
+| Data | `twap (t_ns, user, coin, side, total_sz, executed_sz, minutes, randomize, reduce_only, status)` from a `twapStates` watchlist or (ideally) all TWAPs from node L1/S3 `replica_cmds` ⚠ verify; `bbo`, `trades`, `book` |
+| Signal | Detect large TWAPs (notional / 1 h ADV above a threshold); episode = "active TWAP behind target by X%". Measure drift over the remaining schedule, the catch-up slice, and post-completion reversion, net of taker. |
+| Latency | Medium (slice cadence ≥ 30 s; the catch-up is the fast part). |
+| Special checks | `randomize` (±20%) and the 3× cap blunt prediction; WS shows only the next 8 nonces/current state, so the full population needs node/S3. Distinguish TWAPs from other algorithmic flow; a TWAP that cannot fill (3% cap) is not price-insensitive forever. **Could fail:** a large visible TWAP is already priced; randomisation kills per-slice prediction; the ending may not revert. |
+| Prereq | New node/TWAP source, V-8 |
+
+### O17 — HIP-4 outcomes: digital vs Deribit + 06:00 pin (task S-17)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | HL has native **HIP-4 outcome markets** (fully-collateralized binaries; a daily 06:00 UTC binary settling to the HyperCore **mark**, extended to BTC/ETH/HYPE/SOL — launch date ⚠ verify). Their prices can diverge from a Deribit-implied digital beyond costs; the 06:00 mark settlement pins the underlying perp; and the merged Yes/No book can show transient locked/crossed states. |
+| Data | New `outcomes` source: `outcomeMeta`, outcome `l2Book`/`bbo`/`trades` (Yes and No); `deribit_options`, HL perp `bbo`/`ctx`, `trades` |
+| Signal | (a) §13.3 cross-venue vs a Deribit smile-replicated digital, minus fees (docs say zero opening/closing fees; builder fees may apply on sells ⚠ verify); (b) event study of the perp mark path and outcome decay into 06:00; (c) microstructure: `Yes_ask + No_ask < 1 − buffer` (buy both) and `Yes_bid + No_bid > 1 + buffer` (split and sell). |
+| Latency | Medium; (c) is fast and capacity-limited. |
+| Special checks | Settlement is to the HL **mark**, so a "mispricing" vs Deribit may be a rational basis: model it separately. Full collateral, no liquidation. Thin books: report the USD cap. Digital replication is model-sensitive: report a range and pre-register the model. **Could fail:** liquidity too thin at $25k; the mark basis exceeds the apparent edge; zero fees may end; the merged-book priority makes (c) untakeable at the same instant. |
+| Prereq | New R-task for the outcomes source, V-10 |
+
+### O18 — Cross-dex funding-differential carry (task S-18)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | Each perp dex has independent books, margining and **deployer-set funding parameters** (`setFundingMultipliers` 0–10, `setFundingInterestRates` ±1%/8 h, `setFundingClamps`), and HIP-3 uses a more responsive premium formula. The same underlying on two dexes can carry persistently different funding; long the cheap-funding dex / short the rich one to harvest the differential. |
+| Data | `funding_hist` per coin/dex, `ctx`, `bbo`, `perpDexs` + deployer actions, `positions`/margin |
+| Signal | "Open when annualized differential > X for N hours, close when < Y", grid over X/Y/N; net APR vs 2×taker + basis risk + funding drag. Report the persistent price basis separately from the funding differential. |
+| Latency | Low (`L` = 1 s). |
+| Special checks | Legging/divergence risk (independent books, non-atomic legs); margin is per-dex so capital may double. Verify the deployer cannot change funding params adversely while we hold (30-day cooldown on fee changes; funding-param cooldowns ⚠ verify). **Could fail:** differentials usually below two taker fees + basis noise; basis risk makes it directional; funding flips; capital is locked twice. |
+| Prereq | V-3, V-12 |
+
+### O19 — Quote-asset peg defense + true spot fee multipliers (task S-19)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | A permissionless spot quote asset is backed by a slashable 200k-HYPE stake (3-year lock), slashable on validator vote if `QUOTE/USDC` fails its size/band conditions for a majority of 1-second samples over three days; aligned quote assets add stronger conditions. That creates a forced peg defender. Trade a quote asset away from par, betting on defense before the slashing clock. Separately, the real fee schedule changes O2: stable-vs-stable spot pairs have **80% lower taker fees**, and aligned quote assets **20% lower taker / 50% better maker**. |
+| Data | Spot `bbo` for quote assets and their base pairs, `markets`/`spotMeta`, `spotMetaAndAssetCtxs`; derived `quote_peg (t_ns, quote_token, quote_usdc_px, depth_within_band)`; aligned fee flags |
+| Signal | §13.3 on `QUOTE/USDC` vs 1 (episode beyond a buffer) plus quote-asset triangles using the **actual per-pair fee multiplier**; hold the depeg trade to par with a time stop before the 3-day window. |
+| Latency | Low/medium. |
+| Special checks | Slashing is discretionary (validator vote), so the defender is incentivized, not guaranteed; a depeg can persist days; quote-asset books are thin (report size); new quote assets may have no USDC pair. This **extends O2**; the new content is the slashing mechanism and the fee correction. **Could fail:** validators may not slash; the deployer may not be able to defend; thin books cap size. |
+| Prereq | V-3 |
+
+### O20 — Portfolio-/cross-margin contagion forced flow (task S-20)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | Portfolio and cross margin link assets, so a loss in one can force deleveraging of an apparently unrelated asset held in the same account. With public positions, margin mode and abstraction state, the correlated forced-selling map can be estimated and the uncontaminated asset faded after the flow. |
+| Data | `positions` with `leverage.type`, margin mode and abstraction (`userAbstraction`); `ctx`; node `dex_user_account_summaries` and L1 data; `bbo`, `trades` |
+| Signal | Event study: large move/deleverage in asset A → abnormal move and reversion in correlated asset B held by the same addresses; episode PnL of fading B net of fees. |
+| Latency | High. |
+| Special checks | Attribution is the hard part: forced flow vs ordinary correlation needs position-level (node) data. Portfolio-margin eligibility is validator-restricted, limiting the universe. ADL may close the winner before the fade. **Could fail:** cascade attribution unreliable; forced flow small and absorbed by HLP; correlation dominates. |
+| Prereq | Public-positions/node source, V-12 |
+
+### O21 — HIP-2 Hyperliquidity deterministic-quote pickoff (task S-21)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | HIP-2 Hyperliquidity is a deterministic protocol strategy on USDC spot pairs: a recursive grid (`px_i = round(px_{i−1} × 1.003)`), refreshed on blocks ≥ 3 s since the last update, targeting ~0.3% spread. Because the grid/refresh is deterministic and the external reference moves continuously, the ladder is stale for up to ~3 s after a ≥ 0.3% move and its next levels are predictable. Pick off (or rest against) the stale tranche. |
+| Data | Spot `book`/`bbo` for HIP-2 pairs, external reference (CEX/other HL pair), `markets`/`spotMeta`, `trades` |
+| Signal | §13.3: episode when the external-reference-implied price is through the HL ladder by > fees; identify HL tranches by size and 0.3% spacing. |
+| Latency | High (~3 s window, block-cadence refresh). |
+| Special checks | HIP-2 only operates on USDC spot pairs and only updates on blocks ≥ 3 s apart; the 0.3% spread may already exceed fees + adverse selection; distinguish HIP-2 from human MM quotes (mis-attribution kills the thesis); new listings are the most dislocated and rarest. **Could fail:** 3 s refresh vs the ~0.3% round-trip edge; adverse selection; thin books; rare listings. |
+| Prereq | V-1; no new source |
+
+### O22 — Read-precompile / CoreWriter-delay asymmetry (task S-22)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | HyperEVM read precompiles return HyperCore state guaranteed to match the latest Core state at the EVM block's construction (oracle prices, positions, vault equity, L1 block number). CoreWriter order actions are **deliberately delayed** a few seconds, and transfers are asymmetric (EVM→Core lands in the same L1 block; Core→EVM waits for the next EVM block). Read a guaranteed-fresh Core oracle inside a contract and trade an EVM pool against it while the Core leg is delayed. |
+| Data | `evm_pools`, Core spot `bbo`, oracle precompile reads, HyperEVM block/receipt data (`s3://hl-mainnet-evm-blocks/`, node `evm_block_and_receipts`), gas |
+| Signal | §13.3 with the precompile oracle as fair; model the CoreWriter delay and the block the EVM tx lands in; PnL of the EVM leg plus the delayed Core leg (non-atomic). |
+| Latency | Medium/high (EVM block 1 s small / 60 s large; CoreWriter delay seconds). |
+| Special checks | The delay is the whole risk: the Core leg can be repriced/rejected. Precompiles cost gas and consume all gas on invalid input; priority-fee competition inside EVM blocks. Confirm precompiles are on **mainnet** (docs describe testnet) ⚠ verify. **Could fail:** non-atomicity; delay; gas; thin EVM pools; mainnet precompile availability unconfirmed. |
+| Prereq | V-5, V-6, R-9, own node/RPC |
+
+### O23 — HYPE realized-vs-implied vol carry (task S-23)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | HL has no native vanilla options, but HYPE has external/on-chain option markets (Derive; HyperEVM protocols such as Hypersurface, opt.fun ⚠ verify). HL funding/premium and mark-oracle deviation are a public high-frequency proxy for short-horizon HYPE realized vol. When implied vol exceeds HL realized vol by more than costs, sell options and delta-hedge with the HYPE perp; buy vol when funding/premium spikes signal cheap IV. O9 uses options for **direction**; this is a **vol-carry / relative-vol** strategy. |
+| Data | `deribit_options` (HYPE), new HyperEVM options quotes, HL HYPE `bbo`/`ctx`/`bars` for realized vol, `funding_hist` as a vol signal |
+| Signal | §13.8 slow-signal: pre-register the IV/RV threshold and the delta hedge; net PnL = option premium − realized variance − hedge costs − gas; report the variance risk premium by regime. |
+| Latency | Low (hours–days). |
+| Special checks | On-chain option spreads are wide and thin; hedging on HL is taker-heavy at short intervals and pays funding; HYPE options are not in the current recorder; needs SPEC-0004 directional risk limits (§17 Q7). **Could fail:** wide option spreads; taker-heavy hedges; gas; EVM key operational surface; no native HL options. |
+| Prereq | R-11/R-12, new EVM options source, P-6, V-10; T3 gate |
+
+### 13.10 Rigor for episode studies
+
+Fast (episode) studies (§13.3–13.6) are easy to fool: a point estimate over all days, with parameters (`buffer_bps`, `stale_ms`, `merge_ms`, pairs, grid cells) chosen while looking at the whole sample, no uncertainty, and no competition model. §13.8 already has the slow-signal equivalents (pre-registration, OOS, baselines). These rules are required for every study whose verdict rests on episodes.
+
+| Rule | Requirement |
+|---|---|
+| Pre-registration | Before running on data, the study file declares markets/pairs, the full parameter grid, the headline cell rule, and the verdict metric. `research/REGISTRY.md` records the git SHA of that declaration (§13.13). Every cell tested is reported. |
+| Chronological split | Days split 60/40 in time. Pair selection and parameter choice use the first 60% only; **the headline is the last 40%**. Preliminary reports (≥ 3 days) are labeled "in-sample only". |
+| Uncertainty | Day-block bootstrap (resample days, 2,000 draws) → 90% CI for `usd_per_day_L` and `apr_L`. PASS requires the **CI lower bound ≥ `apr.floor`**, not just the point ≥ target (§13.6). |
+| Multiple testing | A study scanning K (pair × cell) combinations reports K and applies a Holm/Bonferroni-style haircut or, simpler, requires the chosen cell to also pass on the OOS 40% with the in-sample-chosen parameters (no re-selection). The ranking uses OOS numbers. |
+| Fill competition | "Episode still open at t+L" is necessary, not sufficient. Using `trades`: if the quoted size at the episode price was hit/lifted by someone else in `[t_start, t_start+L]`, capture is `max(0, displayed_sz − traded_sz)` (a queue-position-free lower bound). Report both naive and competition-adjusted capture; the verdict uses the adjusted one. |
+| Latency jitter | Evaluate with `L` drawn from a distribution (default: lognormal with the grid value as median, p99 = 3× median) in addition to fixed `L`. Report both; the verdict uses jittered `L` at the headline. |
+| Clock skew | Cross-venue studies (O5, O10 Part A) use local receive time `t_ns` only (one clock) and report the exchange-time skew distribution; results must not change sign under ±25 ms shifts of one feed (a sensitivity row, §13.7). |
+| Adverse selection | For every captured episode, report the mid move over +1 s / +10 s after the hypothetical fill (markout). A study whose PnL is mainly positive at `t+L` but negative by +10 s markout is flagged: the "edge" may be stale-quote noise that reverts. |
+| Artifact checks | Automatic, before hand checks: crossed/locked books, one-sided books, px outliers (> 5σ vs the 1 s median), stale feeds just before a gap, episodes starting within 1 s of a reconnect. Artifacts are excluded and counted. |
+| Capacity | Report the `usd_per_day` vs `max_notional` curve (book-walk slippage makes it concave); the capital grid is the x-axis. A required plot. |
+| Decay / regime | Per-week `usd_per_day` plot + linear trend; a negative trend with p < 0.1 is noted as a risk in the verdict. |
+
+### 13.11 Historical backfill lane
+
+Historical sources give **lower-fidelity preliminary** results. They can kill an idea early (an idea that fails on generous historical assumptions will not pass forward) and prioritize which studies to run first on forward data; they **cannot** PASS a fast study on their own. New verdict qualifier: **HIST-PRELIM** (with the fidelity class); it is never enough for gate G1.
+
+| Fidelity class | Examples | Allowed use |
+|---|---|---|
+| H1 tick/update-level with ms stamps | Tardis full-depth or `bbo` updates; Binance/Bybit book tickers | Episode studies at L ≥ 100 ms; still HIST-PRELIM |
+| H2 periodic snapshots (seconds) | HL S3 `l2Book` snapshots, `asset_ctxs` | Episode studies at L ≥ snapshot period only; duration stats censored |
+| H3 bars / funding | `candleSnapshot`, `fundingHistory`, Binance klines | Slow-signal (§13.8): O7 carry, O10 C/E, O11 B |
+
+**Kill rule.** A study that FAILs at H1/H2 fidelity under **generous** assumptions (L = snapshot period, no competition, maker fees) is deprioritized — moved to the bottom of the forward queue — not deleted.
+
+Concrete sources (histdata review, 2026-09-28):
+
+| Source | Access | Covers (§13.1) | Cost |
+|---|---|---|---|
+| Tardis free days | no key; the first day of each month, every exchange/type | HL `bbo`/`trades`/`ctx`/`book`, Binance/Bybit `bbo`, Deribit (optional); 15 free HL days (2025-07-01…2026-09-01) and 9 HIP-3 days [probed] | free; every day is paid (monthly plans from ~$350/mo, min $300) |
+| HL REST `/info` | public | `funding_hist` (pages to listing, incl. HIP-3); `bars` from candles (1m ≈ 3.5 d, 1h ≈ 208 d, 4h ≈ 2.3 y, 1d all); `markets` [probed] | free |
+| `hyperliquid-archive` (S3) | requester-pays; needs an AWS account | main-dex `l2Book` → `book`/`bbo`, `asset_ctxs` → `ctx`; ~monthly, no timeliness guarantee; no spot, no candles [probed/doc] | egress ~$0.09/GB (us-east-1) |
+| `hl-mainnet-node-data` (S3) | requester-pays; needs an AWS account | `node_fills_by_block` → `trades` (wallets + liquidation marker), funding events in `misc_events_by_block`; ~0.8–1.0 GiB/day [probed/3p] | egress (~$0.11/GB, ap-northeast-1) |
+| Hydromancer Reservoir (S3) | requester-pays; needs an AWS account | 1 s `bars` (all HL markets), fills with liquidation/ADL flags → `trades`, 1-min L2 → `book` [probed/doc] | free + egress |
+| Binance `data.binance.vision` | public | CEX `trades`/`bars`/`funding_hist`; `bookTicker` ended 2024-03-30 [probed] | free |
+| Bybit public + quote-saver | public | CEX `trades`; full-book `bbo` (ob200/ob500) [probed] | free |
+| Deribit history | public | `deribit_options` (trade IV; deltas computed) for O9 P3 [probed] | free |
+| Alpaca / Massive | account | equity `bars` for O9a, O10 B/E and the O11 stock proxy [doc/3p] | free tier |
+
+Per-study confidence for a preliminary (HIST-PRELIM) backtest now:
+
+| Study | Historical source(s) | Fidelity lost vs forward recording | Confidence |
+|---|---|---|---|
+| O1 | Tardis 9 HIP-3 days (`book_ticker` + `derivative_ticker`), `fundingHistory`, Hydromancer 1-min L2 / 1 s candles | block `bbo` is as good as ours, but only 1 day/month (biased: 3 weekends, 1 holiday); `abcd` dex missing; reveal lag not in the data | Medium (prelim) |
+| O2 | Tardis 15 spot days + `spotMeta` | @N mapping for delisted/renamed pairs; quote pairs only from their listing dates | Medium |
+| O3 | Tardis spot + perp days + `derivative_ticker` | no cross-day continuity of the rolling basis | Medium–high |
+| O4 | — (needs R-9 forward) | — | n/a |
+| O5 | Part 1: Tardis HL + Binance + Bybit `book_ticker` (15 d); Part 2: Tardis only; node fills + CEX dumps for more days | HL is block-quantized (10/50 ms grid unresolvable); the ~230 ms reveal lag dominates; Binance BBO only via Tardis | Medium (P1), low–medium (P2 ≤ 100 ms) |
+| O6 | Tardis no-flag trades, or node/Hydromancer fills; Hydromancer 1 s candles; CEX `aggTrades` | mid path from 1 s trade candles is noisier than `bbo`; the +1 s horizon is marginal | Medium |
+| O7 | `fundingHistory` (full) + HL candles (1h/4h/1d) + Hydromancer 1 s | `predictedFundings` has no history: the entry rule must use trailing realized funding only | High |
+| O8 | — (desk research + HyperEVM forward) | — | n/a |
+| O9 (P3) | Deribit `get_last_trades_by_currency_and_time` + DVOL (free, years) | trade IV, no greeks; deltas computed from IV | Medium–high |
+| O10 C | `fundingHistory` for HIP-3 + Tardis `derivative_ticker` (`asset_ctxs` has no HIP-3) | hourly premium only; closed-hours oracle behavior needs V-12 | High (funding), medium (premium) |
+| O10 D | Tardis HIP-3/BTC/ETH days; Hydromancer 1 s candles; HL 1m candles | episodes only on the 9 free days; sparse night prints look like lag | Medium (existence), low–medium (PnL) |
+| O10 E | HL candles 4h/1h + Hydromancer 1 s; Alpaca/Massive stock opens | HIP-3 age caps history: < 30 OOS weekend signals ⇒ INCONCLUSIVE for weekend variants | Medium (overnight), low (weekend) |
+| O11 A | Tardis `bbo` mids (sub-minute cells); Hydromancer/HL candles (≥ 1 m) | sub-minute cells limited to the free days; noisy spreads on illiquid legs | Medium (≥ 1 m), low–medium (1/10 s) |
+| O11 B | HL REST 1h/4h/15m; Hydromancer 1m/5m; Binance 1m proxy for years | the Binance proxy ignores the HL basis/funding; trade-based opens | High (1h/15m), medium (1m/5m) |
+| O11 C | inherits the O9 / O10 E data it filters | — | same as the parent study |
+
+**Common caveats.** First-of-month days are not a random sample: report per-day results and `concentration`. 15 non-contiguous days meet the ≥ 14-day count only as PRELIM; never promote a strategy on backfill alone. Historical data has exchange time, not our reveal time: add the measured HL publish lag to `L` (§13.4, B-9) or run on `local_timestamp`.
+
+### 13.12 Research cadence
+
+1. Survey data (V-8+) → import via the backfill lane (B-tasks) → HIST-PRELIM runs of O7, O11 Part B, O10 Parts C/E, O3, O1 (H2/H3 fidelity) → rank.
+2. Forward recorder deployed (R-10) → ≥ 3 days → preliminary forward reports for the top-ranked studies.
+3. ≥ 14 days → final reports → `RANKING.md` → ADR-0002 (owner approves).
+4. Weekly: re-run every registered study on new data (a scheduled `hlr` rerun job); decay plots update; the `RANKING.md` diff is reviewed.
+
+### 13.13 Hypothesis registry
+
+`research/REGISTRY.md` holds one row per hypothesis ever proposed: id, title, source (spec / agent / owner), status (proposed / pre-registered / running / PASS / MARGINAL / FAIL / INCONCLUSIVE / parked), the pre-registration git SHA, a report link, and a one-line reason for the status. Studies O1–O23 are listed there. Nothing is deleted: failures stay as a graveyard, so the same idea is not re-tested with fresh parameters until it passes.
+
 ---
 
 ## 14. Work breakdown
@@ -752,6 +972,15 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | P-5 | Report template + `RANKING.md` generator | T1 | S | P-4 | ☐ |
 | P-6 | Slow-signal backtester (§13.8) | T3 | M | P-2, P-3, T3 gate | ☐ |
 | P-7 | Read-only import of finsnap's `option_snapshots` history (for O9a) | T3 | S | P-2, V-9, T3 gate | ☐ |
+| B-1 | Tardis free-days downloader | T1 | S | P-1 | ☐ |
+| B-2 | Tardis → §13.1 normalizer with symbol mapping | T1 | M | B-1, P-1 | ☐ |
+| B-3 | HL REST funding + candles backfill + daily 1m candle poller | T1 | S | P-2 | ☐ |
+| B-4 | Binance/Bybit public dumps | T1 | M | P-2 | ☐ |
+| B-5 | Hydromancer Reservoir (**owner AWS account**) | T1 | M | B-2, owner approval | ☐ |
+| B-6 | Official HL S3 archives (**owner AWS account**; completes V-8) | T1 | M–L | owner approval | ☐ |
+| B-7 | Deribit history | T1 | S–M | V-10 | ☐ |
+| B-8 | Equity minute bars (**owner account**; after V-11) | T1 | S | V-11 | ☐ |
+| B-9 | HIST-PRELIM report plumbing | T1 | S | P-5 | ☐ |
 | S-1 | Study O1 HIP-3 dislocations | T1 | M | P-5 | ☐ |
 | S-2 | Study O2 spot triangles | T1 | M | P-5 | ☐ |
 | S-3 | Study O3 spot-perp dislocation | T1 | S | P-5 | ☐ |
@@ -766,6 +995,18 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | S-10c | Study O10 Parts B + E: open convergence; weekend/overnight → next session/week | T3 | M | P-6, V-12 | ☐ |
 | S-11a | Study O11 Part A: Bollinger bands on spreads (stat-arb) | T1 | M | P-4 | ☐ |
 | S-11b | Study O11 Parts B + C: single-instrument bands; bands as a filter | T3 | M | P-6, R-5 candle backfill | ☐ |
+| S-12 | Study O12 oracle-tick lag and mark-price trigger cascade | T1 | M | P-5, R-8 | ☐ |
+| S-13 | Study O13 HIP-3 deployer-oracle stair-step / stale fallback | T1 | M | P-5, V-12 | ☐ |
+| S-14 | Study O14 funding-settlement timing | T2 | S | P-5, V-3, V-12 | ☐ |
+| S-15 | Study O15 liquidation-cluster ladder | T2 | L | P-5, public-positions/node source | ☐ |
+| S-16 | Study O16 public TWAP-flow prediction | T2 | M | P-5, node/TWAP source | ☐ |
+| S-17 | Study O17 HIP-4 outcomes: digital vs Deribit + 06:00 pin | T2 | M | P-5, outcomes source, V-10 | ☐ |
+| S-18 | Study O18 cross-dex funding-differential carry | T2 | S | P-5, V-3, V-12 | ☐ |
+| S-19 | Study O19 quote-asset peg defense + true fee multipliers | T1/T2 | S | P-5, V-3 | ☐ |
+| S-20 | Study O20 portfolio-/cross-margin contagion forced flow | T2 | L | P-5, public-positions/node source, V-12 | ☐ |
+| S-21 | Study O21 HIP-2 Hyperliquidity deterministic-quote pickoff | T2 | M | P-5 | ☐ |
+| S-22 | Study O22 read-precompile / CoreWriter-delay asymmetry | T2 | L | P-5, R-9, V-5, V-6, node/RPC | ☐ |
+| S-23 | Study O23 HYPE realized-vs-implied vol carry | T3 | L | P-6, R-11/R-12, EVM options source, V-10, T3 gate | ☐ |
 | D-1 | `RANKING.md` + ADR-0002 + first strategy spec stub | T1 | S | all S-tasks that are feasible | ☐ |
 
 **Critical path to "recording in production":** R-1 → R-2 → R-4/R-5 (parallel with R-3) → R-6 → V-4 → R-10. Get this done first; the research tasks can start once a few days of data exist.
@@ -781,6 +1022,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | G (equities for T1) | V-11, V-12 → R-13 (feeds S-10a) |
 | D (ops) | V-4 → R-10 → V-7 |
 | E (research, after ~3 days of data) | P-1 → P-2 → P-3 → P-4 → P-5 → T1 studies (S-1, S-2, S-3, S-5, S-8, S-10a, S-11a) → T2 → T3 after the gate |
+| H (backtest now) | B-1 → B-2 → B-3 → B-9 → HIST runs of O7, O11 B, O10 C/E, O3, O1 |
 
 ### 14.2 Task details
 
@@ -817,7 +1059,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 
 #### V-8 — Check the HL public S3 archive
 - **Do:** Hyperliquid is believed to publish historical data to a requester-pays S3 bucket (e.g. `s3://hyperliquid-archive/…`, possibly also node data buckets) ⚠ unverified. Confirm the bucket(s), the paths, the data types (l2Book snapshots? asset ctxs? fills?), the formats (lz4?), the update lag, and the cost. Download one sample file per data type into the scratchpad and describe it.
-- **Done when:** §15 has an "S3 archive" block; if usable, add a follow-up task `P-6 backfill importer` to §14 (don't implement it now).
+- **Done when:** §15 has an "S3 archive" block; if usable, the importer is **B-6** (§14.2), which completes this task (don't implement it now).
 
 #### V-9 — Options data sources + HIP-3 stock universe mapping
 - **Do:** (1) Using finsnap's collector as a reference (`../finsnap/apps/backend/src/collectors/options.ts`, `yahooSession.ts`), document Yahoo's options endpoint: URL, session/crumb requirements, every field per contract (OI, volume, `impliedVolatility`, bid, ask, `lastPrice`), data delay, and safe request pacing. (2) Document finsnap's `option_snapshots` table (columns, date range, symbols) and its `/snap` options JSON, for the read-only uses in §9.1. (3) List every HIP-3 stock/index perp (`hl dexs`, `hl markets --dex …`) and map each one to its underlying stock/ETF and options symbol in `research/mappings/underlyings.toml`.
@@ -950,7 +1192,61 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Tests:** a fixture dump → expected rows; re-running is idempotent.
 - **Done when:** tests pass; §15 records the imported date range and symbols.
 
-#### S-1 … S-11b — Studies
+#### B-1 — Tardis free-days downloader
+- **Do:** `uv run hlr-backfill tardis-free --from DATE --to DATE --symbols FILE`: download the Tardis first-of-month CSVs via plain GET from `datasets.tardis.dev/v1/{exchange}/{type}/{YYYY}/{MM}/01/{SYMBOL}.csv.gz` (no key; HEAD/range requests fail). HL: `book_ticker`, `quotes`, `trades`, `derivative_ticker`, `book_snapshot_5`/`_25`; `binance-futures`/`bybit`: `book_ticker`/`trades`; `deribit` off by default (11.7 GB/day). Retries, a local cache under `research/data/backfill/`, and checksums in a manifest. Never load keys.
+- **Files:** `research/hlr/backfill/tardis_free.py`, tests.
+- **Tests:** a mocked HTTP layer returns fixture CSVs → files land with the expected manifest and checksums; a missing month is recorded as a gap, not a crash; re-running is idempotent.
+- **Done when:** tests pass; a real download of one free HL day (BTC `book_ticker`) is described in the commit message (size, rows).
+
+#### B-2 — Tardis → §13.1 normalizer
+- **Do:** Map Tardis rows into the §13.1 tables: `book_ticker` → `bbo` (`venue` = `hl`/`binance-usdm`/`bybit-linear`; `ts_exch_ms` = `timestamp`, `t_ns` = `local_timestamp`); `quotes` (pre-2025-06-26) → `bbo` tagged `venue="hl-book"`; `trades` → `trades` (buyer/seller null); `derivative_ticker` → `ctx` (oracle = `index_price`, premium null); `book_snapshot_*` → `book`. Symbol mapping: `XYZ:TSLA` → `xyz:TSLA`, `@N` → `BASE/QUOTE` via `spotMeta`, CEX → `binance-usdm:BTCUSDT`. Synthesize `gaps` for every non-sampled interval and Tardis incident windows. Add a `source` column (`tardis-free`).
+- **Files:** `research/hlr/backfill/tardis_normalize.py`; `research/mappings/` additions.
+- **Tests:** fixture rows per type → expected rows and venue tags; `XYZ:TSLA`/`@N` mapping; synthesized gaps cover every missing day; idempotent per partition.
+- **Done when:** tests pass; one free HL day normalizes into `bbo`/`trades`/`ctx`/`book` with row counts in the commit message.
+
+#### B-3 — HL REST funding + candles backfill and daily 1m poller
+- **Do:** One-shot `fundingHistory` for every perp and every HIP-3 dex (page by 500 until caught up) into `funding_hist`; `candleSnapshot` for 1d/4h/1h (max depth) plus 15m/5m/1m (rolling) into `bars(source="candle")`; a `meta`/`spotMeta`/`perpDexs` snapshot into `markets`. Drop `n==0` pre-launch candles. Add a daily job (cron or the R-5 snapshotter) that appends 1m/5m candles so the rolling window stops expiring.
+- **Files:** `research/hlr/backfill/hl_rest.py`; snapshotter hook or `deploy/` cron.
+- **Tests:** paging stops on an empty page; `n==0` rows dropped; re-running appends only new candles.
+- **Done when:** tests pass; `funding_hist` covers BTC from 2023-05 and `xyz:TSLA` from 2025-11; the daily poller is scheduled and its first appended day is recorded.
+
+#### B-4 — Binance/Bybit public dumps
+- **Do:** Import Binance `data.binance.vision` `aggTrades`/`trades`, 1m `klines`, monthly `fundingRate`, `metrics`, and `bookTicker` (2023-05-16…2024-03-30 only); Bybit `public.bybit.com/trading/` trades and quote-saver `ob200`/`ob500` (reconstruct top of book from snapshot + deltas, ms timestamps). Write `trades`/`bars`/`bbo`/`funding_hist` with a CEX `venue`.
+- **Files:** `research/hlr/backfill/cex_dumps.py`.
+- **Tests:** fixture archives → expected rows; the book reconstruction from a snapshot + delta matches a hand-checked top of book.
+- **Done when:** tests pass; one day per venue imported with row counts in the commit message.
+
+#### B-5 — Hydromancer Reservoir (owner AWS account)
+- **Do:** With owner-provided AWS credentials (read by the AWS SDK from the environment, never logged), list the `hydromancer-reservoir` prefixes, estimate egress before downloading, then import 1 s candles → `bars(1s)`, fills → `trades` (buyer/seller + a new optional `trades.flags` for liquidation/ADL), and 1-min L2 → `book(venue="hl-book-1m")`. Document the prefixes/schemas found.
+- **Files:** `research/hlr/backfill/hydromancer.py`.
+- **Tests:** a fixture Parquet file → expected rows; the importer refuses to start without credentials and never prints them (log-scrub test).
+- **Done when:** tests pass; the owner's AWS account is noted in §15 and one day of 1 s candles + fills is imported with row counts.
+
+#### B-6 — Official HL S3 archives (owner AWS account; completes V-8)
+- **Do:** With owner-provided AWS credentials, estimate egress and document which months exist (the §15 "S3 archive" block). Import `hl-mainnet-node-data/node_fills_by_block` (plus `node_fills` before 2025-07-27): dedupe by `tid` into taker-side `trades` with the liquidation marker. `misc_events_by_block` → funding events. `hyperliquid-archive` `asset_ctxs` → `ctx` and `market_data/l2Book` → `book`/`bbo(hl-book)`. Add a per-month egress-cap flag.
+- **Files:** `research/hlr/backfill/hl_s3.py`.
+- **Tests:** fixture envelopes → expected rows; `tid` dedupe yields one row per trade; the cap aborts before exceeding the budget.
+- **Done when:** tests pass; §15's S3 block lists the confirmed buckets, paths, data types, formats, update lag, and cost; one sample day per data type is imported.
+
+#### B-7 — Deribit history (for O9 P3)
+- **Do:** Page `history.deribit.com/api/v2/public/get_last_trades_by_currency_and_time` (`currency=BTC|ETH`, `kind=option`) into `deribit_options` (trade IV as `mark_iv`; `bid_iv`/`ask_iv` null; deltas computed), and import DVOL OHLC as a daily series. Respect V-10's rate limits.
+- **Files:** `research/hlr/backfill/deribit.py`.
+- **Tests:** fixture pages → expected rows and continuation handling; rate-limit backoff.
+- **Done when:** tests pass; the DVOL start date and the imported option-trade range are recorded.
+
+#### B-8 — Equity minute bars (after V-11)
+- **Do:** Using the V-11 provider (owner account), import historical equity minute bars into `bars(venue="equity")` for the mapped underlyings (O10 Parts B/E and the O11 stock proxy). Alpaca free historical SIP (the `end` parameter ≥ 15 min old) or Massive free.
+- **Files:** `research/hlr/backfill/equities.py`.
+- **Tests:** fixture JSON → expected rows; the key (if any) is never logged.
+- **Done when:** tests pass; one symbol's minute bars for the longest available history are imported with the range in the commit message.
+
+#### B-9 — HIST-PRELIM report plumbing
+- **Do:** Teach the study/report machinery that a run is on backfill: `days` and `coverage_pct` are computed over sampled days only (non-sampled intervals are gaps); a `--data-source backfill` flag stamps "PRELIMINARY (backfill: <sources>)" into the §13.7 report and sets the verdict qualifier `HIST-PRELIM` (§13.11); add the reveal-lag adjustment (`L += measured HL publish lag`) as a study parameter.
+- **Files:** `research/hlr/report.py`, `research/hlr/__main__` flags.
+- **Tests:** a synthetic sparse day set → `coverage_pct` counts only sampled days; the report header contains `HIST-PRELIM`; the lag adjustment shifts every `L` in the report.
+- **Done when:** tests pass; `hlr-rank` groups `HIST-PRELIM` studies below the forward ones.
+
+#### S-1 … S-23 — Studies
 - **Do:** Implement the study in `research/studies/o{n}_{slug}.py` (entry point `uv run python -m studies.o{n}_{slug} --from … --to …`) following its §13.9 block exactly, and write the report via P-5. Run it first as **preliminary** (≥ 3 days of data), then **final** (≥ 14 days). O9, the §13.8 parts of O10, and O11 Part B use the data requirements stated in their blocks.
 - **Done when:** the final report exists with all §13.7 sections, including the hand-checked sanity section; the verdict is stated; the report front-matter feeds `RANKING.md`.
 
@@ -974,12 +1270,12 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 | `chronyc -c tracking` column order | `RefID, RefName, Stratum, RefTime, SystemTime, LastOffset, RMSOffset, Frequency, ResidualFreq, Skew, RootDelay, RootDispersion, UpdateInterval, LeapStatus` (SystemTime is column **4**, not 3). | chrony 4.5 `chronyc(1)` + chrony `client.c` `process_cmd_tracking` | 2026-09-28 | V-1 |
 | Binance/Bybit endpoints + fields | | | | V-2 |
 | Binance/Bybit VIP0 fees | | | | V-2 |
-| HIP-3 fee model + per-dex values | | | | V-3 |
-| Spot quote tokens | | | | V-3 |
+| HIP-3 fee model + per-dex values | `taker = base(4.5 bp) × scaleIfHip3 × growthMode(0.1 if on) × (1−referral) × aligned scaling`; `scaleIfHip3 = deployerFeeScale+1` if <1 else ×2; growth mode cuts all-in fees ≥ 90%. Would change O1/O10 verdicts. | https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions | 2026-09-28 | V-3 (ideas review, verify) |
+| Spot quote tokens | No longer just USDC/USDT0: permissionless quote assets (200k HYPE staked, slashable) and aligned quote assets exist, each with peg/liquidity conditions. | https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/permissionless-spot-quote-assets, https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/aligned-quote-assets | 2026-09-28 | V-3 (ideas review, verify) |
 | Latency by region (p50/p90) | | | | V-4 |
-| HyperEVM blocks / gas / mempool / transfers | | | | V-5 |
+| HyperEVM blocks / gas / mempool / transfers | Fast blocks ~1 s / 3 M gas, slow ~1 min / 30 M gas; EVM→Core transfers land in the same L1 block, Core→EVM waits for the next EVM block. Two on-chain L1 mempools, next 8 nonces/address, pruned > 1 day; priority fees (gossip and order) are **burned**. | https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/dual-block-architecture, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/interaction-timings, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/priority-fees | 2026-09-28 | V-5 (ideas review, verify) |
 | Data volume per stream (MB/h raw, zst) | | | | V-7 |
-| S3 archive availability | | | | V-8 |
+| S3 archive availability | Requester-pays: `hyperliquid-archive` (`market_data` L2 book, `asset_ctxs`; ~monthly; no spot, no candles), `hl-mainnet-node-data` (`node_fills_by_block`, `explorer_blocks`, `replica_cmds`, `misc_events_by_block`), `hl-mainnet-evm-blocks`. | https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/raw-hyperevm-block-data | 2026-09-28 | V-8 (ideas review, verify) |
 | Recorder production start date + host | | | | R-10 |
 | Yahoo options endpoint (fields, session, delay, pacing); finsnap `option_snapshots` + `/snap` shape | | | | V-9 |
 | Deribit endpoints, fields, limits | | | | V-10 |
@@ -987,6 +1283,13 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 | HIP-3 stock-perp mechanics per dex | | | | V-12 |
 | finsnap `option_snapshots` coverage; options-history vendors; owner decision | | | | V-13 |
 | finsnap history imported (range, symbols) | | | | P-7 |
+| Spot quote-asset fee multipliers (ideas review) | Spot pairs between two quote assets have **80% lower taker fees**; aligned quote assets 20% lower taker / 50% better maker rebate. Changes O2's triangle threshold. | https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees, https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/aligned-quote-assets | 2026-09-28 | V-3 (ideas review, verify) |
+| Funding mechanics (ideas review) | Paid hourly at 1/8 of the computed 8 h rate; premium sampled every 5 s; cap **4%/hour**; payment = `position_size × oracle_price × rate` (oracle notional, not mark). O14 depends on this. | https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding | 2026-09-28 | V-3 (ideas review, verify) |
+| `perpDexs` funding fields (ideas review) | Returns `assetToStreamingOiCap` and `assetToFundingMultiplier`; deployers can set multipliers 0–10, interest ±1%/8 h, and clamps. | https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions | 2026-09-28 | V-3 (ideas review, verify) |
+| HL documented latency (ideas review) | Co-located median end-to-end 0.2 s, p99 0.9 s; ALO/cancel end-to-end ~380 ms (~2 blocks); write priority ≈45 ms per 1 bp; read gossip priority ≈25 ms per slot. | https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/optimizing-latency, https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/priority-fees | 2026-09-28 | V-4 (ideas review, verify) |
+| HIP-4 outcome markets (ideas review) | Native fully-collateralized binaries; a daily 06:00 UTC binary settling to the HyperCore **mark** (multi-outcome not in the initial release). The launch date and the extension to BTC/ETH/HYPE/SOL are third-party ⚠ verify. | https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-4-outcome-markets | 2026-09-28 | V-12 (ideas review, verify) |
+| New WS channels (ideas review) | `fastAssetCtxs` (base64 + raw-DEFLATE, `markPx`/`midPx`, first message a snapshot), `allDexsAssetCtxs`, `allDexsClearinghouseState`, and `twapStates` are documented. | https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions | 2026-09-28 | V-1 (ideas review, verify) |
+| `noop` action (ideas review) | Exists to invalidate an in-flight nonce; billed at the base rate, unlike a stale `expiresAfter` (5×). Relevant to SPEC-0002, not market data. | https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint | 2026-09-28 | SPEC-0002 (ideas review, verify) |
 
 ## 16. Acceptance criteria
 
@@ -1024,3 +1327,15 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 22. **`hl record plan` opens metadata REST calls (R-6).** §12.1 says "no sockets opened", but resolving universe selectors needs `/info` metadata. It opens no WS/recording sockets; confirm the wording or accept the metadata calls.
 23. ~~**`chronyc` column order (R-6/V-1).**~~ **Resolved 2026-09-28 (V-1):** `chronyc -c tracking` CSV order is `RefID, RefName, Stratum, RefTime, SystemTime, LastOffset, RMSOffset, Frequency, ResidualFreq, Skew, RootDelay, RootDispersion, UpdateInterval, LeapStatus`. `Stratum` is column 2 (correct in `record.rs`), but `SystemTime` is column **4**, not 3, so the current parser reads the RefTime epoch as the offset. **Code follow-up:** read column 4.
 24. **How a `drop` gap ends (R-2/R-7).** `gap_start{reason:"drop"}` is emitted after a bounded-channel overflow but never gets a matching `gap_end`, so a naive coverage calculation would mark the rest of the stream missing. `verify` currently treats an unpaired `gap_start` as running to the last record on the stream (the conservative reading). Define when a drop gap ends, and whether `verify` should instead bound it (for example, one flush interval) or ignore it.
+25. **AWS account for requester-pays buckets (owner).** B-5/B-6 and the V-8 sample download need an AWS account. Expected cost is a few dollars per month of fills, ~$100+ for a full year. The owner must create and hold the credentials; agents never should.
+26. **Tardis subscription (owner).** Only if the preliminary HIST-PRELIM results look promising. The cheapest route to "every day" HL `bbo` for 4 months is a monthly Academic/Solo Perpetuals plan (~$350–1,200/mo; minimum $300); otherwise rely on our own recorder.
+27. **Data licenses.** Tardis, Hydromancer and the HL S3 terms for storing data for research are unstated; only SonarX publishes an explicit (CC0) license. Keep everything under `research/data/` (never committed).
+28. ~~**June-2026 `l2Book` throttling.**~~ **Resolved 2026-09-28 (V-1):** §15's `l2Book` row records the default 20-level push at 2.4–6.6 s (now ~5 s) and `fast:true` 5 levels at ~0.5 s; no re-check needed.
+29. **Claims to verify (ideas review).** Not applied to spec facts unless the claim cites an official docs URL; those are in §15 tagged "(ideas review, verify)". Remaining bullets:
+    - HIP-4 outcome-market launch date and the BTC/ETH/HYPE/SOL extension are third-party ⚠ verify (the docs describe the primitive, not the date); gates O17.
+    - HyperEVM read precompiles on **mainnet** (docs describe testnet) ⚠ verify; gates O22.
+    - HYPE on-chain option venues (Derive, Hypersurface, opt.fun, D2 HYPE++ vault) are third-party ⚠ verify; gates O23.
+    - Whether HL's June-2026 WS throttling also changed the official S3 archive cadence is unverified.
+    - Binance/Bybit VIP0 fees and `predictedFundings` timing/weights remain open (V-2/V-3).
+    - The docs state HyperCore order sequencing but not an explicit EVM block ordering rule; keep O8 Q2 open (source: `hyperliquid.gitbook.io/hyperliquid-docs/hypercore/order-book`).
+    - §B claims already settled by V-1 (trades.users, `l2Book` fast mode, `candleSnapshot` retention, spot ctx channel, WS idle close, `chronyc` columns): no action; see §15.

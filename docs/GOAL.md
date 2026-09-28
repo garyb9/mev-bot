@@ -226,7 +226,8 @@ Follow the tiers (§2.1):
    history needs calendar time, so start its clock now.
 3. **T1 engine:** SPEC-0010 E-6/E-8 remainders (E-7 done), then SPEC-0011 L-tasks
    and SPEC-0004 K-tasks. SPEC-0000 C-tasks are small and can run any time.
-4. **T1 research:** P-1…P-5, then studies O1, O2, O3, O5, O8 (desk), O10
+4. **T1 research:** the historical backtest lane starts now with **B-1 → B-2**
+   (B-3 after P-2, B-9 after P-5); P-2…P-5 follow, then studies O1, O2, O3, O5, O8 (desk), O10
    A+D, O11 A.
 5. **T2** studies, then **T3** research once its gate opens. Everything ends
    in ADR-0002.
