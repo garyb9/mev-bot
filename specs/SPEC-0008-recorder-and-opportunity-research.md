@@ -970,7 +970,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | P-1 | `research/` scaffold + segment reader in Python | T1 | S | R-2 (format frozen) | ✅ |
 | P-2 | Normalizer → Parquet tables (§13.1) | T1 | M | P-1, V-1 | ✅ |
 | P-3 | Cost model module + `costs.toml` + `thresholds.toml` | T1 | S | P-1, V-2, V-3 | ✅ |
-| P-4 | Episode detector + latency capture (§13.3–13.5) | T1 | M | P-2, P-3 | ☐ |
+| P-4 | Episode detector + latency capture (§13.3–13.5) | T1 | M | P-2, P-3 | ✅ |
 | P-5 | Report template + `RANKING.md` generator | T1 | S | P-4 | ☐ |
 | P-6 | Slow-signal backtester (§13.8) | T3 | M | P-2, P-3, T3 gate | ☐ |
 | P-7 | Read-only import of finsnap's `option_snapshots` history (for O9a) | T3 | S | P-2, V-9, T3 gate | ☐ |
