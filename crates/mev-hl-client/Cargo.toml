@@ -32,7 +32,12 @@ tokio = { workspace = true }
 wiremock.workspace = true
 criterion.workspace = true
 anyhow.workspace = true
+metrics-util.workspace = true
 
 [[bench]]
 name = "decode"
+harness = false
+
+[[bench]]
+name = "sign"
 harness = false

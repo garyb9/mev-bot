@@ -943,6 +943,7 @@ mod tests {
                 grouping: mev_hl_client::Grouping::Na,
             },
             cloids: smallvec![c],
+            recv_mono_ns: 0,
         };
         let orders = paper_orders_from_post(&post, &registry, &table);
         assert_eq!(orders.len(), 1);
@@ -962,6 +963,7 @@ mod tests {
                 }],
             },
             cloids: smallvec![c],
+            recv_mono_ns: 0,
         };
         assert_eq!(paper_cancels_from_post(&cancel_post), vec![c]);
     }

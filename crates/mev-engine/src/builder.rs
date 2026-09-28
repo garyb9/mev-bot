@@ -257,6 +257,7 @@ pub fn plan_iteration(
             req_id: req_ids.next(),
             action: VenueAction::CancelByCloid { cancels },
             cloids: cancel_cloids,
+            recv_mono_ns: 0,
         });
     }
     if !places.is_empty() {
@@ -267,6 +268,7 @@ pub fn plan_iteration(
                 grouping: Grouping::Na,
             },
             cloids: place_cloids,
+            recv_mono_ns: 0,
         });
     }
     BuiltBatch { posts, dropped }

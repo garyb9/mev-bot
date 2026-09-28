@@ -919,7 +919,7 @@ impl StrategyDispatcher {
             let ask = slot.best_ask()?.px;
             Some((bid, ask))
         };
-        let batch = plan_iteration(
+        let mut batch = plan_iteration(
             approved,
             &self.registry,
             &self.table,
@@ -929,6 +929,12 @@ impl StrategyDispatcher {
             self.config.max_slippage_bps,
             &mut self.req_ids,
         );
+        // Carry the market frame's monotonic read time so the live transport
+        // can stamp the end-to-end `hl_tick_to_order_seconds` after the socket
+        // write (SPEC-0002 H-7).
+        for post in &mut batch.posts {
+            post.recv_mono_ns = t_recv;
+        }
 
         // A built batch may drop places (bad size, min notional, missing asset).
         // Remove their provisional live orders so exposure is not stranded.
@@ -1560,6 +1566,25 @@ mod tests {
             let order = h.dispatcher.orders.get(*c).expect("live order inserted");
             assert_eq!(order.state, OrderState::PendingNew);
             assert_eq!(order.req_id, Some(posts[1].req_id));
+        }
+    }
+
+    #[test]
+    fn built_posts_carry_the_frames_recv_mono_ns() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+
+        let state = state_with("100", "101");
+        h.dispatcher.on_coin_state(CoinId(0), stamp(4242), &state);
+
+        let posts = h.posts.lock().unwrap();
+        assert!(!posts.is_empty(), "the place built one post");
+        for post in posts.iter() {
+            assert_eq!(
+                post.recv_mono_ns, 4242,
+                "each post must carry the triggering frame's read time"
+            );
         }
     }
 

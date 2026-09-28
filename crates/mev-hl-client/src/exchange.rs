@@ -10,6 +10,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -317,6 +318,15 @@ pub trait ExchangeApi: Send + Sync {
         Ok(ReplyHandle::ready(Ok(response)))
     }
 
+    /// Like [`Self::enqueue`], but carries the market frame's monotonic read
+    /// time (`recv_mono_ns`) so a transport that owns the socket write can
+    /// record `hl_tick_to_order_seconds` end to end (SPEC-0002 H-7). The
+    /// default drops the hint and defers to [`Self::enqueue`].
+    async fn enqueue_timed(&self, action: &Action, recv_mono_ns: u64) -> Result<ReplyHandle> {
+        let _ = recv_mono_ns;
+        self.enqueue(action).await
+    }
+
     /// Place one or more orders and parse the per-order statuses.
     async fn place(&self, orders: Vec<OrderWire>) -> Result<OrderResponse> {
         self.submit(&Action::order(orders)).await?.order_response()
@@ -371,6 +381,9 @@ pub struct WriteCore {
     gate: WriteGate,
     expires_after: Option<u64>,
     vault_address: Option<String>,
+    /// Cached `hl_sign_seconds` handle (SPEC-0002 H-7). Pre-created so the hot
+    /// statement does not format a label or build a key per sign.
+    sign_histogram: metrics::Histogram,
 }
 
 impl WriteCore {
@@ -394,6 +407,7 @@ impl WriteCore {
             gate,
             expires_after: None,
             vault_address: None,
+            sign_histogram: metrics::histogram!(mev_metrics::names::SIGN_SECONDS),
         })
     }
 
@@ -471,13 +485,18 @@ impl WriteCore {
             .as_ref()
             .ok_or_else(|| Error::Config("no agent signer is configured".into()))?;
         let nonce = self.nonce.lock().await.next(now_ms());
-        let request = build_request(
+        let started = Instant::now();
+        let built = build_request(
             action,
             signer,
             nonce,
             self.vault_address.clone(),
             self.expires_after,
-        )?;
+        );
+        // Build + msgpack + EIP-712 sign (SPEC-0002 H-7). Recorded even on
+        // failure: the stage ran.
+        self.sign_histogram.record(started.elapsed().as_secs_f64());
+        let request = built?;
         if self.gate == WriteGate::DryRun {
             return Ok(Prepared::DryRun(Box::new(request)));
         }
@@ -560,6 +579,8 @@ pub struct HttpExchange {
     client: reqwest::Client,
     base_url: String,
     core: WriteCore,
+    /// Cached `hl_submit_ack_seconds{transport="rest"}` handle (SPEC-0002 H-7).
+    submit_histogram: metrics::Histogram,
 }
 
 impl HttpExchange {
@@ -581,6 +602,10 @@ impl HttpExchange {
             client: reqwest::Client::new(),
             base_url: base_url.into(),
             core: WriteCore::new(mode, signer)?,
+            submit_histogram: metrics::histogram!(
+                mev_metrics::names::SUBMIT_ACK_SECONDS,
+                "transport" => "rest"
+            ),
         })
     }
 
@@ -634,6 +659,7 @@ impl HttpExchange {
         };
 
         let url = format!("{}/exchange", self.base_url.trim_end_matches('/'));
+        let started = Instant::now();
         let resp = self
             .client
             .post(&url)
@@ -641,6 +667,10 @@ impl HttpExchange {
             .send()
             .await
             .map_err(|e| Error::Http(e.to_string()))?;
+        // Submit-to-ack: request written through the venue's response
+        // (SPEC-0002 H-7, `transport="rest"`).
+        self.submit_histogram
+            .record(started.elapsed().as_secs_f64());
 
         let status = resp.status();
         if !status.is_success() {
@@ -678,6 +708,8 @@ impl ExchangeApi for HttpExchange {
 mod tests {
     use super::*;
     use crate::order::{Action, Grouping, Tif, limit_order};
+    use crate::test_metrics::histogram_samples;
+    use metrics_util::debugging::DebuggingRecorder;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
@@ -906,5 +938,53 @@ mod tests {
         assert!(HttpExchange::with_base_url("http://x", Mode::Simulate, None).is_err());
         assert!(HttpExchange::with_base_url("http://x", Mode::Live, None).is_err());
         assert!(HttpExchange::with_base_url("http://x", Mode::Observe, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn prepare_records_the_sign_histogram() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Construct inside the local recorder so the cached handle binds to it.
+        let exchange = metrics::with_local_recorder(&recorder, || {
+            HttpExchange::with_base_url("http://127.0.0.1:1", Mode::Simulate, Some(signer()))
+                .unwrap()
+        });
+        // `simulate` signs (the `prepare` stage) but never posts.
+        exchange.submit(&simple_action()).await.unwrap();
+        assert_eq!(
+            histogram_samples(
+                snapshotter.snapshot(),
+                mev_metrics::names::SIGN_SECONDS,
+                None,
+            ),
+            1,
+        );
+    }
+
+    #[tokio::test]
+    async fn live_post_records_the_rest_submit_ack_histogram() {
+        let server = MockServer::start().await;
+        let body = r#"{"status":"ok","response":{"data":{"statuses":["resting"]}}}"#;
+        Mock::given(method("POST"))
+            .and(path("/exchange"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Construct inside the local recorder so the cached handle binds to it.
+        let exchange = metrics::with_local_recorder(&recorder, || {
+            HttpExchange::with_base_url(server.uri(), Mode::Live, Some(signer())).unwrap()
+        });
+        exchange.submit(&simple_action()).await.unwrap();
+        assert_eq!(
+            histogram_samples(
+                snapshotter.snapshot(),
+                mev_metrics::names::SUBMIT_ACK_SECONDS,
+                Some(("transport", "rest")),
+            ),
+            1,
+        );
     }
 }

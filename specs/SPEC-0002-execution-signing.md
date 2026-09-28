@@ -202,7 +202,7 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 | H-4 | Dead-man's switch policy (arm only when needed; fail closed) | **T0** | S | H-1 | ✅ |
 | H-5 | Apply `bbo` to `MarketState` | T1 | S | — | ✅ |
 | H-6 | Nonce persistence off the hot path | T1 | S | H-9 | ☐ |
-| H-7 | Latency instrumentation + sign/submit benchmarks | T1 | M | H-1 | ☐ |
+| H-7 | Latency instrumentation + sign/submit benchmarks | T1 | M | H-1 | 🔄 |
 | H-8 | `simulate` without keys (ephemeral signer) | T1 | S | — | ✅ |
 | H-9 | Verify the HL nonce and `scheduleCancel` rules | **T0** | S | — | ✅ |
 | H-10 | Testnet round-trip (the open §15 item) | T1 | S | **all T0 fixes** (GOAL §2.2), owner-provided testnet key | ☐ |
@@ -224,6 +224,8 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 **H-6 — Nonce persistence off the hot path.** `WriteCore::prepare` currently writes the nonce to SQLite synchronously before every send. Once H-9 confirms the nonce rule, move persistence to write-behind (via `DbWriter`, at most once per second), relying on `max(now_ms, restored + 1)` + the future-drift guard for crash safety. Document the argument in §5. *Done when:* a restart test (kill before the write-behind flush) still never produces a nonce ≤ any previously sent nonce under a monotonic clock; H-7 shows the latency drop.
 
 **H-7 — Latency instrumentation + benchmarks.** Add histograms for each [`docs/GOAL.md`](../docs/GOAL.md) §5.2 stage (`hl_decode_seconds`, `hl_sign_seconds`, `hl_submit_ack_seconds{transport}`, `hl_tick_to_order_seconds`) using a cheap monotonic clock. Add a criterion bench `benches/sign.rs` (build + msgpack + EIP-712 sign of one order and a batch of 10) and a mock-WS `post` round-trip bench. Record results in ADR-0001's "Not yet measured" section. *Done when:* the benches run in CI quick mode and the numbers are recorded.
+
+Instrumentation and benches landed (2026-09-28); CI quick-mode bench job is C-3.
 
 **H-8 — `simulate` without keys.** SPEC-0000 §6 says `simulate` needs no keys, but `WriteCore::new` rejects `DryRun` without a signer. In `simulate` with no key, generate an ephemeral random signer (never persisted, logged as such). *Done when:* `hl run --mode simulate` starts with no key, and a test covers it.
 

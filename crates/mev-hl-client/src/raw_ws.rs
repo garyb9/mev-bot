@@ -395,7 +395,9 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn mono_ns() -> u64 {
+/// Process-global monotonic nanoseconds, used to stamp received frames and to
+/// measure end-to-end latency (SPEC-0002 H-7).
+pub fn mono_ns() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(std::time::Instant::now);
     start.elapsed().as_nanos() as u64

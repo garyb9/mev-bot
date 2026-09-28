@@ -8,6 +8,7 @@
 //! bounded channel; the engine drains it in its loop (E-3).
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use mev_core::error::{Error, Result};
 use smallvec::SmallVec;
@@ -497,6 +498,12 @@ pub fn parse_side(side: &str) -> Side {
 pub struct Ingest {
     coins: IngestCoins,
     conn: ConnId,
+    /// Cached `hl_decode_seconds{kind="market"}` handle (SPEC-0002 H-7).
+    /// Recording itself may allocate or lock inside the Prometheus recorder;
+    /// the cached handle only avoids per-frame key/label construction.
+    market_decode: metrics::Histogram,
+    /// Cached `hl_decode_seconds{kind="account"}` handle (SPEC-0002 H-7).
+    account_decode: metrics::Histogram,
 }
 
 impl Ingest {
@@ -505,17 +512,37 @@ impl Ingest {
         Self {
             coins: IngestCoins::new(registry),
             conn,
+            market_decode: metrics::histogram!(
+                mev_metrics::names::DECODE_SECONDS,
+                "kind" => "market"
+            ),
+            account_decode: metrics::histogram!(
+                mev_metrics::names::DECODE_SECONDS,
+                "kind" => "account"
+            ),
         }
     }
 
-    /// Decode a market text frame at `stamp`.
+    /// Decode a market text frame at `stamp`, timing frames that yield an event
+    /// (pongs, sub-acks, and unknown coins are not decode events).
     pub fn decode(&self, text: &str, stamp: Stamp) -> Result<Option<MarketUpdate>> {
-        decode_market(text, &self.coins, self.conn, stamp)
+        let started = Instant::now();
+        let decoded = decode_market(text, &self.coins, self.conn, stamp);
+        if decoded.as_ref().is_ok_and(Option::is_some) {
+            self.market_decode.record(started.elapsed().as_secs_f64());
+        }
+        decoded
     }
 
-    /// Decode an account text frame into zero or more [`AccountUpdate`]s.
+    /// Decode an account text frame into zero or more [`AccountUpdate`]s,
+    /// timed under `hl_decode_seconds{kind="account"}`.
     pub fn decode_account(&self, text: &str, stamp: Stamp) -> Result<Vec<AccountUpdate>> {
-        decode_account(text, &self.coins, stamp)
+        let started = Instant::now();
+        let decoded = decode_account(text, &self.coins, stamp);
+        if decoded.is_ok() {
+            self.account_decode.record(started.elapsed().as_secs_f64());
+        }
+        decoded
     }
 
     /// The coins this ingester resolves.
@@ -547,7 +574,39 @@ mod tests {
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
     use super::*;
+
+    /// Count histogram samples for `name` (and optional `label`) in a
+    /// debugging-recorder snapshot.
+    fn histogram_samples(
+        snapshot: metrics_util::debugging::Snapshot,
+        name: &str,
+        label: Option<(&str, &str)>,
+    ) -> usize {
+        snapshot
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| {
+                if key.key().name() != name {
+                    return None;
+                }
+                if let Some((want_key, want_value)) = label
+                    && !key
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == want_key && l.value() == want_value)
+                {
+                    return None;
+                }
+                match value {
+                    DebugValue::Histogram(values) => Some(values.len()),
+                    _ => None,
+                }
+            })
+            .sum()
+    }
 
     const L2BOOK: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -840,5 +899,50 @@ mod tests {
             Some(MarketUpdate::Trades { stamp: got, .. }) => assert_eq!(got, stamp),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_records_the_decode_histogram() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Construct inside the local recorder so the cached handle binds to it.
+        let ingester = metrics::with_local_recorder(&recorder, ingester);
+
+        // A market frame that yields no event (a pong) is not a decode.
+        assert!(
+            ingester
+                .decode(r#"{"channel":"pong"}"#, Stamp::default())
+                .unwrap()
+                .is_none()
+        );
+        ingester
+            .decode(first_frame(L2BOOK), Stamp::default())
+            .unwrap();
+        assert_eq!(
+            histogram_samples(
+                snapshotter.snapshot(),
+                mev_metrics::names::DECODE_SECONDS,
+                Some(("kind", "market")),
+            ),
+            1,
+            "only the frame that decoded to an event is timed as a market decode"
+        );
+
+        // Account frames are timed under their own label.
+        ingester
+            .decode_account(
+                r#"{"channel":"userFills","data":{"isSnapshot":false,"user":"0xabc","fills":[
+                    {"coin":"BTC","px":"60000","sz":"0.01","side":"B","time":7,"oid":42,"fee":"0.27","tid":7}]}}"#,
+                Stamp::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            histogram_samples(
+                snapshotter.snapshot(),
+                mev_metrics::names::DECODE_SECONDS,
+                Some(("kind", "account")),
+            ),
+            1,
+        );
     }
 }

@@ -31,6 +31,11 @@ pub struct UnsignedPost {
     pub action: Action,
     /// Engine cloids carried by the action's orders, in action order.
     pub cloids: SmallVec<[Cloid; 8]>,
+    /// Monotonic nanoseconds (the raw-socket clock) when the triggering market
+    /// frame was read, carried so the live exec writer can record
+    /// `hl_tick_to_order_seconds` end to end (SPEC-0002 H-7). `0` when unset
+    /// (replay/paper, which do not go through the live exec writer).
+    pub recv_mono_ns: u64,
 }
 
 /// A non-blocking sink for unsigned posts.
@@ -244,6 +249,7 @@ mod tests {
                 req_id: 7,
                 action: Action::CancelByCloid { cancels: vec![] },
                 cloids,
+                recv_mono_ns: 0,
             }],
             dropped: Vec::new(),
         }

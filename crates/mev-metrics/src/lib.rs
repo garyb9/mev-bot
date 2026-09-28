@@ -71,12 +71,38 @@ pub mod names {
     pub const ENGINE_RISK_SECONDS: &str = "hl_engine_risk_seconds";
     /// Engine sign span: `t_signed − t_risked` (SPEC-0010 §17).
     pub const ENGINE_SIGN_SECONDS: &str = "hl_engine_sign_seconds";
+    /// WS frame decode time, measured at the ingest site (SPEC-0002 H-7),
+    /// tagged by `kind` (`market`/`account`).
+    ///
+    /// Distinct from [`ENGINE_DECODE_SECONDS`], which is the per-decision
+    /// engine span from the internal `LatencyRecorder`; this is the decode of
+    /// one frame as it happens in the ingest task.
+    pub const DECODE_SECONDS: &str = "hl_decode_seconds";
+    /// Order build + msgpack + EIP-712 sign time (SPEC-0002 H-7).
+    ///
+    /// Measured inside `WriteCore::prepare`, where signing actually happens,
+    /// unlike the engine's `hl_engine_sign_seconds` span.
+    pub const SIGN_SECONDS: &str = "hl_sign_seconds";
     /// Engine handoff span: `t_written − t_signed` (SPEC-0010 §17).
     pub const ENGINE_HANDOFF_SECONDS: &str = "hl_engine_handoff_seconds";
-    /// Headline internal latency: `t_written − t_recv` (SPEC-0010 §17, GOAL §5.2).
+    /// Headline internal latency, timed by the live exec path: market frame read
+    /// → order frame written to the socket (SPEC-0002 H-7, GOAL §5.2).
     pub const TICK_TO_ORDER_SECONDS: &str = "hl_tick_to_order_seconds";
-    /// Submit-to-ack span: `t_ack − t_written` (SPEC-0010 §17).
+    /// Submit-to-ack span: `t_ack − t_written`, measured at the transport
+    /// (SPEC-0002 H-7), tagged by `transport`.
     pub const SUBMIT_ACK_SECONDS: &str = "hl_submit_ack_seconds";
+    /// Tick-to-order samples skipped because their `recv_mono_ns` was unset or
+    /// not comparable to the socket clock (timer-driven decisions). SPEC-0002
+    /// H-7.
+    pub const TICK_TO_ORDER_SKIPPED_TOTAL: &str = "hl_tick_to_order_skipped_total";
+    /// Engine-side headline span `t_written − t_recv` from the in-process
+    /// `LatencyRecorder`, not yet published (SPEC-0010 §17). Distinct from
+    /// [`TICK_TO_ORDER_SECONDS`], the H-7 live exec path.
+    pub const ENGINE_TICK_TO_ORDER_SECONDS: &str = "hl_engine_tick_to_order_seconds";
+    /// Engine-side submit span `t_ack − t_written` from the in-process
+    /// `LatencyRecorder`, not yet published (SPEC-0010 §17). Distinct from
+    /// [`SUBMIT_ACK_SECONDS`], the H-7 transport histogram.
+    pub const ENGINE_SUBMIT_ACK_SECONDS: &str = "hl_engine_submit_ack_seconds";
     /// Engine loop iteration duration in seconds (SPEC-0010 §17).
     pub const ENGINE_ITERATION_SECONDS: &str = "hl_engine_iteration_seconds";
     /// Market events drained per engine iteration (SPEC-0010 §17).

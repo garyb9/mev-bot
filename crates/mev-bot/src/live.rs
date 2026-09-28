@@ -50,6 +50,10 @@ pub(crate) fn spawn_exec_writer(
             }
         });
 
+    // Pre-created once, then moved into the writer task. Cached handles avoid a
+    // per-post key/label lookup; the Prometheus recorder may still buffer or
+    // lock internally, so this is not a lock-free guarantee.
+    let exec_queue = metrics::histogram!(mev_metrics::names::EXEC_QUEUE_SECONDS);
     tokio::spawn(async move {
         let mut inflight = FuturesUnordered::new();
         loop {
@@ -57,12 +61,14 @@ pub(crate) fn spawn_exec_writer(
                 maybe = rx.recv() => {
                     let Some(post) = maybe else { break };
                     let queued = Instant::now();
+                    let recv_mono_ns = post.recv_mono_ns;
                     // Sign and enqueue now, in order; only the reply is awaited
-                    // later. No lock is held across this await.
-                    match exchange.enqueue(&post.action).await {
+                    // later. No lock is held across this await. The transport
+                    // stamps the end-to-end tick-to-order span from
+                    // `recv_mono_ns` (SPEC-0002 H-7).
+                    match exchange.enqueue_timed(&post.action, recv_mono_ns).await {
                         Ok(handle) => {
-                            metrics::histogram!(mev_metrics::names::EXEC_QUEUE_SECONDS)
-                                .record(queued.elapsed().as_secs_f64());
+                            exec_queue.record(queued.elapsed().as_secs_f64());
                             inflight.push(finish_post(
                                 handle,
                                 info.clone(),
@@ -472,6 +478,7 @@ mod tests {
     struct MockExchange {
         enqueued: Arc<Mutex<Vec<Action>>>,
         outcomes: Arc<Mutex<VecDeque<Outcome>>>,
+        recv_hints: Arc<Mutex<Vec<u64>>>,
     }
 
     #[async_trait::async_trait]
@@ -502,12 +509,22 @@ mod tests {
                 }
             }))
         }
+
+        async fn enqueue_timed(
+            &self,
+            action: &Action,
+            recv_mono_ns: u64,
+        ) -> mev_core::error::Result<ReplyHandle> {
+            self.recv_hints.lock().unwrap().push(recv_mono_ns);
+            self.enqueue(action).await
+        }
     }
 
     fn mock_exchange(outcomes: Vec<Outcome>) -> Arc<MockExchange> {
         Arc::new(MockExchange {
             enqueued: Arc::new(Mutex::new(Vec::new())),
             outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
+            recv_hints: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -516,6 +533,7 @@ mod tests {
             req_id,
             action,
             cloids: SmallVec::new(),
+            recv_mono_ns: 0,
         }
     }
 
@@ -856,5 +874,42 @@ mod tests {
             }
             other => panic!("expected a decoded fill, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn exec_writer_forwards_the_recv_time_hint() {
+        let exchange = mock_exchange(vec![Outcome {
+            delay: Duration::ZERO,
+            fail: false,
+        }]);
+        let (handles, inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let writer = spawn_exec_writer(rx, exchange.clone(), dead_info(), None, handles);
+
+        let mut post = test_post(
+            2,
+            Action::Order {
+                orders: vec![],
+                grouping: Grouping::Na,
+            },
+        );
+        // The engine carries the market frame's read time; the transport needs it
+        // to stamp the end-to-end tick-to-order span (SPEC-0002 H-7).
+        post.recv_mono_ns = 12_345;
+        tx.send(post).unwrap();
+
+        let got = recv_account(&inputs, Duration::from_secs(2)).await;
+        assert!(
+            matches!(got, Some(AccountUpdate::PostAck { .. })),
+            "expected a post ack, got {got:?}"
+        );
+        assert_eq!(
+            *exchange.recv_hints.lock().unwrap(),
+            vec![12_345],
+            "the exec writer must forward the frame's recv time to the transport"
+        );
+
+        drop(tx);
+        writer.abort();
     }
 }

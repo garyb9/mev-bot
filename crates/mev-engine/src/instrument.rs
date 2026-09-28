@@ -32,8 +32,13 @@
 //! | `hl_engine_risk_seconds` | `t_risked − t_decided` |
 //! | `hl_engine_sign_seconds` | `t_signed − t_risked` |
 //! | `hl_engine_handoff_seconds` | `t_written − t_signed` |
-//! | `hl_tick_to_order_seconds` | `t_written − t_recv` (headline) |
-//! | `hl_submit_ack_seconds` | `t_ack − t_written` |
+//! | `hl_engine_tick_to_order_seconds` | `t_written − t_recv` (engine-side headline) |
+//! | `hl_engine_submit_ack_seconds` | `t_ack − t_written` (engine-side) |
+//!
+//! These are the engine's in-process spans. The live exec path records the
+//! published end-to-end `hl_tick_to_order_seconds` and the transport
+//! `hl_submit_ack_seconds{transport}` separately (SPEC-0002 H-7), so the
+//! engine-side names deliberately carry the `hl_engine_` prefix.
 //!
 //! Loop health:
 //!
@@ -431,11 +436,11 @@ impl LatencyRecorder {
             Metric::Latency(self.handoff.percentiles()),
         ));
         out.push((
-            names::TICK_TO_ORDER_SECONDS,
+            names::ENGINE_TICK_TO_ORDER_SECONDS,
             Metric::Latency(self.tick_to_order.percentiles()),
         ));
         out.push((
-            names::SUBMIT_ACK_SECONDS,
+            names::ENGINE_SUBMIT_ACK_SECONDS,
             Metric::Latency(self.submit_ack.percentiles()),
         ));
         out.push((

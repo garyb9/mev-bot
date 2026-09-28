@@ -18,6 +18,9 @@ pub mod types;
 pub mod ws;
 pub mod ws_exchange;
 
+#[cfg(test)]
+mod test_metrics;
+
 pub use assets::{AssetMap, Market, MarketKind, MarketSelector};
 pub use client::{HttpInfo, InfoApi};
 pub use cloid::CloidFactory;

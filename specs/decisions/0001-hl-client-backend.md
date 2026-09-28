@@ -72,18 +72,46 @@ Takeaways:
   stream with reconnect/heartbeat, and the local state/staleness model. No
   deprecated deps; smallest graph after fastwebsockets.
 
+## Measured (SPEC-0002 H-7, 2026-09-28)
+
+Sign and local submit latency, measured with the new
+`crates/mev-hl-client/benches/sign.rs` criterion bench. It exercises the same
+path `WriteCore::prepare` runs — the `hl_sign_seconds` stage: order build +
+msgpack + EIP-712 sign — plus a localhost mock-WS `post` round trip.
+
+- **Machine:** WSL2 (kernel `6.18.33.2-microsoft-standard-WSL2`), Intel(R)
+  Core(TM) i7-14700K, 28 vCPU.
+- **Command:** `cargo bench -p mev-hl-client --bench sign -- --warm-up-time 1
+  --measurement-time 3 --sample-size 100`. CI quick mode:
+  `cargo bench -p mev-hl-client --bench sign -- --quick`.
+- Release profile (`lto = "fat"`), 100 samples. The mean equals criterion's own
+  point estimate. The p50/p99 columns are the p50/p99 of criterion's
+  **per-sample means**, not a strict per-iteration p99 (criterion does not
+  expose one).
+
+| Bench | Mean | p50 | p99 (per-sample means) | Budget ([GOAL §5.2](../../docs/GOAL.md)) | Verdict |
+|---|---|---|---|---|---|
+| `sign/one_order` | 26.8 µs | 26.6 µs | 30.4 µs | p50 ≤ 150 µs, p99 ≤ 500 µs | **PASS**, ~6×/16× margin |
+| `sign/batch_10` | 28.4 µs | 28.3 µs | 29.7 µs | (same, per action) | PASS |
+| `ws_post/round_trip` | 44.3 µs | 43.5 µs | 72.1 µs | — (localhost mock) | n/a |
+
+`ws_post/round_trip` is an in-process mock venue on `127.0.0.1` (no network),
+so it prices sign + JSON + WS framing + loopback, not the real venue RTT. This
+is the WSL2 dev host, not the (still pending) reference host
+(SPEC-0010 §23 Q-E12-Reference-Host); the numbers should be re-run there.
+
 ## Not yet measured (pending, explicitly out of scope today)
 
-These require an agent/API wallet and funded testnet account, which are not
-available yet (SPEC-0002 / user-provided keys):
-
-- EIP-712 phantom-agent **sign latency** (build + hash + sign).
-- **End-to-end submit** wall time (build → sign → POST `/exchange`, testnet).
+- **End-to-end submit** wall time to the real venue (testnet): submit→ack needs
+  a funded, agent-approved testnet account (SPEC-0002 H-10). Runtime
+  `hl_submit_ack_seconds{transport}` is now recorded and will fill from the
+  testnet round-trip.
 - **Reconnect** time-from-drop under a forced disconnect (needs a local mock
   WS server; our client already reconnects with capped backoff).
 
-They will be added to this record when keys/testnet funds exist; the decision
-rule (p99 on decode/sign/submit) is currently satisfied only on decode.
+The §15 sign-budget acceptance item is met on the dev host (WSL2, i7-14700K);
+it is pending the reference host. The decision rule (p99 on decode/sign/submit)
+is now satisfied on decode and sign.
 
 ## Decision
 
@@ -107,5 +135,8 @@ rule (p99 on decode/sign/submit) is currently satisfied only on decode.
 ## Consequences
 
 - Default remains `tokio-tungstenite` 0.30; trait boundary unchanged.
-- Optional follow-ups: `allMids` lazy/`simd-json` decoding; a mock-WS reconnect
-  harness; sign/submit benchmarks once keys land.
+- Follow-up landed: the sign/submit benchmarks (SPEC-0002 H-7) are in
+  `crates/mev-hl-client/benches/sign.rs` and the numbers are above.
+- Remaining optional follow-ups: `allMids` lazy/`simd-json` decoding; a mock-WS
+  reconnect harness; and a real testnet submit round-trip (SPEC-0002 H-10) once
+  a funded agent wallet exists.

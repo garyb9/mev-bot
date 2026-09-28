@@ -14,6 +14,7 @@ mev-hl-client.workspace = true
 mev-metrics.workspace = true
 mev-risk.workspace = true
 mev-strategy.workspace = true
+metrics.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,6 +24,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+metrics-util.workspace = true
 
 [[bench]]
 name = "ingest"
