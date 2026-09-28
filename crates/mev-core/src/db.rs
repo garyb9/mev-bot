@@ -618,8 +618,8 @@ mod tests {
 
     #[test]
     fn survives_reopen_and_migrates() {
-        let dir = std::env::temp_dir().join(format!("mev-db-{}", std::process::id()));
-        let path = dir.join("hlbot.db");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hlbot.db");
         {
             let db = Db::open(&path).unwrap();
             db.set_nonce_last(42).unwrap();
@@ -629,7 +629,6 @@ mod tests {
         assert_eq!(db.nonce_last().unwrap(), Some(42));
         // Re-opening applies no further migrations.
         assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u32);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

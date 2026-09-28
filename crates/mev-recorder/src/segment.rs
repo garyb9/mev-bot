@@ -680,7 +680,6 @@ mod tests {
     use super::*;
     use crate::envelope::{FixedEnvelopeClock, Kind};
     use std::io::Read;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn decode_records(path: &Path) -> Vec<Envelope> {
         let file = File::open(path).unwrap();
@@ -697,14 +696,11 @@ mod tests {
     const H1: i64 = 1_767_227_400_000_000_000; // 2026-01-01T00:30:00Z
     const H2: i64 = 1_767_231_000_000_000_000; // 2026-01-01T01:30:00Z
 
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let n = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("mev-rec-{tag}-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("mev-rec-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     fn config(dir: &Path, clock: Arc<FixedEnvelopeClock>, src: &str, conn: &str) -> SegmentConfig {
@@ -759,10 +755,10 @@ mod tests {
 
     #[test]
     fn rotates_on_hour_boundary() {
-        let dir = temp_dir("hour");
+        let tmp = temp_dir("hour");
+        let dir = tmp.path();
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
-        let writer =
-            SegmentWriter::spawn(config(&dir, clock.clone(), "hl-ws", "hl-ws-01")).unwrap();
+        let writer = SegmentWriter::spawn(config(dir, clock.clone(), "hl-ws", "hl-ws-01")).unwrap();
 
         clock.set_t_ns(H1);
         assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 0, "a")));
@@ -797,9 +793,10 @@ mod tests {
 
     #[test]
     fn rotates_on_size() {
-        let dir = temp_dir("size");
+        let tmp = temp_dir("size");
+        let dir = tmp.path();
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
-        let mut cfg = config(&dir, clock.clone(), "hl-ws", "hl-ws-01");
+        let mut cfg = config(dir, clock.clone(), "hl-ws", "hl-ws-01");
         cfg.max_raw_bytes = 500;
         let writer = SegmentWriter::spawn(cfg).unwrap();
 
@@ -833,9 +830,10 @@ mod tests {
 
     #[test]
     fn manifest_line_matches_file() {
-        let dir = temp_dir("manifest");
+        let tmp = temp_dir("manifest");
+        let dir = tmp.path();
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
-        let mut cfg = config(&dir, clock.clone(), "hl-ws", "hl-ws-01");
+        let mut cfg = config(dir, clock.clone(), "hl-ws", "hl-ws-01");
         cfg.max_raw_bytes = 400;
         let writer = SegmentWriter::spawn(cfg).unwrap();
         for i in 0..10u64 {
@@ -871,14 +869,15 @@ mod tests {
 
     #[test]
     fn partial_becomes_crashed_on_restart() {
-        let dir = temp_dir("crash");
+        let tmp = temp_dir("crash");
+        let dir = tmp.path();
         let hour_dir = dir.join("testnet/hl-ws/2023-11-14/22");
         fs::create_dir_all(&hour_dir).unwrap();
         let partial = hour_dir.join("hl-ws-01-1700000000000000000.jsonl.zst.partial");
         fs::write(&partial, b"truncated zstd bytes").unwrap();
 
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
-        let writer = SegmentWriter::spawn(config(&dir, clock, "hl-ws", "hl-ws-01")).unwrap();
+        let writer = SegmentWriter::spawn(config(dir, clock, "hl-ws", "hl-ws-01")).unwrap();
         writer.shutdown();
 
         assert!(!partial.exists());
@@ -899,7 +898,8 @@ mod tests {
 
     #[test]
     fn recover_crashed_matches_the_exact_conn() {
-        let dir = temp_dir("crash-conn");
+        let tmp = temp_dir("crash-conn");
+        let dir = tmp.path();
         let hour_dir = dir.join("testnet/hl-ws/2023-11-14/22");
         fs::create_dir_all(&hour_dir).unwrap();
         let mine = hour_dir.join("hl-ws-1700000000000000000.jsonl.zst.partial");
@@ -908,7 +908,7 @@ mod tests {
         fs::write(&other, b"other").unwrap();
 
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
-        let writer = SegmentWriter::spawn(config(&dir, clock, "hl-ws", "hl-ws")).unwrap();
+        let writer = SegmentWriter::spawn(config(dir, clock, "hl-ws", "hl-ws")).unwrap();
         writer.shutdown();
 
         assert!(!mine.exists());
@@ -925,10 +925,10 @@ mod tests {
 
     #[test]
     fn records_written_equal_read_back() {
-        let dir = temp_dir("roundtrip");
+        let tmp = temp_dir("roundtrip");
+        let dir = tmp.path();
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
-        let writer =
-            SegmentWriter::spawn(config(&dir, clock.clone(), "hl-ws", "hl-ws-01")).unwrap();
+        let writer = SegmentWriter::spawn(config(dir, clock.clone(), "hl-ws", "hl-ws-01")).unwrap();
 
         let total = 50u64;
         for i in 0..total {
@@ -952,9 +952,10 @@ mod tests {
 
     #[test]
     fn disk_guard_stops_stream_and_emits_gap() {
-        let dir = temp_dir("disk");
+        let tmp = temp_dir("disk");
+        let dir = tmp.path();
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
-        let mut cfg = config(&dir, clock.clone(), "hl-ws", "hl-ws-01");
+        let mut cfg = config(dir, clock.clone(), "hl-ws", "hl-ws-01");
         cfg.disk = Arc::new(FixedDiskSpace(0));
         cfg.flush_interval = Duration::ZERO;
         let writer = SegmentWriter::spawn(cfg).unwrap();
@@ -1006,9 +1007,10 @@ mod tests {
 
     #[test]
     fn writes_realistic_frame_sizes() {
-        let dir = temp_dir("realistic");
+        let tmp = temp_dir("realistic");
+        let dir = tmp.path();
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
-        let mut cfg = config(&dir, clock.clone(), "hl-ws", "hl-ws-01");
+        let mut cfg = config(dir, clock.clone(), "hl-ws", "hl-ws-01");
         cfg.channel_capacity = 65_536;
         let writer = SegmentWriter::spawn(cfg).unwrap();
 

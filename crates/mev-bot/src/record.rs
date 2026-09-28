@@ -1417,14 +1417,11 @@ mod tests {
         matchers::{method, path},
     };
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("mev-bot-record-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("mev-bot-record-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     fn segment_files(root: &Path) -> Vec<PathBuf> {
@@ -1482,7 +1479,8 @@ mod tests {
     /// contain `segment_open`, `sub`, `frame`, and `segment_close`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recorder_writes_segments_from_mock_feeds() {
-        let dir = temp_dir("e2e");
+        let tmp = temp_dir("e2e");
+        let dir = tmp.path();
 
         // Mock WS server: accept one connection, then push a frame every 50 ms.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1533,7 +1531,7 @@ mod tests {
         };
         let writer = SegmentWriter::spawn(segment_config(
             &Profile {
-                out_dir: dir.clone(),
+                out_dir: dir.to_path_buf(),
                 ..Profile::default()
             },
             network,
@@ -1563,7 +1561,7 @@ mod tests {
         let rest_writer = Arc::new(
             SegmentWriter::spawn(segment_config(
                 &Profile {
-                    out_dir: dir.clone(),
+                    out_dir: dir.to_path_buf(),
                     ..Profile::default()
                 },
                 network,
@@ -1577,7 +1575,7 @@ mod tests {
         );
         let snapshotter = SnapshotterConfig {
             base_url: rest.uri(),
-            out_dir: dir.clone(),
+            out_dir: dir.to_path_buf(),
             funding_coins: Vec::new(),
             candle_coins: Vec::new(),
             meta_refresh: Duration::from_secs(3600),
@@ -1601,7 +1599,7 @@ mod tests {
         let _ = rest_task.await;
         let _ = server.await;
 
-        let files = segment_files(&dir);
+        let files = segment_files(dir);
         assert!(!files.is_empty(), "no segment files were written");
         let report = reader::inspect(&files).unwrap();
         for kind in ["segment_open", "sub", "frame", "segment_close"] {

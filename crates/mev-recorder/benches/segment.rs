@@ -30,10 +30,11 @@ fn realistic_frame() -> String {
     )
 }
 
-fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mev-rec-seg-bench-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+fn temp_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("mev-rec-seg-bench-")
+        .tempdir()
+        .unwrap()
 }
 
 fn config(dir: PathBuf, clock: Arc<FixedEnvelopeClock>) -> SegmentConfig {
@@ -51,7 +52,8 @@ fn config(dir: PathBuf, clock: Arc<FixedEnvelopeClock>) -> SegmentConfig {
 /// Run a fixed write burst and assert the R-2 floor of 50k envelopes/s.
 fn assert_throughput_floor() {
     let clock = Arc::new(FixedEnvelopeClock::new(1_767_227_400_000_000_000, 0));
-    let writer = SegmentWriter::spawn(config(temp_dir(), clock.clone())).unwrap();
+    let dir = temp_dir();
+    let writer = SegmentWriter::spawn(config(dir.path().to_path_buf(), clock.clone())).unwrap();
 
     let total: u64 = 100_000;
     let payload = realistic_frame();
@@ -78,7 +80,8 @@ fn segment_writer(c: &mut Criterion) {
     assert_throughput_floor();
 
     let clock = Arc::new(FixedEnvelopeClock::new(1_767_227_400_000_000_000, 0));
-    let writer = SegmentWriter::spawn(config(temp_dir(), clock.clone())).unwrap();
+    let dir = temp_dir();
+    let writer = SegmentWriter::spawn(config(dir.path().to_path_buf(), clock.clone())).unwrap();
     let payload = realistic_frame();
     let mut seq = 0u64;
     c.bench_function("segment/try_send_1k", |b| {

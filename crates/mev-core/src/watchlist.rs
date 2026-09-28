@@ -57,17 +57,17 @@ mod tests {
 
     #[test]
     fn round_trips_through_disk() {
-        let dir = std::env::temp_dir().join(format!("mev-watchlist-{}", std::process::id()));
-        let path = dir.join("watchlist.txt");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watchlist.txt");
         let coins = vec!["BTC".to_string(), "xyz:TSLA".to_string()];
         save(&path, &coins).unwrap();
         assert_eq!(load(&path).unwrap(), coins);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn missing_file_loads_empty() {
-        let path = std::env::temp_dir().join("mev-watchlist-does-not-exist.txt");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.txt");
         assert!(load(&path).unwrap().is_empty());
     }
 }

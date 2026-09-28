@@ -744,15 +744,14 @@ mod tests {
 
     #[tokio::test]
     async fn creating_the_flag_file_trips_the_kill_switch() {
-        let path = std::env::temp_dir().join(format!("mev-kill-test-{}.flag", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kill.flag");
         let (handles, inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
         let task = tokio::spawn(control(handles, path.clone()));
 
         std::fs::write(&path, b"kill\n").unwrap();
         let got = recv_account(&inputs, Duration::from_secs(2)).await;
         task.abort();
-        let _ = std::fs::remove_file(&path);
 
         match got {
             Some(AccountUpdate::Control(Control::KillSwitch)) => {}
@@ -768,9 +767,8 @@ mod tests {
 
     #[test]
     fn startup_flag_file_sends_an_initial_kill() {
-        let path =
-            std::env::temp_dir().join(format!("mev-kill-startup-{}.flag", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kill.flag");
         let (handles, inputs) = inputs(MARKET_CHANNEL_CAP, ACCOUNT_CHANNEL_CAP);
 
         // Present at startup: send KillSwitch before the loop runs.
@@ -789,8 +787,8 @@ mod tests {
 
     #[test]
     fn panic_and_resume_create_and_remove_the_flag_file() {
-        let path = std::env::temp_dir().join(format!("mev-kill-cli-{}.flag", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kill.flag");
 
         set_kill_switch(&path, true).unwrap();
         assert!(path.exists(), "hl panic writes the flag file");

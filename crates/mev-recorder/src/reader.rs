@@ -862,15 +862,11 @@ mod tests {
 
     use super::*;
 
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let n = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("mev-rec-reader-{tag}-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("mev-rec-reader-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     fn zstd_frame(lines: &[String]) -> Vec<u8> {
@@ -950,7 +946,8 @@ mod tests {
 
     #[test]
     fn truncated_crashed_file_reads_to_last_full_line() {
-        let dir = temp_dir("crash");
+        let tmp = temp_dir("crash");
+        let dir = tmp.path();
         let all = frames();
         let lines: Vec<String> = all
             .iter()
@@ -973,7 +970,8 @@ mod tests {
 
     #[test]
     fn corrupted_finished_segment_is_an_error() {
-        let dir = temp_dir("corrupt");
+        let tmp = temp_dir("corrupt");
+        let dir = tmp.path();
         let lines: Vec<String> = frames()
             .iter()
             .map(|env| serde_json::to_string(env).unwrap())
@@ -1022,7 +1020,8 @@ mod tests {
 
     #[test]
     fn large_file_read_lazily() {
-        let dir = temp_dir("lazy");
+        let tmp = temp_dir("lazy");
+        let dir = tmp.path();
         let total = 20_000u64;
         let lines: Vec<String> = (0..total)
             .map(|i| {
@@ -1059,7 +1058,8 @@ mod tests {
 
     #[test]
     fn holes_spanning_a_restart_are_found() {
-        let dir = temp_dir("restart-holes");
+        let tmp = temp_dir("restart-holes");
+        let dir = tmp.path();
         let clock = clock_at();
         // Run A: seq 0,1,2. Run B (after a restart): seq 0,1,3. A naive union
         // over all seqs would see {0,1,2,3} and miss the hole in run B.
@@ -1089,7 +1089,8 @@ mod tests {
 
     #[test]
     fn merge_orders_by_time_conn_seq() {
-        let dir = temp_dir("merge");
+        let tmp = temp_dir("merge");
+        let dir = tmp.path();
         let clock = FixedEnvelopeClock::new(1_000, 0);
         // A real segment file holds one (src, conn) and is time-ordered, which
         // is the invariant the k-way merge relies on.
@@ -1136,7 +1137,8 @@ mod tests {
 
     #[test]
     fn inspect_detects_seq_holes_and_gaps() {
-        let dir = temp_dir("inspect");
+        let tmp = temp_dir("inspect");
+        let dir = tmp.path();
         let clock = FixedEnvelopeClock::new(1_000, 0);
         let envelopes = vec![
             Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "x"),
@@ -1177,10 +1179,11 @@ mod tests {
 
     #[test]
     fn verify_checks_manifest_against_disk() {
-        let dir = temp_dir("verify");
+        let tmp = temp_dir("verify");
+        let dir = tmp.path();
         let clock = Arc::new(FixedEnvelopeClock::new(1_767_227_400_000_000_000, 0));
         let config = SegmentConfig {
-            out_dir: dir.clone(),
+            out_dir: dir.to_path_buf(),
             network: "testnet".into(),
             src: "hl-ws".into(),
             conn: "hl-ws-01".into(),
@@ -1195,7 +1198,7 @@ mod tests {
         writer.shutdown();
 
         let report = verify(&VerifyConfig {
-            out_dir: dir,
+            out_dir: dir.to_path_buf(),
             network: "testnet".into(),
             date: "2026-01-01".into(),
         })
@@ -1213,7 +1216,8 @@ mod tests {
 
     #[test]
     fn coverage_shows_crash_and_late_restart_as_missing() {
-        let dir = temp_dir("coverage-crash");
+        let tmp = temp_dir("coverage-crash");
+        let dir = tmp.path();
         let base = 1_767_227_400_000_000_000i64; // 2026-01-01T00:30:00Z
         let clock = FixedEnvelopeClock::new(base, 0);
 
@@ -1231,7 +1235,7 @@ mod tests {
         let clean_last = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "d");
 
         write_segment(
-            &dir,
+            dir,
             "hl-ws",
             "hl-ws-01",
             "2026-01-01",
@@ -1240,7 +1244,7 @@ mod tests {
             true,
         );
         write_segment(
-            &dir,
+            dir,
             "hl-ws",
             "hl-ws-01",
             "2026-01-01",
@@ -1250,7 +1254,7 @@ mod tests {
         );
 
         let report = verify(&VerifyConfig {
-            out_dir: dir,
+            out_dir: dir.to_path_buf(),
             network: "testnet".into(),
             date: "2026-01-01".into(),
         })
@@ -1266,7 +1270,8 @@ mod tests {
 
     #[test]
     fn back_to_back_clean_segments_show_full_coverage() {
-        let dir = temp_dir("coverage-full");
+        let tmp = temp_dir("coverage-full");
+        let dir = tmp.path();
         let (day_start, day_end) = day_bounds("2026-01-01").unwrap();
         let mid = day_start + 43_200_000_000_000; // 12:00:00Z
         let clock = FixedEnvelopeClock::new(day_start, 0);
@@ -1281,7 +1286,7 @@ mod tests {
         let b_last = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "d");
 
         write_segment(
-            &dir,
+            dir,
             "hl-ws",
             "hl-ws-01",
             "2026-01-01",
@@ -1290,7 +1295,7 @@ mod tests {
             false,
         );
         write_segment(
-            &dir,
+            dir,
             "hl-ws",
             "hl-ws-01",
             "2026-01-01",
@@ -1300,7 +1305,7 @@ mod tests {
         );
 
         let report = verify(&VerifyConfig {
-            out_dir: dir,
+            out_dir: dir.to_path_buf(),
             network: "testnet".into(),
             date: "2026-01-01".into(),
         })
@@ -1312,13 +1317,14 @@ mod tests {
 
     #[test]
     fn segments_for_enumerates_a_date_range_and_skips_manifests() {
-        let dir = temp_dir("segments-for");
+        let tmp = temp_dir("segments-for");
+        let dir = tmp.path();
         let clock = FixedEnvelopeClock::new(1_700_000_000_000_000_000, 0);
         let one = |n: u64| vec![Envelope::frame(&clock, "hl-ws", "hl-ws-01", n, "x")];
-        write_segment(&dir, "hl-ws", "hl-ws-01", "2026-01-01", 0, &one(0), false);
-        write_segment(&dir, "hl-ws", "hl-ws-01", "2026-01-02", 0, &one(1), true);
+        write_segment(dir, "hl-ws", "hl-ws-01", "2026-01-01", 0, &one(0), false);
+        write_segment(dir, "hl-ws", "hl-ws-01", "2026-01-02", 0, &one(1), true);
         write_segment(
-            &dir,
+            dir,
             "binance-usdm",
             "binance-usdm-01",
             "2026-01-03",
@@ -1326,9 +1332,9 @@ mod tests {
             &one(2),
             false,
         );
-        write_segment(&dir, "hl-ws", "hl-ws-01", "2026-02-01", 0, &one(3), false);
+        write_segment(dir, "hl-ws", "hl-ws-01", "2026-02-01", 0, &one(3), false);
 
-        let got = segments_for(&dir, "testnet", "2026-01-01", "2026-01-02").unwrap();
+        let got = segments_for(dir, "testnet", "2026-01-01", "2026-01-02").unwrap();
         assert_eq!(got.len(), 2, "{got:?}");
         assert!(
             got.iter()
@@ -1339,22 +1345,24 @@ mod tests {
                 .any(|path| path.to_string_lossy().ends_with(".crashed"))
         );
 
-        let wide = segments_for(&dir, "testnet", "2026-01-01", "2026-02-01").unwrap();
+        let wide = segments_for(dir, "testnet", "2026-01-01", "2026-02-01").unwrap();
         assert_eq!(wide.len(), 4, "{wide:?}");
 
-        let empty = temp_dir("segments-for-empty");
+        let empty_tmp = temp_dir("segments-for-empty");
+        let empty = empty_tmp.path();
         assert!(
-            segments_for(&empty, "testnet", "2026-01-01", "2026-01-01")
+            segments_for(empty, "testnet", "2026-01-01", "2026-01-01")
                 .unwrap()
                 .is_empty()
         );
-        assert!(segments_for(&dir, "testnet", "2026-13-01", "2026-01-02").is_err());
+        assert!(segments_for(dir, "testnet", "2026-13-01", "2026-01-02").is_err());
     }
 
     #[test]
     fn verify_rejects_bad_date() {
+        let tmp = temp_dir("date");
         let err = verify(&VerifyConfig {
-            out_dir: temp_dir("date"),
+            out_dir: tmp.path().to_path_buf(),
             network: "testnet".into(),
             date: "2026-13-40".into(),
         })

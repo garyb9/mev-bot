@@ -238,7 +238,6 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use mev_core::config::{Config, MmSettings, Network, StrategyConfig};
     use mev_hl_client::AssetMap;
@@ -248,18 +247,15 @@ mod tests {
 
     use super::*;
 
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
     fn ds(value: &str) -> Decimal {
         Decimal::from_str(value).unwrap()
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let n = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("mev-replay-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("mev-replay-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     fn btc_asset_map() -> AssetMap {
@@ -339,15 +335,16 @@ mod tests {
 
     #[test]
     fn segment_replay_is_byte_identical_across_runs() {
-        let dir = temp_dir("determinism");
-        let date = write_fixture(&dir);
+        let tmp = temp_dir("determinism");
+        let dir = tmp.path();
+        let date = write_fixture(dir);
         let cfg = mm_config();
         let selector = MarketSelector::new(btc_asset_map());
 
         let first_out = dir.join("first.jsonl");
         let second_out = dir.join("second.jsonl");
         let request = |out: PathBuf| ReplayRequest {
-            out_dir: dir.clone(),
+            out_dir: dir.to_path_buf(),
             from: date.clone(),
             to: date.clone(),
             out: Some(out),

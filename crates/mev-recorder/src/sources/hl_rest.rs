@@ -753,8 +753,6 @@ fn candle_weight(interval: &str, start_ms: u64, end_ms: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
@@ -765,15 +763,11 @@ mod tests {
     use crate::reader::read_envelopes;
     use crate::segment::{SegmentConfig, SegmentWriter};
 
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let n = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("mev-rec-rest-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("mev-rec-rest-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     fn segment_config(dir: &Path, clock: Arc<dyn EnvelopeClock>) -> SegmentConfig {
@@ -842,13 +836,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let dir = temp_dir("raw");
+        let tmp = temp_dir("raw");
+        let dir = tmp.path();
         let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
-        let writer = SegmentWriter::spawn(segment_config(&dir, clock.clone())).unwrap();
+        let writer = SegmentWriter::spawn(segment_config(dir, clock.clone())).unwrap();
         let sink: Arc<dyn EnvelopeSink> = Arc::new(writer);
         let config = SnapshotterConfig {
             base_url: server.uri(),
-            out_dir: dir.clone(),
+            out_dir: dir.to_path_buf(),
             ..SnapshotterConfig::default()
         };
         let snapshotter = RestSnapshotter::new(config, sink.clone(), clock).unwrap();
@@ -860,7 +855,7 @@ mod tests {
         drop(sink);
 
         let mut files = Vec::new();
-        files_with_ext(&dir, "zst", &mut files);
+        files_with_ext(dir, "zst", &mut files);
         assert_eq!(files.len(), 1);
         let envelopes = read_envelopes(&files[0]).unwrap();
         let rest: Vec<&Envelope> = envelopes
@@ -889,13 +884,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let dir = temp_dir("page");
+        let tmp = temp_dir("page");
+        let dir = tmp.path();
         let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
-        let writer = SegmentWriter::spawn(segment_config(&dir, clock.clone())).unwrap();
+        let writer = SegmentWriter::spawn(segment_config(dir, clock.clone())).unwrap();
         let sink: Arc<dyn EnvelopeSink> = Arc::new(writer);
         let config = SnapshotterConfig {
             base_url: server.uri(),
-            out_dir: dir.clone(),
+            out_dir: dir.to_path_buf(),
             funding_coins: vec!["BTC".into()],
             funding_backfill_start_ms: 0,
             ..SnapshotterConfig::default()
@@ -926,10 +922,11 @@ mod tests {
 
     #[test]
     fn restart_refetches_the_last_page() {
-        let dir = temp_dir("restart-page");
+        let tmp = temp_dir("restart-page");
+        let dir = tmp.path();
         let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
         let config = SnapshotterConfig {
-            out_dir: dir.clone(),
+            out_dir: dir.to_path_buf(),
             funding_coins: vec!["BTC".into()],
             funding_backfill_start_ms: 0,
             ..SnapshotterConfig::default()
@@ -957,10 +954,11 @@ mod tests {
 
     #[test]
     fn dropped_envelope_does_not_advance_state() {
-        let dir = temp_dir("dropped");
+        let tmp = temp_dir("dropped");
+        let dir = tmp.path();
         let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
         let config = SnapshotterConfig {
-            out_dir: dir,
+            out_dir: dir.to_path_buf(),
             funding_coins: vec!["BTC".into()],
             funding_backfill_start_ms: 1000,
             ..SnapshotterConfig::default()
@@ -984,10 +982,11 @@ mod tests {
 
     #[test]
     fn failed_request_retries_within_the_backoff_cap() {
-        let dir = temp_dir("backoff");
+        let tmp = temp_dir("backoff");
+        let dir = tmp.path();
         let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
         let config = SnapshotterConfig {
-            out_dir: dir,
+            out_dir: dir.to_path_buf(),
             funding_coins: vec!["BTC".into()],
             ..SnapshotterConfig::default()
         };
@@ -1014,7 +1013,8 @@ mod tests {
 
     #[test]
     fn state_round_trips() {
-        let dir = temp_dir("state");
+        let tmp = temp_dir("state");
+        let dir = tmp.path();
         let path = dir.join("hl-rest-state.json");
         let mut state = SnapshotterState::default();
         state.set_funding_resume("BTC", 1000);
@@ -1029,7 +1029,8 @@ mod tests {
 
     #[test]
     fn legacy_state_format_is_ignored() {
-        let dir = temp_dir("legacy-state");
+        let tmp = temp_dir("legacy-state");
+        let dir = tmp.path();
         let path = dir.join("hl-rest-state.json");
         std::fs::write(
             &path,

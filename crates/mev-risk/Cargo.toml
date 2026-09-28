@@ -11,3 +11,6 @@ repository.workspace = true
 mev-core.workspace = true
 mev-strategy.workspace = true
 rust_decimal.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

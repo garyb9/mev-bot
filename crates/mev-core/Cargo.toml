@@ -15,3 +15,6 @@ figment.workspace = true
 secrecy.workspace = true
 rusqlite.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -203,15 +203,18 @@ fn apply(db: &Db, seqs: &mut HashMap<i64, u64>, cmd: WriteCmd) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn temp_path(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("mev-writer-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("hlbot.db")
+    fn temp_path(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("mev-writer-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("hlbot.db");
+        (dir, path)
     }
 
     #[test]
     fn assigns_monotonic_sequences_and_drains_on_shutdown() {
-        let path = temp_path("seq");
+        let (_dir, path) = temp_path("seq");
         let db = Db::open(&path).unwrap();
         let session = db.create_session("Testnet", "simulate", None, 0).unwrap();
         let writer = DbWriter::spawn(db, 8);
@@ -233,12 +236,11 @@ mod tests {
             assert_eq!(event.seq, i as u64);
             assert_eq!(event.ts_ms, i as u64);
         }
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
     fn resumes_sequence_after_restart() {
-        let path = temp_path("resume");
+        let (_dir, path) = temp_path("resume");
         let db = Db::open(&path).unwrap();
         let session = db.create_session("Testnet", "simulate", None, 0).unwrap();
         let writer = DbWriter::spawn(db, 4);
@@ -274,12 +276,11 @@ mod tests {
             vec![0, 1, 2]
         );
         assert_eq!(events[2].kind, "ctx");
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
     fn records_trading_rows() {
-        let path = temp_path("rows");
+        let (_dir, path) = temp_path("rows");
         let db = Db::open(&path).unwrap();
         let session = db.create_session("Mainnet", "live", None, 0).unwrap();
         let writer = DbWriter::spawn(db, 4);
@@ -295,6 +296,5 @@ mod tests {
             },
         }));
         writer.shutdown();
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

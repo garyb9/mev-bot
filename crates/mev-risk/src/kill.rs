@@ -77,17 +77,7 @@ pub fn cancel_all_cloids<T: Copy>(working: impl IntoIterator<Item = T>) -> Vec<T
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_flag_path() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("mev-risk-kill-{}-{n}.flag", std::process::id()))
-    }
 
     #[test]
     fn starts_clear_and_is_sticky_until_cleared() {
@@ -119,7 +109,8 @@ mod tests {
 
     #[test]
     fn check_flag_file_detects_existence() {
-        let path = temp_flag_path();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kill.flag");
         assert!(!check_flag_file(&path));
         std::fs::write(&path, b"kill\n").expect("write flag");
         assert!(check_flag_file(&path));
