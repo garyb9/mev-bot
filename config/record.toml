@@ -39,6 +39,11 @@ enabled = true
 # see SPEC-0008 §8 for the request list and cadences
 weight_per_min = 300             # a quarter of the 1200/IP budget
 
+[profile.default.deribit]
+enabled    = false               # R-12; public Deribit options summaries (no keys)
+currencies = ["BTC", "ETH"]
+base_url   = "https://www.deribit.com/api/v2"  # public JSON-RPC host
+
 [profile.default.cex]
 binance_usdm = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT"]
 binance_spot = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]

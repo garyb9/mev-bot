@@ -38,7 +38,10 @@ use mev_recorder::{
     SegmentOpenMeta, SegmentWriter, SystemDiskSpace, SystemEnvelopeClock, VolumeIndex,
     planner::{Stream, plan as build_plan},
     reader,
-    sources::hl_rest::{RestSnapshotter, SnapshotterConfig},
+    sources::{
+        deribit::{DEFAULT_BASE_URL, DeribitConfig, DeribitSource},
+        hl_rest::{RestSnapshotter, SnapshotterConfig},
+    },
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -99,6 +102,8 @@ struct Profile {
     hl: HlSection,
     /// Hyperliquid REST snapshotter.
     rest: RestSection,
+    /// Deribit public options summaries (R-12).
+    deribit: DeribitSection,
     /// Reference CEX symbols (R-8, not started yet).
     #[allow(dead_code)]
     cex: CexSection,
@@ -119,6 +124,7 @@ impl Default for Profile {
             http_port: 9091,
             hl: HlSection::default(),
             rest: RestSection::default(),
+            deribit: DeribitSection::default(),
             cex: CexSection::default(),
             hyperevm: HyperevmSection::default(),
         }
@@ -202,6 +208,56 @@ impl Default for RestSection {
     }
 }
 
+/// The `[profile.<name>.deribit]` block (R-12, SPEC-0008 §9.1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct DeribitSection {
+    /// Whether to poll Deribit's public endpoints. Off by default so existing
+    /// profiles and recordings are unchanged.
+    enabled: bool,
+    /// Currencies to poll (`BTC`, `ETH`, …).
+    currencies: Vec<String>,
+    /// JSON-RPC base URL (public, unauthenticated endpoint).
+    base_url: String,
+}
+
+impl Default for DeribitSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            currencies: vec!["BTC".to_string(), "ETH".to_string()],
+            base_url: DEFAULT_BASE_URL.to_string(),
+        }
+    }
+}
+
+/// Validate every profile after parsing (config errors are fatal at startup).
+fn validate_config(config: &RecordConfig) -> Result<()> {
+    for (name, profile) in &config.profile {
+        profile
+            .validate()
+            .with_context(|| format!("profile `{name}`"))?;
+    }
+    Ok(())
+}
+
+impl Profile {
+    /// Reject profiles that would start a source with no work to do.
+    fn validate(&self) -> Result<()> {
+        if self.deribit.enabled && self.deribit.currencies.is_empty() {
+            bail!("deribit.enabled = true but deribit.currencies is empty");
+        }
+        Ok(())
+    }
+}
+
+/// Parse a recorder config from figment providers and validate every profile.
+fn parse_config(figment: Figment) -> Result<RecordConfig> {
+    let config: RecordConfig = figment.extract().context("loading config/record.toml")?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
 /// The `[profile.<name>.cex]` block (R-8).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -228,7 +284,7 @@ fn load_profile(
     let figment = Figment::new()
         .merge(Toml::file("config/record.toml"))
         .merge(Env::prefixed("HL_RECORD_").split("__"));
-    let config: RecordConfig = figment.extract().context("loading config/record.toml")?;
+    let config = parse_config(figment)?;
     let name = name.unwrap_or("default").to_string();
     let mut profile = config
         .profile
@@ -401,6 +457,7 @@ pub async fn run(
     let health = Health::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let rest_shutdown = Arc::new(Notify::new());
+    let deribit_shutdown = Arc::new(Notify::new());
 
     // Register connection health before spawning the readiness monitor.
     let mut states: Vec<(String, Arc<ConnState>)> = plan
@@ -470,6 +527,31 @@ pub async fn run(
         warn!("rest snapshotter disabled by profile");
     }
 
+    // Deribit public options source (SPEC-0008 §9.1, R-12). Off by default.
+    if profile.deribit.enabled {
+        let writer = Arc::new(
+            SegmentWriter::spawn(segment_config(
+                &profile,
+                network,
+                "deribit",
+                "deribit",
+                &meta,
+                clock.clone(),
+                1,
+            ))
+            .context("spawning segment writer for deribit")?,
+        );
+        tasks.push(tokio::spawn(run_deribit(
+            deribit_config(&profile),
+            writer,
+            clock.clone(),
+            recorder_health.clone(),
+            deribit_shutdown.clone(),
+        )));
+    } else {
+        debug!("deribit source disabled by profile");
+    }
+
     tasks.push(tokio::spawn(disk_monitor(
         profile.out_dir.clone(),
         shutdown_rx.clone(),
@@ -492,6 +574,7 @@ pub async fn run(
     info!("shutdown requested; finalizing recorder");
     let _ = shutdown_tx.send(true);
     rest_shutdown.notify_one();
+    deribit_shutdown.notify_one();
     for task in tasks {
         let _ = task.await;
     }
@@ -576,6 +659,15 @@ fn snapshotter_config(
         funding_backfill_start_ms: now_ms.saturating_sub(FUNDING_BACKFILL_DAYS * 86_400_000),
         candle_backfill_start_ms: now_ms.saturating_sub(CANDLE_BACKFILL_DAYS * 86_400_000),
     })
+}
+
+/// Build the [`DeribitConfig`] from the profile (SPEC-0008 §9.1).
+fn deribit_config(profile: &Profile) -> DeribitConfig {
+    DeribitConfig {
+        base_url: profile.deribit.base_url.clone(),
+        currencies: profile.deribit.currencies.clone(),
+        ..DeribitConfig::default()
+    }
 }
 
 /// Wall-clock milliseconds since the epoch.
@@ -913,27 +1005,36 @@ fn record_gap_seconds(src: &str, conn: &str, reason: &str, gap_ms: u64) {
 // ---------------------------------------------------------------------------
 
 /// An [`EnvelopeSink`] that counts records and marks REST liveness.
+///
+/// `account_hl_rest` gates the Hyperliquid-specific side effects (the §8 weight
+/// counter and `/readyz` REST freshness); non-HL sources such as Deribit reuse
+/// the sink with it off so their polls do not consume the HL budget or mask an
+/// `hl-rest` outage.
 struct CountingSink {
     writer: Arc<SegmentWriter>,
     clock: Arc<dyn EnvelopeClock>,
     health: Arc<RecorderHealth>,
     metrics: ConnMetrics,
     state: Arc<ConnState>,
+    account_hl_rest: bool,
 }
 
 impl EnvelopeSink for CountingSink {
     fn send(&self, env: Envelope) -> bool {
         // Mirror the §8 weights so the 300/min budget is observable. R-5 meters
         // its own bucket; this counter is the recorder-side view of it.
-        let weight = env
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get("req"))
-            .map(request_weight)
-            .unwrap_or(0);
+        let weight = if self.account_hl_rest {
+            env.meta
+                .as_ref()
+                .and_then(|meta| meta.get("req"))
+                .map(request_weight)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let mono_ns = self.clock.mono_ns();
         let sent = emit(&self.metrics, &self.writer, &self.state, &*self.clock, env);
-        if sent {
+        if sent && self.account_hl_rest {
             if weight > 0 {
                 metrics::counter!(names::REST_WEIGHT_USED_TOTAL, "src" => "recorder".to_string())
                     .increment(weight as u64);
@@ -995,11 +1096,34 @@ async fn run_rest(
         health,
         metrics: ConnMetrics::new("hl-rest", "hl-rest"),
         state,
+        account_hl_rest: true,
     });
     match RestSnapshotter::new(config, sink, clock) {
         Ok(snapshotter) => snapshotter.run(shutdown).await,
         Err(err) => warn!(error = %err, "rest snapshotter failed to start"),
     }
+    // Dropping the last `Arc` finalizes the segment (SegmentWriter::drop).
+    drop(writer);
+}
+
+/// Run the Deribit options source until `shutdown` is notified, then finalize.
+async fn run_deribit(
+    config: DeribitConfig,
+    writer: Arc<SegmentWriter>,
+    clock: Arc<dyn EnvelopeClock>,
+    health: Arc<RecorderHealth>,
+    shutdown: Arc<Notify>,
+) {
+    let state = ConnState::new();
+    let sink = Arc::new(CountingSink {
+        writer: writer.clone(),
+        clock: clock.clone(),
+        health,
+        metrics: ConnMetrics::new("deribit", "deribit"),
+        state,
+        account_hl_rest: false,
+    });
+    DeribitSource::new(config, sink, clock).run(shutdown).await;
     // Dropping the last `Arc` finalizes the segment (SegmentWriter::drop).
     drop(writer);
 }
@@ -1551,6 +1675,139 @@ mod tests {
             20
         );
         assert_eq!(request_weight(&serde_json::json!({ "type": "meta" })), 20);
+    }
+
+    /// Parse a recorder config from a TOML string (no file or env), validating.
+    fn parse_toml(text: &str) -> Result<RecordConfig> {
+        parse_config(Figment::new().merge(Toml::string(text)))
+    }
+
+    #[test]
+    fn deribit_defaults_to_disabled() {
+        let config = parse_toml("[profile.default]\nnetwork = \"mainnet\"\n").unwrap();
+        let deribit = &config.profile.get("default").unwrap().deribit;
+        assert!(!deribit.enabled, "deribit is on unless explicitly enabled");
+        assert_eq!(
+            deribit.currencies,
+            vec!["BTC".to_string(), "ETH".to_string()]
+        );
+        assert_eq!(deribit.base_url, DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn deribit_enabled_parses_currencies_and_base_url() {
+        let config = parse_toml(
+            "[profile.default.deribit]\n\
+             enabled = true\n\
+             currencies = [\"SOL\"]\n\
+             base_url = \"https://example.test/api/v2\"\n",
+        )
+        .unwrap();
+        let deribit = &config.profile.get("default").unwrap().deribit;
+        assert!(deribit.enabled);
+        assert_eq!(deribit.currencies, vec!["SOL".to_string()]);
+        assert_eq!(deribit.base_url, "https://example.test/api/v2");
+    }
+
+    #[test]
+    fn deribit_enabled_with_empty_currencies_is_rejected() {
+        let err = parse_toml(
+            "[profile.default.deribit]\n\
+             enabled = true\n\
+             currencies = []\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("currencies"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// End-to-end wiring: an enabled deribit profile polls a mock server and
+    /// leaves a finalized `deribit` segment holding `rest` envelopes.
+    #[tokio::test]
+    async fn deribit_enabled_writes_rest_segment() {
+        let tmp = temp_dir("deribit");
+        let dir = tmp.path();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"result\":[]}"))
+            .mount(&server)
+            .await;
+
+        let profile = Profile {
+            out_dir: dir.to_path_buf(),
+            deribit: DeribitSection {
+                enabled: true,
+                currencies: vec!["BTC".to_string()],
+                base_url: server.uri(),
+            },
+            ..Profile::default()
+        };
+        profile.validate().unwrap();
+
+        let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
+        let writer = Arc::new(
+            SegmentWriter::spawn(segment_config(
+                &profile,
+                Network::Testnet,
+                "deribit",
+                "deribit",
+                &SegmentOpenMeta::default(),
+                clock.clone(),
+                1,
+            ))
+            .unwrap(),
+        );
+        let health = RecorderHealth::new(Vec::new());
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(run_deribit(
+            deribit_config(&profile),
+            writer,
+            clock,
+            health,
+            shutdown.clone(),
+        ));
+
+        // One round is the options summary plus the index price for one currency.
+        let mut served = 0;
+        for _ in 0..200 {
+            served = server
+                .received_requests()
+                .await
+                .map(|requests| requests.len())
+                .unwrap_or(0);
+            if served >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(served >= 2, "deribit source did not poll the mock");
+        // Give the source a moment to consume the responses and write the sink.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown.notify_one();
+        task.await.unwrap();
+
+        let files = segment_files(dir);
+        assert!(!files.is_empty(), "no deribit segment was written");
+        let report = reader::inspect(&files).unwrap();
+        assert!(
+            report.by_src.get("deribit").copied().unwrap_or(0) > 0,
+            "segment has no deribit records: {:#?}",
+            report.by_src
+        );
+        assert!(
+            report.by_kind.get("rest").copied().unwrap_or(0) >= 2,
+            "expected rest envelopes: {:#?}",
+            report.by_kind
+        );
+        assert!(
+            report.by_kind.get("segment_close").copied().unwrap_or(0) == 1,
+            "segment did not finalize: {:#?}",
+            report.by_kind
+        );
     }
 
     /// End-to-end wiring test: a mock WS server and a mock REST server feed the
