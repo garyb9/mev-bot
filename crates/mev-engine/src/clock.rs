@@ -3,8 +3,10 @@
 //! The engine reads time only through [`EngineClock`], so the same code runs in
 //! `live`, `simulate`, and deterministic `replay`:
 //!
-//! - [`LiveClock`] reads the system wall clock and a millisecond-resolution
-//!   monotonic base (the loop's timer base).
+//! - [`LiveClock`] reads the system wall clock for wall time and the
+//!   process-global monotonic clock shared with the raw socket
+//!   ([`mev_hl_client::raw_ws::mono_ns`]) for its monotonic lane, so engine
+//!   spans and received-frame stamps share one timeline.
 //! - [`ReplayClock`] is advanced by the replay driver to the recorded event
 //!   time, so paper fills, risk rate budgets, and latency stamps are all
 //!   event-driven and a replay is reproducible.
@@ -28,7 +30,11 @@ pub trait EngineClock: Send + Sync + 'static {
     /// The current time as an event [`Stamp`].
     fn now(&self) -> Stamp;
 
-    /// Monotonic nanoseconds on the loop's timer base.
+    /// Monotonic nanoseconds on the engine's shared monotonic base.
+    ///
+    /// In live this is the process-global raw-socket clock
+    /// ([`mev_hl_client::raw_ws::mono_ns`]); replay drives it from recorded
+    /// stamps.
     fn mono_ns(&self) -> u64;
 
     /// Wall-clock milliseconds since the Unix epoch.
@@ -56,7 +62,7 @@ impl EngineClock for LiveClock {
     }
 
     fn mono_ns(&self) -> u64 {
-        SystemClock.now_ms().saturating_mul(1_000_000)
+        mev_hl_client::raw_ws::mono_ns()
     }
 
     fn now_ms(&self) -> u64 {
@@ -116,11 +122,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_clock_is_monotonic_and_consistent() {
+    fn live_clock_shares_the_raw_socket_monotonic_base() {
         let clock = LiveClock::new();
         assert!(clock.now_ms() > 0);
-        assert_eq!(clock.now().t_recv_ns, clock.now_ms() as i64 * 1_000_000);
-        assert_eq!(clock.mono_ns(), clock.now_ms().saturating_mul(1_000_000));
+        let t_recv_ns = clock.now().t_recv_ns;
+        assert!(t_recv_ns > 0);
+        assert_eq!(t_recv_ns % 1_000_000, 0, "wall lane is millisecond-grained");
+
+        // A frame stamped by the raw socket, then a later LiveClock reading,
+        // must be on the same timeline: a small, positive delta (not the
+        // ~1e18 ns wall-clock-vs-uptime skew the old millisecond base gave).
+        let t_recv = mev_hl_client::raw_ws::mono_ns();
+        let t_written = clock.mono_ns();
+        let delta = t_written.saturating_sub(t_recv);
+        assert!(t_written >= t_recv, "clock went backwards: {delta} ns");
+        assert!(delta < 1_000_000_000, "delta not sub-second: {delta} ns");
+    }
+
+    #[test]
+    fn live_clock_is_monotonic() {
+        let clock = LiveClock::new();
+        let first = clock.mono_ns();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let second = clock.mono_ns();
+        assert!(second > first, "monotonic clock did not advance");
     }
 
     #[test]
