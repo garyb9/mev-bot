@@ -1,0 +1,82 @@
+# Documented Hyperliquid system addresses (SPEC-0008 V-1).
+#
+# Only addresses stated in the official Hyperliquid docs (or the docs'
+# vaultDetails example) are listed; every entry carries a `source` URL and the
+# date it was checked. Public protocol actors only — no user, deployer, or
+# testnet-example addresses. Built for study O6 (SPEC-0008 §13.9), which tags
+# large-flow bursts by taker address.
+#
+# `kind = "pattern"` means the docs give an address *scheme*, not one address;
+# `address` holds the base and `notes` explains the offset.
+
+[[address]]
+name = "HLP protocol vault"
+address = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+kind = "vault"
+network = "mainnet"
+notes = "Community-owned protocol vault; performs liquidations (its liquidator vault is a component strategy of HLP), market making, and accrues fees. Address taken from the docs `vaultDetails` example and confirmed live via POST /info {\"type\":\"vaultDetails\",\"vaultAddress\":...} on 2026-09-28 (name \"Hyperliquidity Provider (HLP)\")."
+source = "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint"
+source_date = "2026-09-28"
+
+[[address]]
+name = "Perp / HIP-3 backstop liquidator"
+address = "0x4000000000000000000000000000000000000000"
+kind = "pattern"
+network = "mainnet"
+notes = "Address = 0x4000000000000000000000000000000000000000 + dex_index (exact integer addition). The first HIP-3 dex is 0x4000000000000000000000000000000000000001. Each HIP-3 dex has an independent onchain backstop liquidator; the main perp dex uses the base."
+source = "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions"
+source_date = "2026-09-28"
+
+[[address]]
+name = "Portfolio-margin spot backstop liquidator"
+address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+kind = "liquidator"
+network = "mainnet"
+notes = "The docs abbreviate this as `0xbbb...b`; the full 40-hex form is written out here and has NOT been confirmed against a full literal in the docs. It takes over portfolio-margin liquidations directly."
+source = "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/portfolio-margin"
+source_date = "2026-09-28"
+
+[[address]]
+name = "Assistance Fund"
+address = "0xfefefefefefefefefefefefefefefefefefefefe"
+kind = "system"
+network = "mainnet"
+notes = "System address that receives fees; converts them to HYPE, which is burned."
+source = "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees"
+source_date = "2026-09-28"
+
+[[address]]
+name = "HYPE Core<->HyperEVM transfer address"
+address = "0x2222222222222222222222222222222222222222"
+kind = "system"
+network = "mainnet"
+notes = "HYPE is the exception to the 0x20.. token-system-address scheme. Sending HYPE here moves it between HyperCore spot and the HyperEVM native balance."
+source = "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/hypercore-less-than-greater-than-hyperevm-transfers"
+source_date = "2026-09-28"
+
+[[address]]
+name = "Spot token system address"
+address = "0x2000000000000000000000000000000000000000"
+kind = "pattern"
+network = "mainnet"
+notes = "Address = 0x2000...0000 with the Core spot token index encoded big-endian in the last bytes. Example: token index 200 => 0x20000000000000000000000000000000000000c8. HYPE is the exception (0x222..2)."
+source = "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/hypercore-less-than-greater-than-hyperevm-transfers"
+source_date = "2026-09-28"
+
+[[address]]
+name = "CoreWriter system contract"
+address = "0x3333333333333333333333333333333333333333"
+kind = "system"
+network = "hyperevm"
+notes = "HyperEVM system contract for sending actions from the HyperEVM to HyperCore. Order and vault-transfer actions sent through it are deliberately delayed onchain by a few seconds."
+source = "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/interacting-with-hypercore"
+source_date = "2026-09-28"
+
+[[address]]
+name = "HyperCore read precompiles (base)"
+address = "0x0000000000000000000000000000000000000800"
+kind = "system"
+network = "hyperevm"
+notes = "Base of the HyperEVM read precompiles (e.g. 0x...0807 reads an oracle price); they reflect the latest HyperCore state when the EVM block is built."
+source = "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/interacting-with-hypercore"
+source_date = "2026-09-28"

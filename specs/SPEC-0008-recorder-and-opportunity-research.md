@@ -184,14 +184,14 @@ data/rec/
 | Mainnet WS URL | `wss://api.hyperliquid.xyz/ws` (`Network::ws_url()`) | known |
 | Subscribe message | `{"method":"subscribe","subscription":{…}}` | known (in `ws.rs`) |
 | App-level ping | send `{"method":"ping"}`, expect `{"channel":"pong"}` | known |
-| Server idle close | closes a connection that has sent nothing for ~60 s | ⚠ verify (V-1) |
+| Server idle close | closes a connection it has not **sent** a message to for ~60 s; app-level `{"method":"ping"}` (→ `{"channel":"pong"}`) resets the timer | known (V-1) |
 | Limits per IP | ≤ 10 WS connections, ≤ 30 new connections/min, ≤ 1000 subscriptions, ≤ 2000 client→server messages/min | known (SPEC-0001 §5) |
-| `l2Book` depth | up to 20 levels per side; optional `nSigFigs` (2–5) and `mantissa` params aggregate levels | ⚠ verify (V-1) |
-| `l2Book` cadence | a snapshot per block when the book changed, roughly every ≥ 0.5 s | ⚠ verify (V-1) |
+| `l2Book` depth | up to 20 levels per side; optional `nSigFigs` (2–5 or `null`) and `mantissa` (1/2/5, only when `nSigFigs=5`) aggregate levels; `fast:true` returns 5 levels | known (V-1) |
+| `l2Book` cadence | default 20-level snapshot pushed on change (observed ~2.4–6.6 s for BTC); `fast:true` (5 levels) observed ~0.5 s (docs state a ≥ 0.5 s push bound) | known (V-1) |
 | `bbo` | pushed only when best bid/offer changes on a block | known (SPEC-0001) |
-| `trades` payload | includes `users: [buyer, seller]` addresses | ⚠ verify (V-1) |
-| `allMids` HIP-3 | accepts `"dex": "<name>"` to get mids for a HIP-3 dex | ⚠ verify (V-1) |
-| `activeAssetCtx` for spot | spot coins (`@123`) may answer on a different channel name (e.g. `activeSpotAssetCtx`) | ⚠ verify (V-1). The recorder stores raw frames, so this only matters for research normalization. |
+| `trades` payload | includes `users: [buyer, seller]` addresses (WS `WsTrade`; REST `recentTrades` too) | known (V-1) |
+| `allMids` HIP-3 | accepts `"dex": "<name>"` to get mids for a HIP-3 dex (WS and REST); spot mids only with the first perp dex | known (V-1) |
+| `activeAssetCtx` for spot | spot coins answer on channel `activeSpotAssetCtx` (data `{coin, ctx}`), not `activeAssetCtx`; the subscription coin may be `@123` or `BASE/QUOTE` | known (V-1). The recorder stores raw frames, so this only matters for research normalization. |
 
 ### 7.2 Streams to record
 
@@ -300,9 +300,9 @@ Recorded as `kind:"rest"` envelopes under `src:"hl-rest"`. All requests are `POS
 | `{"type":"spotMeta"}` | same | 20 | Spot tokens and pairs |
 | `{"type":"metaAndAssetCtxs"}` | every 60 s | 20 | Funding/OI/volume for **all** perps (backs up WS ctx) |
 | `{"type":"spotMetaAndAssetCtxs"}` | every 60 s | 20 | Spot volume and mid |
-| `{"type":"predictedFundings"}` | every 5 min | 20 | Predicted funding for HL and CEXes (O7) ⚠ verify shape (V-1) |
-| `{"type":"fundingHistory","coin":C,"startTime":T}` | once a day per coin in `active_asset_ctx`, paging forward from the last stored time | 20 + per-item surcharge | Funding backfill (O7) |
-| `{"type":"candleSnapshot","req":{"coin":C,"interval":I,"startTime":T,"endTime":E}}` for I ∈ {1m, 5m, 1h} | once a day per coin in `bbo`, paging forward from the last stored time; a one-time backfill on first run | 20 + 20 per 60 candles | History for O10 Part E and O11. The venue keeps only the most recent ~5000 candles per interval ⚠ verify (V-1), so 1m history is only a few days: **start this early**. |
+| `{"type":"predictedFundings"}` | every 5 min | 20 | Predicted funding for HL and CEXes (O7). Shape `[[coin, [[venue, {fundingRate, nextFundingTime, fundingIntervalHours}], …]], …]`; first perp dex only (V-1) |
+| `{"type":"fundingHistory","coin":C,"startTime":T}` | once a day per coin in `active_asset_ctx`, paging forward from the last stored time | 20 + 1 per 20 items returned | Funding backfill (O7). Response `[{coin, fundingRate, premium, time(ms)}]`, ascending, max **500** items/call (V-1) |
+| `{"type":"candleSnapshot","req":{"coin":C,"interval":I,"startTime":T,"endTime":E}}` for I ∈ {1m, 5m, 1h} | once a day per coin in `bbo`, paging forward from the last stored time; a one-time backfill on first run | 20 + 1 per 60 items returned | History for O10 Part E and O11. Fields `t,T,s,i,o,c,h,l,v,n`. The venue keeps only the most recent ~5000 candles per interval (V-1: observed 5182 for 1m, 5003 for 1h), so 1m history is only a few days: **start this early**. |
 
 Budget: the snapshotter owns a token bucket of **300 weight/min** (a quarter of the 1200/IP budget, leaving the rest for the bot and tools). A request that doesn't fit waits; it is never dropped. Metric: `hl_rest_weight_used_total{src="recorder"}`.
 
@@ -719,7 +719,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 
 | ID | Title | Tier | Size | Depends on | Status |
 |---|---|---|---|---|---|
-| V-1 | Verify HL WS/REST facts | T1 | S | — | ☐ |
+| V-1 | Verify HL WS/REST facts | T1 | S | — | ✅ |
 | V-2 | Verify CEX endpoints, fields, fees, reachability | T1 | S | — | ☐ |
 | V-3 | Verify HIP-3 fees and the spot quote-token set | T1 | S | — | ☐ |
 | V-4 | Measure latency from candidate regions; pick a host | T1 | M | R-6 (`hl probe latency`) | ☐ |
@@ -962,12 +962,16 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 
 | Fact | Value | Source | Date | Task |
 |---|---|---|---|---|
-| HL WS idle-close window | | | | V-1 |
-| HL `l2Book` depth / params / cadence | | | | V-1 |
-| HL `trades.users` present | | | | V-1 |
-| HL `allMids` with `dex` | | | | V-1 |
-| HL spot ctx channel name | | | | V-1 |
-| HL `predictedFundings` shape | | | | V-1 |
+| HL WS idle-close window | Server closes a connection it has not **sent** a message to for ~60 s; app `{"method":"ping"}` → `{"channel":"pong"}` resets it. Live: unpinged conn closed at 59.8 s (code 1000 "Inactive"); pinged every 20 s stayed open > 84 s. | docs timeouts-and-heartbeats + observed live 2026-09-28 (`wss://api.hyperliquid.xyz/ws`) | 2026-09-28 | V-1 |
+| HL `l2Book` depth / params / cadence | Depth ≤ 20 levels/side (observed 20/20); `fast:true` → 5. `nSigFigs` ∈ {2,3,4,5,null}; `mantissa` ∈ {1,2,5} only when `nSigFigs=5`. Cadence: default pushed on change, observed 2.4–6.6 s for BTC; `fast:true` observed ~0.5 s. | docs websocket/subscriptions + observed live 2026-09-28 | 2026-09-28 | V-1 |
+| HL `trades.users` present | Yes. WS `WsTrade.users: [buyer, seller]`; REST `recentTrades` also carries `users`. | docs websocket/subscriptions + observed live 2026-09-28 (WS `trades` and `recentTrades`) | 2026-09-28 | V-1 |
+| HL `allMids` with `dex` | Yes, WS and REST. `{"type":"allMids","dex":"xyz"}` returned 126 `xyz:*` mids; default dex includes spot mids only for the first perp dex. | docs websocket/subscriptions + info-endpoint + observed live 2026-09-28 | 2026-09-28 | V-1 |
+| HL spot ctx channel name | `activeSpotAssetCtx`, data `{coin, ctx}` (SpotAssetCtx). Both `@1` and `PURR/USDC` subscriptions answered on it. | docs websocket/subscriptions + observed live 2026-09-28 | 2026-09-28 | V-1 |
+| HL `predictedFundings` shape | `[[coin, [[venue, {fundingRate, nextFundingTime, fundingIntervalHours}], …]], …]`; venues seen `BinPerp`, `HlPerp`, `BybitPerp`; first perp dex only. | docs info-endpoint + observed live 2026-09-28 | 2026-09-28 | V-1 |
+| HL `fundingHistory` shape / max / weight | `[{coin, fundingRate, premium, time(ms)}]`, ascending from `startTime`; max **500** items/call (request from `startTime=0` returned the earliest 500); weight `20 + 1 per 20 items returned`. | docs info-endpoint + rate-limits + observed live 2026-09-28 | 2026-09-28 | V-1 |
+| HL `candleSnapshot` shape / max / weight | `[{t,T,s,i,o,c,h,l,v,n}]` (`t`/`T` ms; prices/`v` strings; `n` number). Only the most recent ~5000 candles per interval are retained and a call returns at most that (observed 1m = 5182 over ~3.6 d, 1h = 5003 over ~208 d); `startTime` honored within retention; weight `20 + 1 per 60 items returned`. | docs info-endpoint + rate-limits + observed live 2026-09-28 | 2026-09-28 | V-1 |
+| HL `spotMetaAndAssetCtxs` row alignment | Response `[meta, ctxs]`; `ctxs` is indexed by the spot pair `index` (`meta.universe[].index`), **not** by position in `meta.universe`: 330 universe rows vs 885 ctx rows (indices 0–884); `ctxs[i].coin` matched pair `index == i` with 0 mismatches. Join on `universe[].index`, never array position. | observed live 2026-09-28 (POST /info `{"type":"spotMetaAndAssetCtxs"}`) | 2026-09-28 | V-1 |
+| `chronyc -c tracking` column order | `RefID, RefName, Stratum, RefTime, SystemTime, LastOffset, RMSOffset, Frequency, ResidualFreq, Skew, RootDelay, RootDispersion, UpdateInterval, LeapStatus` (SystemTime is column **4**, not 3). | chrony 4.5 `chronyc(1)` + chrony `client.c` `process_cmd_tracking` | 2026-09-28 | V-1 |
 | Binance/Bybit endpoints + fields | | | | V-2 |
 | Binance/Bybit VIP0 fees | | | | V-2 |
 | HIP-3 fee model + per-dex values | | | | V-3 |
@@ -1006,11 +1010,11 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 8. **Writer-originated `seq` (R-1/R-2).** §5.1 defines `seq` as the per-`conn` data counter, but `segment_open`/`segment_close` are produced by the writer, not the caller. The writer currently stamps `segment_open.seq` from the first data envelope and `segment_close.seq` from the last, so a naive hole detector sees no downward jump. Confirm this is the intended reading.
 9. **`records`/`bytes_raw` scope (R-2).** §6 lists `records`/`bytes_raw` without saying whether they include the `segment_close` line. Current choice: `segment_close.meta` counts lines **before** close; the manifest's `records` counts **total file lines including close** (so `records` equals the decoded line count).
 10. **Per-stream disk guard (R-2).** §6 says stop the "lowest-priority streams"; with one `SegmentWriter` per `(src, conn)` the guard stops only its own stream and emits `gap_start{reason:"disk"}`. A cross-stream coordinator (priority ordering) lands with R-6.
-11. **`*:top:N` volume source (R-4).** Perps rank from a caller-built `VolumeIndex` (positional `meta.universe`↔`asset_ctxs`); the `spotMetaAndAssetCtxs` row alignment is unverified, so spot volume uses `VolumeIndex::insert` and missing volume ranks last (ties by canonical coin). Confirm the shape with V-1.
+11. ~~**`*:top:N` volume source (R-4).**~~ **Resolved 2026-09-28 (V-1):** `spotMetaAndAssetCtxs` returns `[meta, ctxs]` where `ctxs` is indexed by the spot pair `index` (from `meta.universe[].index`), not by position in `meta.universe`; observed 330 universe rows vs 885 ctx rows with `ctxs[i].coin` matching pair `index == i` (0 mismatches). `record.rs` already matches by `market.index == ctx position`, so it is correct; its comment saying rows "align positionally" should read "by pair index". Perps keep the positional `meta.universe`↔`asset_ctxs` join (which is aligned).
 12. **`spot:quotes` needs `SpotMeta` (R-4).** `AssetMap` does not expose token indices, so `spot:quotes` requires the caller to pass `SpotMeta` (else `PlannerError::MissingSpotMeta`). Confirm this is acceptable for R-6.
-13. **`fundingHistory` paging shape (R-5).** Assumed a JSON array with a ms `time` field; next `startTime = max_time + 1`; "caught up" at `now − 60 s`; the per-item weight surcharge is unverified (flat weight 20 used). Verify with V-1.
-14. **`candleSnapshot` paging (R-5).** Window fixed at 6 h; weight `20 + 20·(candles/60)`; response field `t` assumed. Verify with V-1.
-15. **`predictedFundings` (R-5)** is recorded raw but not parsed (shape ⚠ V-1).
+13. ~~**`fundingHistory` paging shape (R-5).**~~ **Resolved 2026-09-28 (V-1):** the response is `[{coin, fundingRate, premium, time(ms)}]`, ascending from `startTime`, and a call returns at most **500** items (a request from `startTime=0` returned the earliest 500), so `next startTime = max(time)+1` and "caught up at now − 60 s" are both correct. The weight is `20 + 1 per 20 items returned` (docs rate limits), not flat 20. **Code follow-up:** R-5 charges a flat weight 20 for `fundingHistory`; add the per-20-items surcharge once the item count is known.
+14. ~~**`candleSnapshot` paging (R-5).**~~ **Resolved 2026-09-28 (V-1):** fields are `t` (open ms), `T` (close ms), `s`, `i`, `o`, `c`, `h`, `l`, `v`, `n`; only the most recent ~5000 candles per interval are retained and a call returns at most that (observed 1m = 5182, 1h = 5003), so the 6 h page window is well inside the cap. The weight is `20 + 1 per 60 items returned`, not `20 + 20·(candles/60)`. **Code follow-up:** fix `candle_weight` (and its test), which overestimates by ~20×.
+15. ~~**`predictedFundings` (R-5)** is recorded raw but not parsed (shape ⚠ V-1).~~ **Resolved 2026-09-28 (V-1):** shape is `[[coin, [[venue, {fundingRate, nextFundingTime, fundingIntervalHours}], …]], …]` with venues `BinPerp`/`HlPerp`/`BybitPerp`; first perp dex only. Recording raw is sufficient; no code change needed.
 16. **`inspect` gap duration (R-7)** counts paired `gap_start`/`gap_end` only; an open gap (crashed tail, no `gap_end`) increments the gap count but contributes no duration (`crashed_files` is reported separately).
 17. ~~**`verify` coverage (R-7).**~~ **Resolved 2026-09-27:** coverage is the union of each segment's `[first_t_ns, last_t_ns]` per `(src,conn)`, minus paired gaps and clipped to the day. An unpaired `gap_start` is closed at the last record on the stream (see #24); the writer's `segment_open`/`segment_close` lines do not define a segment's span.
 18. **`SegmentWriter` stats missing (R-6).** The writer exposes no counters, so `hl_rec_bytes_raw_total`, `hl_rec_bytes_zst_total`, `hl_rec_channel_depth`, and `hl_rec_segment_rotations_total` (names added) are not yet emitted. Add a `SegmentWriter::stats()` / shared `Arc<SegmentStats>`.
@@ -1018,5 +1022,5 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 20. **`clock` envelope on `hl-rest` (R-6).** `RestSnapshotter` owns its `seq` and has no clock hook, and a second `(hl-rest, hl-rest)` producer would collide, so `clock` is emitted per `hl-ws` connection only. Needs a clock hook or a shared sequence.
 21. **Subscribe pacing inside `RawWsConn` (R-6).** §7.4 step 6 (≤ 20 msg/s, ≤ 1 dial/3 s on reconnect) cannot be enforced from R-6: `RawWsConn` sends all subscriptions/resubscribes in one burst with no incremental subscribe hook. Connection-level pacing and initial-dial retry are in R-6. Its `hl_ws_*` metrics also label `src="hl"` with no `conn` (§7.5 mismatch).
 22. **`hl record plan` opens metadata REST calls (R-6).** §12.1 says "no sockets opened", but resolving universe selectors needs `/info` metadata. It opens no WS/recording sockets; confirm the wording or accept the metadata calls.
-23. **`chronyc` column order (R-6/V-1).** The `clock` envelope parses `chronyc -c tracking` assuming `RefID,Name,Stratum,System time,…`; unverified. Fold into V-1.
+23. ~~**`chronyc` column order (R-6/V-1).**~~ **Resolved 2026-09-28 (V-1):** `chronyc -c tracking` CSV order is `RefID, RefName, Stratum, RefTime, SystemTime, LastOffset, RMSOffset, Frequency, ResidualFreq, Skew, RootDelay, RootDispersion, UpdateInterval, LeapStatus`. `Stratum` is column 2 (correct in `record.rs`), but `SystemTime` is column **4**, not 3, so the current parser reads the RefTime epoch as the offset. **Code follow-up:** read column 4.
 24. **How a `drop` gap ends (R-2/R-7).** `gap_start{reason:"drop"}` is emitted after a bounded-channel overflow but never gets a matching `gap_end`, so a naive coverage calculation would mark the rest of the stream missing. `verify` currently treats an unpaired `gap_start` as running to the last record on the stream (the conservative reading). Define when a drop gap ends, and whether `verify` should instead bound it (for example, one flush interval) or ignore it.
