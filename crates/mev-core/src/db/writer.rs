@@ -236,9 +236,13 @@ fn apply(
             records,
         } => db.insert_open_orders(session_id, ts_ms, &records)?,
         WriteCmd::Nonce { nonce } => {
-            db.set_nonce_last(nonce)?;
-            // Publish only after the write is durable, and never regress it.
-            nonce_hwm.fetch_max(nonce, Ordering::AcqRel);
+            // Two refreshes can be enqueued out of order (A CAS, B CAS, B
+            // enqueue, A enqueue). Never let the persisted row or the published
+            // marker regress.
+            if nonce > nonce_hwm.load(Ordering::Acquire) {
+                db.set_nonce_last(nonce)?;
+                nonce_hwm.fetch_max(nonce, Ordering::AcqRel);
+            }
         }
         WriteCmd::Shutdown => {}
     }
@@ -338,6 +342,25 @@ mod tests {
         assert_eq!(hwm.load(Ordering::Acquire), 1_700_000_000_000);
         let db = Db::open(&path).unwrap();
         assert_eq!(db.nonce_last().unwrap(), Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn nonce_persist_never_regresses() {
+        let (_dir, path) = temp_path("nonce-max");
+        let db = Db::open(&path).unwrap();
+        let writer = DbWriter::spawn(db, 4);
+        let hwm = writer.nonce_hwm();
+        // High then low: the out-of-order low must be dropped, not overwrite.
+        assert!(writer.try_send(WriteCmd::Nonce {
+            nonce: 1_700_000_000_500
+        }));
+        assert!(writer.try_send(WriteCmd::Nonce {
+            nonce: 1_700_000_000_100
+        }));
+        writer.shutdown();
+        assert_eq!(hwm.load(Ordering::Acquire), 1_700_000_000_500);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.nonce_last().unwrap(), Some(1_700_000_000_500));
     }
 
     #[test]
