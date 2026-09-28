@@ -72,13 +72,16 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Option<Reply>>>>>;
 /// handle (SPEC-0002 H-7).
 type Reply = (Value, Instant);
 
-/// One outbound frame and the monotonic read time of the market frame it was
-/// produced for, carried to the socket-owning task so `hl_tick_to_order_seconds`
-/// can be stamped after the socket write (SPEC-0002 H-7). `0` means the caller
-/// did not provide a read time.
+/// One outbound frame, the monotonic read time of the market frame it was
+/// produced for, and a one-shot that resolves with the instant the socket write
+/// completed. `recv_mono_ns` lets the socket task stamp
+/// `hl_tick_to_order_seconds` after the write; `written_tx` lets the reply timer
+/// start at the write rather than before dial/enqueue (SPEC-0002 H-7). `0`
+/// means the caller did not provide a read time.
 struct Outbound {
     message: Message,
     recv_mono_ns: u64,
+    written_tx: oneshot::Sender<Instant>,
 }
 
 /// WebSocket `post` transport implementing [`ExchangeApi`].
@@ -94,9 +97,10 @@ pub struct WsExchange {
     /// Cached `hl_tick_to_order_seconds` handle, handed to the socket task
     /// (SPEC-0002 H-7).
     tick_to_order: metrics::Histogram,
-    /// Cached `hl_tick_to_order_skipped_total` counter, handed to the socket
-    /// task (SPEC-0002 H-7).
-    tick_skipped: metrics::Counter,
+    /// Cached `hl_tick_to_order_skipped_total{reason="unset"}` counter.
+    tick_skipped_unset: metrics::Counter,
+    /// Cached `hl_tick_to_order_skipped_total{reason="clock"}` counter.
+    tick_skipped_clock: metrics::Counter,
 }
 
 /// One live socket: the writer task, the reader task, and the pending map.
@@ -140,7 +144,14 @@ impl WsExchange {
                 "transport" => "ws"
             ),
             tick_to_order: metrics::histogram!(mev_metrics::names::TICK_TO_ORDER_SECONDS),
-            tick_skipped: metrics::counter!(mev_metrics::names::TICK_TO_ORDER_SKIPPED_TOTAL),
+            tick_skipped_unset: metrics::counter!(
+                mev_metrics::names::TICK_TO_ORDER_SKIPPED_TOTAL,
+                "reason" => mev_metrics::names::TICK_TO_ORDER_SKIP_UNSET
+            ),
+            tick_skipped_clock: metrics::counter!(
+                mev_metrics::names::TICK_TO_ORDER_SKIPPED_TOTAL,
+                "reason" => mev_metrics::names::TICK_TO_ORDER_SKIP_CLOCK
+            ),
         })
     }
 
@@ -225,7 +236,8 @@ impl WsExchange {
                 rx,
                 pending.clone(),
                 self.tick_to_order.clone(),
-                self.tick_skipped.clone(),
+                self.tick_skipped_unset.clone(),
+                self.tick_skipped_clock.clone(),
             ));
             *guard = Some(Connection {
                 tx: send_tx,
@@ -242,11 +254,18 @@ impl WsExchange {
     /// calls in sequence preserve write order (SPEC-0010 §12). The caller
     /// awaits the receiver separately, keeping only the wait concurrent.
     /// `recv_mono_ns` is the market frame's monotonic read time (SPEC-0002 H-7).
+    /// The returned write-time receiver resolves with the instant the socket
+    /// write completed, where `hl_submit_ack_seconds` starts.
     async fn post_enqueue(
         &self,
         request: &ExchangeRequest,
         recv_mono_ns: u64,
-    ) -> Result<(u64, PendingMap, oneshot::Receiver<Option<Reply>>)> {
+    ) -> Result<(
+        u64,
+        PendingMap,
+        oneshot::Receiver<Option<Reply>>,
+        oneshot::Receiver<Instant>,
+    )> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let frame = serde_json::to_string(&PostFrame {
             method: "post",
@@ -259,17 +278,19 @@ impl WsExchange {
         .map_err(|e| Error::NotSent(format!("request serialisation failed: {e}")))?;
 
         let (tx, rx) = oneshot::channel();
+        let (written_tx, written_rx) = oneshot::channel();
         let (send_tx, pending) = self.register_pending(id, tx).await?;
         let outbound = Outbound {
             message: Message::Text(frame.into()),
             recv_mono_ns,
+            written_tx,
         };
         if send_tx.send(outbound).await.is_err() {
             self.remove_pending(id);
             // The frame never entered the writer queue, so it was not sent.
             return Err(Error::NotSent("websocket send failed".into()));
         }
-        Ok((id, pending, rx))
+        Ok((id, pending, rx, written_rx))
     }
 
     /// Sign, enqueue, and return a handle for the reply, carrying no market
@@ -302,19 +323,23 @@ impl WsExchange {
             .await
             .map_err(|_| Error::NotSent("websocket closed before send".into()))?;
 
-        let started = Instant::now();
-        let (id, pending, rx) = self.post_enqueue(&request, recv_mono_ns).await?;
+        let (id, pending, rx, written_rx) = self.post_enqueue(&request, recv_mono_ns).await?;
         let histogram = self.submit_histogram.clone();
         let timeout = self.request_timeout;
         Ok(ReplyHandle::new(async move {
             let _permit = permit;
             let value = match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(Some((response, ack_at)))) => {
-                    // Submit-to-ack: frame enqueued through the venue's reply.
-                    // The ack timestamp comes from the reader task, so a delayed
-                    // poll by the exec writer does not inflate it (SPEC-0002
-                    // H-7, `transport="ws"`). A timeout is not an ack.
-                    histogram.record(ack_at.saturating_duration_since(started).as_secs_f64());
+                    // Submit-to-ack starts at the socket write, not at the
+                    // enqueue: the write instant comes back from the socket
+                    // task, so a cold dial or a busy writer channel is excluded
+                    // (SPEC-0002 H-7, `transport="ws"`). The ack instant itself
+                    // is stamped by the reader, so a delayed poll cannot inflate
+                    // it. A timeout is not an ack.
+                    if let Ok(written_at) = written_rx.await {
+                        histogram
+                            .record(ack_at.saturating_duration_since(written_at).as_secs_f64());
+                    }
                     response
                 }
                 Ok(Ok(None)) => {
@@ -384,32 +409,33 @@ impl WsExchange {
         mut rx: mpsc::Receiver<Outbound>,
         pending: PendingMap,
         tick_to_order: metrics::Histogram,
-        skipped: metrics::Counter,
+        skipped_unset: metrics::Counter,
+        skipped_clock: metrics::Counter,
     ) {
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await;
         loop {
             tokio::select! {
                 outbound = rx.recv() => {
-                    let Some(Outbound { message, recv_mono_ns }) = outbound else { break };
+                    let Some(Outbound { message, recv_mono_ns, written_tx }) = outbound else { break };
                     if socket.send(message).await.is_err() {
                         break;
                     }
-                    // The frame is now on the socket: stamp the headline span
-                    // from the market frame's read time (SPEC-0002 H-7). A zero
-                    // or backwards delta means the caller had no comparable
-                    // stamp (e.g. a timer-driven decision), so count it instead
-                    // of recording a bogus sample.
+                    // Tell the submit-ack timer when the write completed, and
+                    // stamp the headline span from the market frame's read time
+                    // (SPEC-0002 H-7). An unset read time or a stamp not before
+                    // now is counted with its reason rather than recorded.
+                    let now = Instant::now();
+                    let _ = written_tx.send(now);
                     if recv_mono_ns != 0 {
-                        let elapsed =
-                            crate::raw_ws::mono_ns().saturating_sub(recv_mono_ns);
+                        let elapsed = crate::raw_ws::mono_ns().saturating_sub(recv_mono_ns);
                         if elapsed > 0 {
                             tick_to_order.record(elapsed as f64 / 1e9);
                         } else {
-                            skipped.increment(1);
+                            skipped_clock.increment(1);
                         }
                     } else {
-                        skipped.increment(1);
+                        skipped_unset.increment(1);
                     }
                 }
                 _ = ping.tick() => {
@@ -531,6 +557,37 @@ mod tests {
                     let frame = json!({
                         "channel": "post",
                         "data": { "id": id, "response": reply(&request) },
+                    })
+                    .to_string();
+                    ws.send(Message::Text(frame.into())).await.unwrap();
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// A mock venue whose WebSocket handshake is delayed by `delay` after the
+    /// TCP accept, so a cold dial is slow; posts are then answered promptly.
+    async fn slow_handshake_venue(delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(delay).await;
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Text(text) = message {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let id = request["id"].as_u64().unwrap();
+                    let frame = json!({
+                        "channel": "post",
+                        "data": {
+                            "id": id,
+                            "response": {
+                                "type": "action",
+                                "payload": {"status": "ok", "response": {"n": 1}},
+                            },
+                        },
                     })
                     .to_string();
                     ws.send(Message::Text(frame.into())).await.unwrap();
@@ -949,7 +1006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_recv_time_is_counted_as_skipped() {
+    async fn skipped_tick_to_order_samples_are_counted_by_reason() {
         let url = mock_venue(
             |_| json!({"type": "action", "payload": {"status": "ok", "response": {"n": 1}}}),
         )
@@ -962,13 +1019,57 @@ mod tests {
 
         // `submit` carries no read time, so the frame cannot be timed.
         exchange.submit(&action()).await.unwrap();
+        // A stamp in the future cannot be before "now": a foreign clock.
+        exchange
+            .enqueue_timed(&action(), crate::raw_ws::mono_ns() + 1_000_000_000)
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
 
+        let snapshot = snapshotter.snapshot();
+        assert_eq!(
+            counter_value(
+                snapshot,
+                mev_metrics::names::TICK_TO_ORDER_SKIPPED_TOTAL,
+                Some(("reason", mev_metrics::names::TICK_TO_ORDER_SKIP_UNSET)),
+            ),
+            1,
+        );
         assert_eq!(
             counter_value(
                 snapshotter.snapshot(),
                 mev_metrics::names::TICK_TO_ORDER_SKIPPED_TOTAL,
+                Some(("reason", mev_metrics::names::TICK_TO_ORDER_SKIP_CLOCK)),
             ),
             1,
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_dial_does_not_inflate_submit_ack() {
+        // The handshake stalls for `delay`; the submit-ack clock must start at
+        // the socket write, after the dial (SPEC-0002 H-7).
+        let delay = Duration::from_millis(300);
+        let url = slow_handshake_venue(delay).await;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let exchange = metrics::with_local_recorder(&recorder, || {
+            WsExchange::with_url(url, Mode::Live, Some(signer())).unwrap()
+        });
+
+        exchange.submit(&action()).await.unwrap();
+
+        let values = histogram_values(
+            snapshotter.snapshot(),
+            mev_metrics::names::SUBMIT_ACK_SECONDS,
+            Some(("transport", "ws")),
+        );
+        let max = values.iter().copied().fold(0.0_f64, f64::max);
+        assert!(
+            max < delay.as_secs_f64() / 2.0,
+            "submit_ack {max}s included the {delay:?} cold dial"
         );
     }
 
@@ -984,9 +1085,10 @@ mod tests {
             WsExchange::with_url(url, Mode::Live, Some(signer())).unwrap()
         });
 
+        let poll_delay = Duration::from_millis(300);
         let handle = exchange.enqueue_timed(&action(), 0).await.unwrap();
-        // The venue replies promptly, but the handle is only polled 200 ms later.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The venue replies promptly, but the handle is only polled much later.
+        tokio::time::sleep(poll_delay).await;
         handle.wait().await.unwrap();
 
         let values = histogram_values(
@@ -996,8 +1098,8 @@ mod tests {
         );
         let max = values.iter().copied().fold(0.0_f64, f64::max);
         assert!(
-            max < 0.1,
-            "submit_ack {max}s was inflated by the delayed poll"
+            max < poll_delay.as_secs_f64() / 2.0,
+            "submit_ack {max}s was inflated by the {poll_delay:?} delayed poll"
         );
     }
 }

@@ -145,7 +145,8 @@ impl Stamps {
         span(self.t_signed, self.t_handoff)
     }
 
-    /// Headline internal latency: `t_written − t_recv` (`hl_tick_to_order_seconds`).
+    /// Engine-side headline latency: `t_written − t_recv`
+    /// (`hl_engine_tick_to_order_seconds`).
     pub fn tick_to_order(&self) -> Option<u64> {
         span(self.t_recv, self.t_written)
     }

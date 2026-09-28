@@ -52,14 +52,22 @@ pub(crate) fn histogram_samples(
     histogram_values(snapshot, name, label).len()
 }
 
-/// The value of the counter `name` in a debugging-recorder snapshot (0 when
-/// absent).
-pub(crate) fn counter_value(snapshot: Snapshot, name: &str) -> u64 {
+/// The value of the counter `name`, optionally filtered to a single `label`
+/// (`key = value`), in a debugging-recorder snapshot (0 when absent).
+pub(crate) fn counter_value(snapshot: Snapshot, name: &str, label: Option<(&str, &str)>) -> u64 {
     snapshot
         .into_vec()
         .into_iter()
         .filter_map(|(key, _, _, value)| {
             if key.key().name() != name {
+                return None;
+            }
+            if let Some((want_key, want_value)) = label
+                && !key
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == want_key && l.value() == want_value)
+            {
                 return None;
             }
             match value {

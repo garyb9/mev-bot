@@ -91,10 +91,14 @@ pub mod names {
     /// Submit-to-ack span: `t_ack − t_written`, measured at the transport
     /// (SPEC-0002 H-7), tagged by `transport`.
     pub const SUBMIT_ACK_SECONDS: &str = "hl_submit_ack_seconds";
-    /// Tick-to-order samples skipped because their `recv_mono_ns` was unset or
-    /// not comparable to the socket clock (timer-driven decisions). SPEC-0002
-    /// H-7.
+    /// Tick-to-order samples skipped, tagged by `reason` (SPEC-0002 H-7).
     pub const TICK_TO_ORDER_SKIPPED_TOTAL: &str = "hl_tick_to_order_skipped_total";
+    /// `hl_tick_to_order_skipped_total{reason}`: the post carried no market
+    /// read time (e.g. a timer-driven decision).
+    pub const TICK_TO_ORDER_SKIP_UNSET: &str = "unset";
+    /// `hl_tick_to_order_skipped_total{reason}`: the market read stamp was not
+    /// before now on the socket clock (foreign/future clock).
+    pub const TICK_TO_ORDER_SKIP_CLOCK: &str = "clock";
     /// Engine-side headline span `t_written − t_recv` from the in-process
     /// `LatencyRecorder`, not yet published (SPEC-0010 §17). Distinct from
     /// [`TICK_TO_ORDER_SECONDS`], the H-7 live exec path.

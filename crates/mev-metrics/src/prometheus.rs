@@ -35,7 +35,7 @@ pub fn install_recorder() -> PrometheusHandle {
 ///
 /// The first call happens after one interval. The thread runs for the process
 /// lifetime; a detached `std` thread does not keep the process alive.
-pub fn spawn_periodic<F>(interval: Duration, mut task: F)
+pub(crate) fn spawn_periodic<F>(interval: Duration, mut task: F)
 where
     F: FnMut() + Send + 'static,
 {
