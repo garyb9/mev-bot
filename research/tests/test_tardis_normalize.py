@@ -66,8 +66,10 @@ def _write_csv(
 
 
 def _read(out: Path, table: str, day: str = _DAY) -> pl.DataFrame:
-    """Read the single ``(table, day, tardis-free)`` partition."""
-    return pl.read_parquet(out / table / f"date={day}" / "tardis-free.parquet")
+    """Load a whole ``(table, day)`` partition with one glob."""
+    files = sorted((out / table / f"date={day}").glob("tardis-free*.parquet"))
+    assert files, f"no {table} partition for {day}"
+    return pl.read_parquet(files)
 
 
 # --------------------------------------------------------------------------
@@ -361,6 +363,40 @@ def test_cli_main_normalizes_and_returns_zero(tmp_path: Path) -> None:
     assert _read(out, "trades").height == 1
 
 
+def test_cli_main_reads_expect_streams(tmp_path: Path) -> None:
+    from hlr.backfill.tardis_normalize import main
+
+    raw = tmp_path / "raw"
+    out = tmp_path / "out"
+    _write_csv(
+        raw,
+        "trades",
+        "BTC",
+        _TRADES_HEADER,
+        ["hyperliquid,BTC,1788220800095000,1788220801941368,1,buy,78575,0.1"],
+    )
+    streams = tmp_path / "streams.txt"
+    streams.write_text("hyperliquid/book_ticker/BTC\n")
+
+    code = main(
+        [
+            "--from",
+            "2026-09-01",
+            "--to",
+            "2026-09-01",
+            "--in",
+            str(raw),
+            "--out",
+            str(out),
+            "--expect-streams",
+            str(streams),
+        ]
+    )
+
+    assert code == 0
+    assert _read(out, "gaps")["conn"].to_list() == ["hyperliquid/book_ticker/BTC"]
+
+
 def test_cli_main_rejects_a_reversed_range(tmp_path: Path) -> None:
     from hlr.backfill.tardis_normalize import main
 
@@ -414,6 +450,69 @@ def test_gaps_cover_every_missing_day(tmp_path: Path) -> None:
         assert row["end_ns"] == start + DAY_NS
 
 
+def test_expected_streams_flag_a_fully_absent_source(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    _write_csv(
+        raw,
+        "book_ticker",
+        "BTC",
+        _BOOK_TICKER_HEADER,
+        ["hyperliquid,BTC,1788220800019000,1788220801849918,2.6,78575,78574,10.0"],
+    )
+    out = tmp_path / "out"
+
+    # Without the expected stream, ETH is unknown and never flagged.
+    normalize(raw, out, dt.date(2026, 9, 1), dt.date(2026, 9, 1))
+    conns = _read(out, "gaps")["conn"].to_list()
+    assert conns == []
+
+    # With it, the same day gains a gap row for ETH.
+    report = normalize(
+        raw,
+        out,
+        dt.date(2026, 9, 1),
+        dt.date(2026, 9, 1),
+        expected_streams=[("hyperliquid", "book_ticker", "ETH")],
+    )
+    assert report.gap_rows == 1
+    assert _read(out, "gaps")["conn"].to_list() == ["hyperliquid/book_ticker/ETH"]
+
+
+def test_expected_streams_validation_is_fail_closed(tmp_path: Path) -> None:
+    with pytest.raises(NormalizeError, match="unknown exchange"):
+        normalize(
+            tmp_path / "raw",
+            tmp_path / "out",
+            dt.date(2026, 9, 1),
+            dt.date(2026, 9, 1),
+            expected_streams=[("kraken", "book_ticker", "BTC")],
+        )
+    with pytest.raises(NormalizeError, match="unsupported data type"):
+        normalize(
+            tmp_path / "raw",
+            tmp_path / "out",
+            dt.date(2026, 9, 1),
+            dt.date(2026, 9, 1),
+            expected_streams=[("hyperliquid", "options_chain", "BTC")],
+        )
+
+
+def test_parse_expected_streams(tmp_path: Path) -> None:
+    from hlr.backfill.tardis_normalize import parse_expected_streams
+
+    path = tmp_path / "streams.txt"
+    path.write_text(
+        "# a comment\n\nhyperliquid/book_ticker/BTC\nbybit/trades/ETHUSDT\n"
+    )
+    assert parse_expected_streams(path) == [
+        ("hyperliquid", "book_ticker", "BTC"),
+        ("bybit", "trades", "ETHUSDT"),
+    ]
+    path.write_text("hyperliquid/book_ticker\n")
+    with pytest.raises(NormalizeError, match="exchange/data_type/symbol"):
+        parse_expected_streams(path)
+
+
 def test_new_data_clears_a_stale_gap(tmp_path: Path) -> None:
     raw = tmp_path / "raw"
     out = tmp_path / "out"
@@ -437,7 +536,7 @@ def test_new_data_clears_a_stale_gap(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_multiple_symbols_share_one_partition(tmp_path: Path) -> None:
+def test_multiple_symbols_one_day_one_glob(tmp_path: Path) -> None:
     raw = tmp_path / "raw"
     _write_csv(
         raw,
@@ -457,9 +556,41 @@ def test_multiple_symbols_share_one_partition(tmp_path: Path) -> None:
 
     normalize(raw, out, dt.date(2026, 9, 1), dt.date(2026, 9, 1))
 
-    files = list((out / "bbo").rglob("*.parquet"))
-    assert files == [out / "bbo" / "date=2026-09-01" / "tardis-free.parquet"]
+    # One part per input stream, loaded together by the day glob.
+    parts = sorted(
+        path.name for path in (out / "bbo" / "date=2026-09-01").glob("tardis-free*.parquet")
+    )
+    assert parts == ["tardis-free.hyperliquid.book_ticker.BTC.parquet",
+                     "tardis-free.hyperliquid.book_ticker.XYZ-TSLA.parquet"]
     assert set(_read(out, "bbo")["market"]) == {"BTC", "xyz:TSLA"}
+
+
+def test_rerun_drops_a_stale_stream_part(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    _write_csv(
+        raw,
+        "book_ticker",
+        "BTC",
+        _BOOK_TICKER_HEADER,
+        ["hyperliquid,BTC,1788220800019000,1788220801849918,2.6,78575,78574,10.0"],
+    )
+    eth = _write_csv(
+        raw,
+        "book_ticker",
+        "XYZ-TSLA",
+        _BOOK_TICKER_HEADER,
+        ["hyperliquid,XYZ-TSLA,1788220800019000,1788220801849918,2.6,300,299,10.0"],
+    )
+    out = tmp_path / "out"
+
+    normalize(raw, out, dt.date(2026, 9, 1), dt.date(2026, 9, 1))
+    assert set(_read(out, "bbo")["market"]) == {"BTC", "xyz:TSLA"}
+
+    eth.unlink()
+    normalize(raw, out, dt.date(2026, 9, 1), dt.date(2026, 9, 1))
+    assert set(_read(out, "bbo")["market"]) == {"BTC"}
+    parts = list((out / "bbo" / "date=2026-09-01").glob("tardis-free*.parquet"))
+    assert len(parts) == 1
 
 
 def test_rerun_is_idempotent_per_partition(tmp_path: Path) -> None:

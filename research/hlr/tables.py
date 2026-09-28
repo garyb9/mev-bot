@@ -13,6 +13,13 @@ The §13.1 columns are exactly as specified; only ``source`` and ``fidelity`` ar
 appended. All prices and sizes are ``float64`` (research only, SPEC-0008 §13.1);
 timestamps are int64 nanoseconds plus ``ts_exch_ms`` where the venue provides an
 exchange timestamp.
+
+Physical layout. A normalizer writes
+``{root}/{table}/date=YYYY-MM-DD/{source}*.parquet``: one part file per input
+stream (B-2 names them ``{source}.{exchange}.{data_type}.{symbol}.parquet``) so
+peak memory stays at one stream instead of a whole day. A reader loads a full
+day with a single glob, ``{root}/{table}/date=DAY/{source}*.parquet`` (which
+also matches a single-file ``{source}.parquet`` partition).
 """
 
 from __future__ import annotations

@@ -20,14 +20,18 @@ Every partition is written with the ``source`` column (``tardis-free``, the
 SPEC-0008 §13.11 tag) and the ``fidelity`` column (``H1``). Rows are read with
 polars' lazy CSV scanner, reshaped by vectorized expressions, and sunk to
 parquet with the streaming engine: no row ever becomes a Python object and no
-per-row Python loop runs. (Polars' gzip reader still buffers a decompressed
-file, so peak memory tracks the *decompressed* size, not the file size alone —
-fine for the tens-of-MB per-symbol/day Tardis files B-2 imports.) Writes go to a
-``.tmp`` file that is atomically renamed into place, so re-running a
-``(table, date, source)`` overwrites only that file.
+per-row Python loop runs. The wide book snapshots are reshaped by projecting one
+narrow frame per ``(side, level)`` and concatenating, which the optimizer folds
+onto a single cached scan — all streaming-supported, so peak memory stays flat
+as a file or a multi-symbol day grows. Writes go to a ``.tmp`` file that is
+atomically renamed into place, so re-running a ``(table, date, source)``
+overwrites only that file.
 
 ``gaps`` rows are synthesized for every ``(stream, day)`` in the requested range
 that has no downloaded file (the Tardis free lane only has one day per month).
+Only streams with at least one file in the range are known by default; pass
+``--expect-streams`` (lines ``exchange/data_type/symbol``) to also flag a source
+that is entirely absent.
 
 Research only: never imported by, or deployed with, the trading bot. It reads
 no keys and no network.
@@ -40,7 +44,7 @@ import datetime as _dt
 import os
 import sys
 from collections import defaultdict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -76,6 +80,7 @@ __all__ = [
     "normalize_book",
     "normalize_ctx",
     "normalize_trades",
+    "parse_expected_streams",
     "scan_tardis_csv",
     "spot_index_map",
     "synthesize_gaps",
@@ -395,34 +400,36 @@ def normalize_book(
 ) -> pl.LazyFrame:
     """Normalize a wide Tardis book snapshot into the long-form ``book`` table.
 
-    The wide ``asks[i].price/amount`` columns are folded into a list of structs
-    per row and exploded with vectorized expressions (no per-row Python work)
-    and the result is sunk with the streaming engine. Empty levels (null price)
+    Each ``(side, level)`` pair is projected as its own narrow lazy frame, and
+    the frames are concatenated. Polars' optimizer folds the projections onto a
+    single cached CSV scan, and ``select``/``concat``/``filter`` are all
+    streaming, so ``sink_parquet(engine="streaming")`` keeps memory flat as the
+    file grows (unlike the previous struct/``explode`` plan, which the streaming
+    engine silently ran in memory). No per-row Python work runs. Empty levels
     are dropped; Tardis has no order count, so ``n`` is null.
     """
-    entries: list[pl.Expr] = []
-    for level in range(levels):
-        for side, prefix in (("ask", "asks"), ("bid", "bids")):
-            entries.append(
-                pl.struct(
-                    side=pl.lit(side, dtype=pl.String),
-                    level=pl.lit(level, dtype=pl.Int32),
-                    px=pl.col(f"{prefix}[{level}].price").cast(pl.Float64),
-                    sz=pl.col(f"{prefix}[{level}].amount").cast(pl.Float64),
-                )
-            )
-    base = lf.select(
+    meta = [
         _t_ns().alias("t_ns"),
         _ts_exch_ms().alias("ts_exch_ms"),
         pl.lit(venue).alias("venue"),
         pl.lit(market).alias("market"),
         pl.lit(source).alias("source"),
         pl.lit(fidelity).alias("fidelity"),
-        pl.concat_list(entries).alias("__level"),
-    )
+    ]
+    projections: list[pl.LazyFrame] = []
+    for level in range(levels):
+        for side, prefix in (("ask", "asks"), ("bid", "bids")):
+            projections.append(
+                lf.select(
+                    *meta,
+                    pl.lit(side, dtype=pl.String).alias("side"),
+                    pl.lit(level, dtype=pl.Int32).alias("level"),
+                    pl.col(f"{prefix}[{level}].price").cast(pl.Float64).alias("px"),
+                    pl.col(f"{prefix}[{level}].amount").cast(pl.Float64).alias("sz"),
+                )
+            )
     return (
-        base.explode("__level", empty_as_null=True)
-        .unnest("__level")
+        pl.concat(projections, how="vertical", rechunk=False)
         .filter(pl.col("px").is_not_null() & pl.col("sz").is_not_null())
         .with_columns(_null(pl.Int64).alias("n"))
         .select(tables.columns("book"))
@@ -526,6 +533,19 @@ def _atomic_sink(lf: pl.LazyFrame, path: Path) -> None:
         raise
 
 
+def _part_name(source: str, file: TardisFile) -> str:
+    """Part filename for one input stream, safe to glob with ``{source}*``."""
+    symbol = file.symbol.replace("/", "_").replace(os.sep, "_").replace("\\", "_")
+    return f"{source}.{file.exchange}.{file.data_type}.{symbol}.parquet"
+
+
+def _drop_stale_parts(directory: Path, source: str, keep: set[str]) -> None:
+    """Remove leftover ``{source}*`` parts of a rewritten partition."""
+    for existing in directory.glob(f"{source}*.parquet"):
+        if existing.name not in keep:
+            existing.unlink()
+
+
 def _parquet_rows(path: Path) -> int:
     """Row count from a parquet file's metadata (no full read)."""
     return pl.scan_parquet(path).select(pl.len()).collect().item()
@@ -544,32 +564,49 @@ def _iter_days(first: _dt.date, last: _dt.date) -> Iterator[_dt.date]:
         day += _dt.timedelta(days=1)
 
 
+def _validate_stream(stream: tuple[str, str, str], origin: str) -> None:
+    """Reject an expected stream with an unknown exchange or data type."""
+    exchange, data_type, _symbol = stream
+    if exchange not in EXCHANGES:
+        raise NormalizeError(f"{origin}: unknown exchange `{exchange}`")
+    if data_type not in DATA_TYPE_TABLE:
+        raise NormalizeError(f"{origin}: unsupported data type `{data_type}`")
+
+
 def synthesize_gaps(
     files: Sequence[TardisFile],
     out_dir: str | os.PathLike[str],
     date_from: _dt.date,
     date_to: _dt.date,
     *,
+    expected_streams: Iterable[tuple[str, str, str]] | None = None,
     source: str = SOURCE,
     fidelity: str = FIDELITY,
 ) -> tuple[int, int]:
     """Write one ``gaps`` partition per requested day, over every known stream.
 
-    A *stream* is a ``(exchange, data_type, symbol)`` seen anywhere in the
-    selected raw files. For each day in ``[date_from, date_to]`` any stream with
-    no file that day becomes one gap row covering the whole UTC day, under
+    A *stream* is a ``(exchange, data_type, symbol)``. Streams seen anywhere in
+    the selected raw files are always covered; ``expected_streams`` adds streams
+    that should exist but have **no file at all** in the requested range, so a
+    completely missing source is flagged rather than silently absent (each
+    expected stream is validated against the known exchanges/data types,
+    fail-closed). For each day in ``[date_from, date_to]`` any stream with no
+    file that day becomes one gap row covering the whole UTC day, under
     ``gaps/date=DAY/{source}.parquet``. Days with full coverage still get a
     (zero-row) partition, so a stale gap file is overwritten rather than left
     behind. Returns ``(files_written, rows_written)``.
     """
     present = {(f.exchange, f.data_type, f.symbol, f.day) for f in files}
-    streams = sorted({(f.exchange, f.data_type, f.symbol) for f in files})
+    streams = {(f.exchange, f.data_type, f.symbol) for f in files}
+    for stream in expected_streams or ():
+        _validate_stream(stream, "expected stream")
+        streams.add(stream)
     root = Path(out_dir)
     files_written = rows_written = 0
     for day in _iter_days(date_from, date_to):
         conns: list[str] = []
         starts: list[int] = []
-        for exchange, data_type, symbol in streams:
+        for exchange, data_type, symbol in sorted(streams):
             if (exchange, data_type, symbol, day) in present:
                 continue
             conns.append(f"{exchange}/{data_type}/{symbol}")
@@ -604,15 +641,24 @@ def normalize(
     date_to: _dt.date,
     *,
     spot_symbols: Mapping[str, str] | None = None,
+    expected_streams: Iterable[tuple[str, str, str]] | None = None,
     source: str = SOURCE,
     fidelity: str = FIDELITY,
 ) -> NormalizeReport:
     """Normalize every raw Tardis file under ``root`` into ``out_dir``.
 
-    Files for the same ``(table, date)`` are concatenated into one parquet
-    partition; each ``(table, date, source)`` write is idempotent. ``gaps``
-    partitions are then synthesized (see :func:`synthesize_gaps`). A symbol that
-    cannot be mapped raises :class:`MarketMappingError` (fail closed).
+    Each input file (one exchange/data-type/symbol stream) becomes its own part
+    file in the day partition, named
+    ``{source}.{exchange}.{data_type}.{symbol}.parquet``. Reading a whole day is
+    one glob: ``{table}/date=DAY/{source}*.parquet``. Per-stream parts keep peak
+    memory to one stream (a day-level ``concat`` would decompress every symbol
+    into memory at once, since polars' gzip reader buffers each file), and each
+    part is overwritten atomically by name. When a ``(table, day)`` is rewritten,
+    any part for a stream no longer present in the raw tree is removed, so a
+    re-run matches the current raw set. ``gaps`` partitions are then synthesized
+    over the streams seen in the range plus any ``expected_streams`` (see
+    :func:`synthesize_gaps`). A symbol that cannot be mapped raises
+    :class:`MarketMappingError` (fail closed).
     """
     if date_from > date_to:
         raise NormalizeError(
@@ -620,27 +666,32 @@ def normalize(
         )
     files, skipped = discover_files(root, date_from, date_to)
 
-    groups: dict[tuple[str, _dt.date], list[pl.LazyFrame]] = defaultdict(list)
+    out_root = Path(out_dir)
+    parts: dict[tuple[str, _dt.date], list[Path]] = defaultdict(list)
+    rows: dict[tuple[str, _dt.date], int] = defaultdict(int)
     for raw in files:
+        table = DATA_TYPE_TABLE[raw.data_type]
         frame = build_frame(
             raw, source=source, fidelity=fidelity, spot_symbols=spot_symbols
         )
-        groups[(DATA_TYPE_TABLE[raw.data_type], raw.day)].append(frame)
+        path = out_root / table / f"date={raw.day.isoformat()}" / _part_name(source, raw)
+        _atomic_sink(frame, path)
+        parts[(table, raw.day)].append(path)
+        rows[(table, raw.day)] += _parquet_rows(path)
 
-    out_root = Path(out_dir)
     counts: list[TableCount] = []
-    for (table, day), frames in sorted(groups.items()):
-        merged = (
-            frames[0]
-            if len(frames) == 1
-            else pl.concat(frames, how="vertical", rechunk=False)
-        )
-        path = out_root / table / f"date={day.isoformat()}" / f"{source}.parquet"
-        _atomic_sink(merged, path)
-        counts.append(TableCount(table, day, _parquet_rows(path), path))
+    for (table, day), written in sorted(parts.items()):
+        _drop_stale_parts(written[0].parent, source, {path.name for path in written})
+        counts.append(TableCount(table, day, rows[(table, day)], written[0].parent))
 
     gap_files, gap_rows = synthesize_gaps(
-        files, out_root, date_from, date_to, source=source, fidelity=fidelity
+        files,
+        out_root,
+        date_from,
+        date_to,
+        expected_streams=expected_streams,
+        source=source,
+        fidelity=fidelity,
     )
     return NormalizeReport(
         input_files=len(files),
@@ -654,6 +705,31 @@ def normalize(
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+
+
+def parse_expected_streams(path: str | os.PathLike[str]) -> list[tuple[str, str, str]]:
+    """Read ``exchange/data_type/symbol`` lines into expected-stream tuples.
+
+    Blank lines and ``#`` comments are ignored. A malformed line raises
+    :class:`NormalizeError`; the exchange/data-type pair is validated later by
+    :func:`synthesize_gaps`.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise NormalizeError(f"cannot read expected-streams file `{path}`: {exc}") from exc
+    streams: list[tuple[str, str, str]] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split("/")
+        if len(parts) != 3 or not all(parts):
+            raise NormalizeError(
+                f"`{path}` line {lineno}: expected exchange/data_type/symbol"
+            )
+        streams.append((parts[0], parts[1], parts[2]))
+    return streams
 
 
 def load_spot_meta(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -700,6 +776,15 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="optional HL spotMeta JSON used to resolve @N → BASE/QUOTE",
     )
+    parser.add_argument(
+        "--expect-streams",
+        default=None,
+        metavar="PATH",
+        help=(
+            "optional file of exchange/data_type/symbol lines to flag as gaps "
+            "even when they have no file in the range"
+        ),
+    )
     return parser
 
 
@@ -727,12 +812,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         spot_symbols = None
         if args.spot_meta is not None:
             spot_symbols = spot_index_map(load_spot_meta(args.spot_meta))
+        expected_streams = None
+        if args.expect_streams is not None:
+            expected_streams = parse_expected_streams(args.expect_streams)
         report = normalize(
             args.in_dir,
             args.out_dir,
             date_from,
             date_to,
             spot_symbols=spot_symbols,
+            expected_streams=expected_streams,
         )
     except (NormalizeError, TardisError) as exc:
         print(f"error: {exc}", file=sys.stderr)
