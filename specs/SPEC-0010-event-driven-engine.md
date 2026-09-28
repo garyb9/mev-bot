@@ -301,8 +301,8 @@ The existing `PaperExecutor` in `mev-strategy/src/paper.rs` becomes the core of 
 | `hl_engine_sign_seconds` | `t_signed − t_risked` |
 | `hl_engine_handoff_seconds` | `t_written − t_signed` |
 | `hl_exec_queue_seconds` | exec writer: post received → frame enqueued on the socket (excludes the reply wait; task C) |
-| **`hl_tick_to_order_seconds`** | **`t_written − t_recv`** (the GOAL §5.2 headline) |
-| `hl_submit_ack_seconds` | `t_ack − t_written` (network + venue) |
+| **`hl_engine_tick_to_order_seconds`** | **`t_written − t_recv`** (the engine-side headline; the published `hl_tick_to_order_seconds` is the live transport span, SPEC-0002 H-7) |
+| `hl_engine_submit_ack_seconds` | `t_ack − t_written` (network + venue, engine-side) |
 | `hl_engine_iteration_seconds`, `hl_engine_events_per_iteration`, `hl_engine_market_drops_total`, `hl_engine_idle_ratio` | loop health |
 
 **Benchmarks (criterion, `crates/mev-bot/benches/engine.rs`):**
@@ -321,7 +321,7 @@ exact experiment to run. No host numbers are invented.
 
 | Item | Default | Decide by | E-12 decision |
 |---|---|---|---|
-| Pin the engine thread to a dedicated core (`core_affinity`) | on if ≥ 4 vCPUs | bench p99 with and without; check VPS steal time | **deferred — needs reference host (SPEC-0008 V-4).** No affinity code or `core_affinity` dependency exists yet, and E-12 does not add one. Experiment: on the production host type, build two variants (pin on / off) and bench `bbo_to_action` p99 and 24 h `simulate` `hl_tick_to_order_seconds` p99 under live load, plus `/proc/stat` steal time; keep pinning only if p99 improves. The `pin_core` config surface lands with the E-13 wiring of the v2 loop into `hl` (nothing reads it today). |
+| Pin the engine thread to a dedicated core (`core_affinity`) | on if ≥ 4 vCPUs | bench p99 with and without; check VPS steal time | **deferred — needs reference host (SPEC-0008 V-4).** No affinity code or `core_affinity` dependency exists yet, and E-12 does not add one. Experiment: on the production host type, build two variants (pin on / off) and bench `bbo_to_action` p99 and 24 h `simulate` `hl_engine_tick_to_order_seconds` p99 under live load, plus `/proc/stat` steal time; keep pinning only if p99 improves. The `pin_core` config surface lands with the E-13 wiring of the v2 loop into `hl` (nothing reads it today). |
 | Spin before blocking (`spin_us`) | 50 µs | p99 vs CPU cost | **default confirmed.** `LoopConfig::default` is `spin_us: 50` (`crates/mev-engine/src/run.rs:53`) and the §19 example matches. **deferred — needs reference host (SPEC-0008 V-4).** Experiment: sweep `spin_us ∈ {0, 20, 50, 100, 250}` and record `bbo_to_action` p99 vs engine-core CPU% (and idle ratio) to pick the knee. |
 | Allocator (`mimalloc`) | off | bench | **confirmed off.** No `mimalloc` dependency is added; the zero-alloc test (`crates/mev-engine/tests/zero_alloc.rs`) passes on the system allocator. **deferred — needs reference host (SPEC-0008 V-4).** Experiment: add `mimalloc` as a temporary global allocator, bench `bbo_to_action`/`replay_throughput`/`drain_1000`; adopt only on a measured win. |
 | `TCP_NODELAY` on every exec and market socket | **on** | always | **decided and verified (E-6).** `set_tcp_nodelay` (`crates/mev-hl-client/src/raw_ws.rs:375`) is applied to the market `RawWsConn` (`raw_ws.rs:387`) and the exec `WsExchange` (`crates/mev-hl-client/src/ws_exchange.rs:167`); a loopback test asserts `nodelay()` is set (`raw_ws.rs:547`). Always on; no host decision needed. |
@@ -523,7 +523,7 @@ row additionally needs a testnet round-trip; no host row is fabricated here.
 ## 22. Acceptance criteria
 
 - [ ] E-0 merged before any testnet or live run.
-- [ ] G-2 met on the reference host (bench + a 24 h `simulate` run's `hl_tick_to_order_seconds`).
+- [ ] G-2 met on the reference host (bench + a 24 h `simulate` run's `hl_engine_tick_to_order_seconds`).
 - [ ] G-3: the zero-alloc test passes.
 - [ ] G-6: replay determinism test passes in CI.
 - [ ] `FundingBasis` and `MarketMaker` run on the new engine in `simulate` for 24 h with no panics, no drops on the account channel, and reconciliation drift = 0.

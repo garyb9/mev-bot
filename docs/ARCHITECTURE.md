@@ -141,7 +141,7 @@ in the loop but the `hl` binary does **not** export it yet *(planned)*; the
 | Risk check | `RiskGate::check`, `risk.rs:520` | `hl_engine_risk_seconds` (engine-side) | ≤ 10 µs / 50 µs |
 | Order build + msgpack + EIP-712 sign | `WriteCore::prepare`, `exchange.rs:468` | `hl_sign_seconds` | ≤ 150 µs / 500 µs |
 | Write to socket | exec writer, `live.rs:68` | `hl_exec_queue_seconds` | ≤ 20 µs / 100 µs |
-| **Total internal tick-to-order** | socket read → frame handed to socket | **`hl_tick_to_order_seconds`** | **≤ 100–250 µs / 1 ms** |
+| **Total internal tick-to-order** | socket read → frame written to socket | **`hl_tick_to_order_seconds`** | **≤ 100–250 µs / 1 ms** |
 | Network RTT (send → venue ack) | `WsExchange::enqueue_split`, `ws_exchange.rs` | `hl_submit_ack_seconds` | minimize |
 
 Socket rules: `TCP_NODELAY` is set on both the market and exec sockets. The
