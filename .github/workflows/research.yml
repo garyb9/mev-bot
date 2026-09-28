@@ -1,0 +1,29 @@
+name: Research CI
+
+on:
+  push:
+    branches: [main]
+    paths: ["research/**", ".github/workflows/research.yml"]
+  pull_request:
+    paths: ["research/**", ".github/workflows/research.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  research:
+    name: research
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: research
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv sync --locked
+      - run: uv run ruff check
+      - run: uv run pytest
