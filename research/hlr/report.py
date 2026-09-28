@@ -277,7 +277,17 @@ def build_front_matter(
     required. ``data_source`` may force ``"backfill"`` (or ``"unknown"``) but can
     never force ``"forward"``: forward provenance is decided by the input tables'
     ``source`` column only, and a forced/mixed backfill study is preliminary.
-    ``reveal_lag_ms`` shifts every latency in the report by that lag (§13.4).
+
+    ``reveal_lag_ms`` applies the §13.4 reveal lag **where episodes were
+    computed**: metrics for a label ``L`` are read from the ``L + lag`` capture
+    and markout columns, so the row is graded conservatively on data that was
+    only available ``lag`` ms later. The report keeps the original ``L`` labels
+    (and records ``effective_latency_grid_ms``/``effective_headline_latency_ms``).
+    The caller must have detected episodes at those effective latencies: a lagged
+    report whose tables lack the ``L + lag`` columns is rejected with
+    :class:`ReportError` rather than relabelled, because grading data computed at
+    a lower latency than claimed would weaken the result. A lag can therefore only
+    make a verdict worse or equal, never better.
     """
     if implementation_cost not in _IMPL_ORDER:
         raise ReportError(
@@ -303,8 +313,15 @@ def build_front_matter(
         else:
             data_source, backfill_sources, derived_fidelity = "unknown", (), None
     if data_source == BACKFILL:
+        # Intended: a backfill is preliminary, so its verdict needs only
+        # _MIN_DAYS_PRELIM valid days (the HIST-PRELIM MARGINAL cap still applies).
         preliminary = True
     _require_dates_in_all_dates(provenance_frames, dates)
+
+    labels = [int(lat) for lat in latencies_ms]
+    effective_latencies = [lat + lag_ms for lat in labels]
+    if lag_ms:
+        _require_effective_latencies(list(capital_runs.values()), effective_latencies)
 
     capital_blocks: list[dict[str, Any]] = []
     for capital in sorted_capitals:
@@ -329,7 +346,7 @@ def build_front_matter(
                     episodes,
                     in_sample,
                     capital_usd=capital,
-                    latencies_ms=latencies_ms,
+                    latencies_ms=effective_latencies,
                     capture_variants=capture_variants,
                     bootstrap_draws=bootstrap_draws,
                     bootstrap_seed=bootstrap_seed,
@@ -339,7 +356,7 @@ def build_front_matter(
                     episodes,
                     out_sample,
                     capital_usd=capital,
-                    latencies_ms=latencies_ms,
+                    latencies_ms=effective_latencies,
                     capture_variants=capture_variants,
                     bootstrap_draws=bootstrap_draws,
                     bootstrap_seed=bootstrap_seed,
@@ -347,6 +364,10 @@ def build_front_matter(
                 ),
             }
         )
+    if lag_ms:
+        for block in capital_blocks:
+            for sample in ("in_sample", "oos"):
+                _relabel_latencies(block[sample], lag_ms)
 
     digest = episode_digest(capital_runs)
     if episode_parquet is not None and reports_dir is not None:
@@ -365,14 +386,13 @@ def build_front_matter(
         if headline_capital_usd is not None
         else sorted_capitals[0]
     )
+    headline_label = _ceiling_latency(labels, headline_latency_ms) or max(labels)
+    effective_headline = int(headline_label) + lag_ms
     if not merged.get("top_episodes"):
         run = capital_runs[_as_key(capital_runs, headline_cap)]
-        merged["top_episodes"] = top_episodes(
-            run, _ceiling_latency(latencies_ms, headline_latency_ms) or max(latencies_ms),
-            HEADLINE_VARIANT,
-        )
+        merged["top_episodes"] = top_episodes(run, effective_headline, HEADLINE_VARIANT)
 
-    front_matter = _json_safe(
+    return _json_safe(
         {
             "spec": "SPEC-0008",
             "study_id": study_id,
@@ -391,9 +411,11 @@ def build_front_matter(
             "episode_digest": digest,
             "episode_parquet": episode_parquet,
             "headline_latency_ms": int(headline_latency_ms),
+            "effective_headline_latency_ms": effective_headline,
             "headline_variant": HEADLINE_VARIANT,
             "headline_capital_usd": headline_cap,
-            "latency_grid_ms": [int(lat) for lat in latencies_ms],
+            "latency_grid_ms": labels,
+            "effective_latency_grid_ms": effective_latencies,
             "capture_variants": list(capture_variants)
             if capture_variants
             else available_variants,
@@ -404,9 +426,6 @@ def build_front_matter(
             "reveal_lag_ms": lag_ms,
         }
     )
-    if lag_ms:
-        _apply_reveal_lag(front_matter, lag_ms)
-    return front_matter
 
 
 def build_report(
@@ -723,6 +742,12 @@ def render_report(front_matter: Mapping[str, Any]) -> str:
         f"- Pre-registration git SHA: `{fm.get('prereg_sha') or ''}`",
         f"- Cells scanned (K): {fm.get('cells_K')}",
     ]
+    lag = _lag_of(fm)
+    if lag and verdict.headline_latency_ms is not None:
+        lines.append(
+            f"- Reveal lag: +{lag} ms; the headline is graded on data computed at "
+            f"L = {verdict.headline_latency_ms + lag} ms (report labels stay at L)"
+        )
     lines += ["", "## 4. Results"]
     lines += _render_results(fm, verdict, headline, sections)
     lines += ["", "## 5. Sanity checks"]
@@ -898,8 +923,11 @@ def _latency_table(fm: Mapping[str, Any], verdict: GradeResult) -> list[str]:
     run = _run_for_capital(fm, verdict.headline_capital_usd)
     oos = run.get("oos", []) if run else []
     variant = verdict.headline_variant or HEADLINE_VARIANT
-    headers = [
-        "L (ms)",
+    lag = _lag_of(fm)
+    headers = ["L (ms)"]
+    if lag:
+        headers.append("L+lag (ms)")
+    headers += [
         "episodes",
         "capture_rate",
         "usd/day (naive)",
@@ -915,19 +943,20 @@ def _latency_table(fm: Mapping[str, Any], verdict: GradeResult) -> list[str]:
         naive = _find_row(oos, lat, "naive")
         if row is None and naive is None:
             continue
-        rows.append(
-            [
-                str(lat),
-                str(_get_int(row or naive, "episodes")),
-                _fmt_pct(_get(row, "capture_rate")),
-                _fmt_usd(_get(naive, "usd_per_day")),
-                _fmt_usd(_get(row, "usd_per_day")),
-                _fmt_usd(_get(row, "usd_per_day_ci90_lo")),
-                _fmt_pct(_get(row, "apr")),
-                _fmt_num(_get(row, "markout_1s_median"), 2),
-                _fmt_num(_get(row, "markout_10s_median"), 2),
-            ]
-        )
+        cells = [str(lat)]
+        if lag:
+            cells.append(str(lat + lag))
+        cells += [
+            str(_get_int(row or naive, "episodes")),
+            _fmt_pct(_get(row, "capture_rate")),
+            _fmt_usd(_get(naive, "usd_per_day")),
+            _fmt_usd(_get(row, "usd_per_day")),
+            _fmt_usd(_get(row, "usd_per_day_ci90_lo")),
+            _fmt_pct(_get(row, "apr")),
+            _fmt_num(_get(row, "markout_1s_median"), 2),
+            _fmt_num(_get(row, "markout_10s_median"), 2),
+        ]
+        rows.append(cells)
     if not rows:
         return ["_No latency rows._"]
     return _markdown_table(headers, rows)
@@ -1217,9 +1246,11 @@ def sampled_coverage_pct(
     first-of-month days — and leave the intervals between them unsampled. Those
     intervals are sourcing gaps, not missing data, so they must never enter the
     coverage denominator: ``sampled_days`` is the denominator and
-    ``day_valid_fraction`` maps each sampled day to its valid share in ``[0, 1]``
-    (a day absent from the mapping counts as fully valid, the default). Raises
-    :class:`ReportError` on an empty day set or a fraction outside ``[0, 1]``.
+    ``day_valid_fraction`` must map **every** sampled day to its valid share in
+    ``[0, 1]`` (a missing day is an error, not a silent fully-valid day). A key
+    that is not one of the sampled days is also rejected, so an unlisted or
+    mistyped day cannot be ignored. Raises :class:`ReportError` on an empty day
+    set, a missing/extra key, or a fraction outside ``[0, 1]``.
     """
     days = list(sampled_days)
     if not days:
@@ -1228,6 +1259,10 @@ def sampled_coverage_pct(
         raise ReportError("sampled_days must not contain duplicates")
     if day_valid_fraction is None:
         return 1.0
+    sampled = set(days)
+    extra = sorted(str(day) for day in set(day_valid_fraction) - sampled)
+    if extra:
+        raise ReportError(f"day_valid_fraction has unsampled day(s): {extra}")
     total = 0.0
     for day in days:
         fraction = day_valid_fraction.get(day)
@@ -1676,6 +1711,10 @@ def _resolve_coverage(
     if coverage_pct is not None and day_coverage is not None:
         raise ReportError("pass coverage_pct or day_coverage, not both")
     if day_coverage is not None:
+        sampled = set(dates)
+        extra = sorted(str(day) for day in set(day_coverage) - sampled)
+        if extra:
+            raise ReportError(f"day_coverage has unsampled day(s): {extra}")
         return sampled_coverage_pct(dates, day_coverage)
     if coverage_pct is None:
         raise ReportError("coverage_pct or day_coverage is required")
@@ -1719,23 +1758,47 @@ def _validated_data_source(data_source: Any) -> str | None:
     return value
 
 
-def _apply_reveal_lag(front_matter: dict[str, Any], lag_ms: int) -> None:
-    """Shift every latency in ``front_matter`` up by ``lag_ms`` (§13.4).
+def _require_effective_latencies(
+    frames: Sequence[pl.DataFrame], effective_latencies: Sequence[int]
+) -> None:
+    """Raise unless every frame has capture data at each effective latency.
 
-    The §13.4 reveal lag is added to the grid, the headline and every metric
-    row's ``latency_ms`` together, so the latency table, the headline cell and
-    the grader all stay on the same (lagged) clock. ``reveal_lag_ms`` is stored
-    for transparency; the top-episode capture columns are already materialized by
-    latency and are not renamed.
+    The §13.4 reveal lag is applied where the episodes were **computed**, so a
+    lagged report is only valid if the study's table actually detected at
+    ``L + lag``. Relabelling a column computed at a lower latency would grade
+    data that was not available in time, so the report is refused instead.
     """
-    front_matter["headline_latency_ms"] = int(front_matter["headline_latency_ms"]) + lag_ms
-    front_matter["latency_grid_ms"] = [
-        int(value) + lag_ms for value in front_matter.get("latency_grid_ms", [])
-    ]
-    for block in front_matter.get("capital", []) or []:
-        for sample in ("in_sample", "oos"):
-            for row in block.get(sample, []) or []:
-                row["latency_ms"] = int(row["latency_ms"]) + lag_ms
+    wanted = sorted({int(lat) for lat in effective_latencies})
+    for frame in frames:
+        missing = [
+            lat
+            for lat in wanted
+            if not any(fmt.format(lat=lat) in frame.columns for fmt in _CAPTURED_FORMAT.values())
+        ]
+        if missing:
+            raise ReportError(
+                "reveal_lag_ms requires capture data computed at the effective "
+                f"latencies {wanted} ms, but {missing} ms are missing from the "
+                "episode table; detect episodes at L + lag instead of relabelling"
+            )
+
+
+def _relabel_latencies(rows: Sequence[dict[str, Any]], lag_ms: int) -> None:
+    """Move each metric row's computed ``latency_ms`` back to its reported label.
+
+    The row keeps the effective latency it was computed at in
+    ``effective_latency_ms`` so the report can show both ``L`` and ``L + lag``.
+    """
+    for row in rows:
+        effective = int(row["latency_ms"])
+        row["effective_latency_ms"] = effective
+        row["latency_ms"] = effective - lag_ms
+
+
+def _lag_of(front_matter: Mapping[str, Any]) -> int:
+    """The positive reveal lag recorded in the front-matter (0 when absent)."""
+    value = _optional_float(front_matter.get("reveal_lag_ms"))
+    return int(value) if value is not None and value > 0 else 0
 
 
 def _optional_float(value: Any) -> float | None:
@@ -1919,6 +1982,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     out = Path(args.out)
     try:
+        if args.data_source == BACKFILL and not args.all_dates:
+            # Deriving the sampled days from the parquet drops sampled days with
+            # no episode, which would inflate days and coverage (B-9 fix).
+            raise ReportError(
+                "--data-source backfill requires --all-dates with the explicit "
+                "sampled day list; the parquet's dates would lose zero-episode days"
+            )
         frame = pl.read_parquet(args.episodes)
         dates = _cli_sampled_dates(args.all_dates, frame)
         day_coverage = _cli_day_coverage(args.day_coverage)
