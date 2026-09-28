@@ -12,7 +12,9 @@ live here once. Every physical partition also carries two provenance columns:
 The §13.1 columns are exactly as specified; only ``source`` and ``fidelity`` are
 appended. All prices and sizes are ``float64`` (research only, SPEC-0008 §13.1);
 timestamps are int64 nanoseconds plus ``ts_exch_ms`` where the venue provides an
-exchange timestamp.
+exchange timestamp. ``bars`` is the one table whose §13.1 columns already include
+``source(mid/trade/candle)``; that column doubles as its provenance value
+(``candle`` for the B-3 REST candle backfill), so it is not duplicated.
 
 Physical layout. A normalizer writes
 ``{root}/{table}/date=YYYY-MM-DD/{source}*.parquet``: one part file per input
@@ -105,21 +107,58 @@ BASE_SCHEMAS: dict[str, dict[str, pl.DataType]] = {
         "end_ns": pl.Int64,
         "reason": pl.String,
     },
+    "funding_hist": {
+        "time_ms": pl.Int64,
+        "market": pl.String,
+        "funding_rate": pl.Float64,
+        "premium": pl.Float64,
+    },
+    "markets": {
+        "snapshot_t_ns": pl.Int64,
+        "market": pl.String,
+        "kind": pl.String,
+        "dex": pl.String,
+        "base": pl.String,
+        "quote": pl.String,
+        "asset_id": pl.Int64,
+        "sz_decimals": pl.Int64,
+        "max_leverage": pl.Int64,
+    },
+    # ``bars`` already has the §13.1 ``source(mid/trade/candle)`` column; for this
+    # table that column *is* the provenance marker, so ``schema`` does not append
+    # a second ``source`` (see below). ``fidelity`` is still appended.
+    "bars": {
+        "t_open_ms": pl.Int64,
+        "interval": pl.String,
+        "venue": pl.String,
+        "market": pl.String,
+        "open": pl.Float64,
+        "high": pl.Float64,
+        "low": pl.Float64,
+        "close": pl.Float64,
+        "volume": pl.Float64,
+        "n_trades": pl.Int64,
+        "source": pl.String,
+    },
 }
 
 
 def columns(table: str) -> list[str]:
-    """Return the §13.1 columns of ``table`` plus the two provenance columns."""
-    return [*BASE_SCHEMAS[table], SOURCE_COLUMN, FIDELITY_COLUMN]
+    """Return the §13.1 columns of ``table`` plus the provenance columns."""
+    return list(schema(table))
 
 
 def schema(table: str) -> dict[str, pl.DataType]:
     """Return the full polars schema of ``table``, in column order.
 
-    The §13.1 columns come first, then ``source`` and ``fidelity``.
+    The §13.1 columns come first, then ``source`` and ``fidelity``. The one
+    exception is ``bars``: its §13.1 ``source(mid/trade/candle)`` column already
+    carries the provenance value (§13.11), so only ``fidelity`` is appended and
+    ``source`` appears once.
     """
     base = dict(BASE_SCHEMAS[table])
-    base[SOURCE_COLUMN] = pl.String
+    if SOURCE_COLUMN not in base:
+        base[SOURCE_COLUMN] = pl.String
     base[FIDELITY_COLUMN] = pl.String
     return base
 

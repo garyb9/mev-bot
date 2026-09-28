@@ -53,6 +53,22 @@ A `SegmentError` from a finished segment means the recorder reported the file as
 complete but the bytes are truncated or corrupted: surface it, don't skip it
 (SPEC-0008 G-1/G-4).
 
+## HL REST backfill (B-3)
+
+`hlr/backfill/hl_rest.py` (console script `hlr-hl-rest`) backfills
+`funding_hist`, `bars(source="candle")` and `markets` from Hyperliquid's public
+`POST /info` endpoint. No keys are ever used. It is resumable and idempotent
+(merge-dedupe per date partition, state in `hl_rest_state.json`) and meters the
+documented REST weight through a token bucket with backoff.
+
+```sh
+uv run hlr-hl-rest backfill --out research/data/parquet   # one-shot
+uv run hlr-hl-rest poll --out research/data/parquet       # scheduled daily 1m/5m
+```
+
+See [`../deploy/research/hl-rest-poller.md`](../deploy/research/hl-rest-poller.md)
+for the daily cron entry (nothing is installed automatically).
+
 ## Tests
 
 ```sh

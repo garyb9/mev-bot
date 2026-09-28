@@ -976,7 +976,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | P-7 | Read-only import of finsnap's `option_snapshots` history (for O9a) | T3 | S | P-2, V-9, T3 gate | ☐ |
 | B-1 | Tardis free-days downloader | T1 | S | P-1 | ✅ |
 | B-2 | Tardis → §13.1 normalizer with symbol mapping | T1 | M | B-1, P-1 | ✅ |
-| B-3 | HL REST funding + candles backfill + daily 1m candle poller | T1 | S | P-2 | ☐ |
+| B-3 | HL REST funding + candles backfill + daily 1m candle poller | T1 | S | P-2 | ✅ |
 | B-4 | Binance/Bybit public dumps | T1 | M | P-2 | ☐ |
 | B-5 | Hydromancer Reservoir (**owner AWS account**) | T1 | M | B-2, owner approval | ☐ |
 | B-6 | Official HL S3 archives (**owner AWS account**; completes V-8) | T1 | M–L | owner approval | ☐ |
