@@ -263,11 +263,11 @@ def test_preliminary_cannot_pass(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("robust", [None, 0.0, -1.0])
-def test_non_robust_cannot_pass(tmp_path: Path, robust: float | None) -> None:
+def test_non_robust_is_fail(tmp_path: Path, robust: float | None) -> None:
     result = grade_study(
         make_fm(apr=0.5, ci_lo=0.5, robust=robust), thresholds=thresholds(tmp_path)
     )
-    assert result.verdict == MARGINAL
+    assert result.verdict == FAIL
     assert any("robustness" in reason for reason in result.reasons)
 
 

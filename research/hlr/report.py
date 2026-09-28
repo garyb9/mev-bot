@@ -30,10 +30,10 @@ False-PASS paths are closed: the headline cell must be exactly ``adj_jitter`` at
 the smallest grid latency >= the threshold headline (INCONCLUSIVE otherwise),
 and the headline capital must have been run (no nearest-match); data provenance
 is derived from the tables' ``source`` column (anything but ``recorder`` is
-backfill), a ``HIST-PRELIM`` report, a preliminary report, and a report whose
-buffered-cost robustness re-run does not stay positive are all capped at
-MARGINAL; and a report whose episode parquet no longer matches its stored
-sha256 digest is INCONCLUSIVE.
+backfill), a ``HIST-PRELIM`` or preliminary report is capped at MARGINAL, a
+report whose buffered-cost robustness re-run does not stay positive is FAIL, and
+a report whose episode parquet no longer matches its stored sha256 digest is
+INCONCLUSIVE.
 
 This is research code. It is never imported by, or deployed with, the bot; it
 reads no keys and no network.
@@ -526,9 +526,9 @@ def _grade_cell(
 ) -> str:
     """Apply the §13.6 quality gates and APR tier, then the PASS caps.
 
-    Quality failures (episodes/day, concentration, coverage) are FAIL. A PASS also
-    requires the robustness re-run to stay positive, and is capped at MARGINAL for
-    a HIST-PRELIM report, a preliminary report, or a non-robust one.
+    Any failed quality gate (episodes/day, concentration, coverage, robustness)
+    is FAIL. A PASS is capped at MARGINAL for a HIST-PRELIM report and for a
+    preliminary (fewer than 14 valid days) report.
     """
     quality_ok = True
     if episodes_per_day is None:
@@ -556,6 +556,12 @@ def _grade_cell(
         reasons.append(
             f"coverage {coverage:.3f} < {thresholds.quality.min_coverage_pct}"
         )
+    if robust_usd_per_day is None or robust_usd_per_day <= 0.0:
+        quality_ok = False
+        reasons.append(
+            "robustness check failed or missing; usd_per_day at buffered costs "
+            "must stay > 0"
+        )
 
     if apr is None or apr_ci_lo is None:
         reasons.append("missing APR / CI")
@@ -571,12 +577,6 @@ def _grade_cell(
             return MARGINAL
         if preliminary:
             reasons.append("preliminary report cannot PASS; needs >= 14 valid days")
-            return MARGINAL
-        if robust_usd_per_day is None or robust_usd_per_day <= 0.0:
-            reasons.append(
-                "robustness check failed or missing; usd_per_day at buffered costs "
-                "must stay > 0"
-            )
             return MARGINAL
         return PASS
     reasons.append(
