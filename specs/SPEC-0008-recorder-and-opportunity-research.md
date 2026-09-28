@@ -967,7 +967,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | R-9 | HyperEVM pool source | T2 | L | R-6, V-5, V-6 (+ SPEC-0009 node or a provider) | ☐ |
 | R-10 | Deploy recorder (systemd, chrony, runbook, optional shipping) | T1 | M | R-6, R-7, V-4 | ☐ |
 | R-11 | Options-chain sources: `yahoo-options` chains (all fields) + optional `finsnap` `/snap` poller | T3-data | S | R-5, V-9 | ☐ |
-| R-12 | `deribit` options summary source | T3-data | S | R-5, V-10 | ☐ |
+| R-12 | `deribit` options summary source | T3-data | S | R-5, V-10 | 🔄 |
 | R-13 | `equities` real-time quote source | T1 | M | R-3, V-11 | ☐ |
 | P-1 | `research/` scaffold + segment reader in Python | T1 | S | R-2 (format frozen) | ✅ |
 | P-2 | Normalizer → Parquet tables (§13.1) | T1 | M | P-1, V-1 | ✅ |
