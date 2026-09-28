@@ -37,6 +37,16 @@ const PAGE_TOLERANCE_MS: u64 = 60_000;
 /// Maximum time range covered by one `candleSnapshot` page.
 const CANDLE_PAGE_MS: u64 = 6 * 3_600 * 1_000;
 
+/// Maximum `fundingHistory` items returned by one call (SPEC-0008 §8, V-1).
+const FUNDING_MAX_PAGE: u32 = 500;
+
+/// Pre-charged weight for a `fundingHistory` request (SPEC-0008 §8, V-1).
+///
+/// The weight is `20 + 1 per 20 items returned`, but the item count is only
+/// known after the response. `candle_weight` likewise charges the page's
+/// maximum up front, so charge the 500-item maximum: `20 + 500 / 20 = 45`.
+const FUNDING_WEIGHT: u32 = 20 + FUNDING_MAX_PAGE / 20;
+
 /// First retry delay after a failed or dropped request.
 const RETRY_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 
@@ -520,7 +530,7 @@ impl RestSnapshotter {
                 20,
                 Some(self.config.predicted_fundings_interval),
             ),
-            JobKey::Funding(coin) => (self.funding_request(coin), 20, None),
+            JobKey::Funding(coin) => (self.funding_request(coin), FUNDING_WEIGHT, None),
             JobKey::Candles(coin, interval) => {
                 let start = self.candle_start(coin, interval);
                 let end = start + CANDLE_PAGE_MS;
@@ -744,11 +754,12 @@ fn interval_ms(interval: &str) -> u64 {
     }
 }
 
-/// Weight for a candle page: 20 plus 20 per 60 candles (SPEC-0008 §8).
+/// Weight for a candle page: 20 plus 1 per 60 candles in the window
+/// (SPEC-0008 §8; V-1 verified `20 + 1 per 60 items returned`).
 fn candle_weight(interval: &str, start_ms: u64, end_ms: u64) -> u32 {
     let step = interval_ms(interval).max(1);
     let candles = end_ms.saturating_sub(start_ms) / step;
-    20 + (20 * (candles / 60)) as u32
+    20 + (candles / 60) as u32
 }
 
 #[cfg(test)]
@@ -1007,8 +1018,25 @@ mod tests {
 
     #[test]
     fn candle_weight_adds_surcharge() {
-        assert_eq!(candle_weight("1m", 0, 6 * 3_600_000), 20 + 20 * 6);
+        // V-1: `20 + 1 per 60 items`; 6 h of 1m is 360 candles -> 20 + 6.
+        assert_eq!(candle_weight("1m", 0, 6 * 3_600_000), 26);
         assert_eq!(candle_weight("1h", 0, 6 * 3_600_000), 20);
+    }
+
+    #[test]
+    fn funding_weight_charges_the_page_maximum() {
+        // V-1: `20 + 1 per 20 items`; the page max is 500 -> 20 + 25.
+        assert_eq!(FUNDING_WEIGHT, 45);
+        let tmp = temp_dir("funding-weight");
+        let config = SnapshotterConfig {
+            out_dir: tmp.path().to_path_buf(),
+            funding_coins: vec!["BTC".into()],
+            ..SnapshotterConfig::default()
+        };
+        let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
+        let snapshotter = RestSnapshotter::new(config, Arc::new(NoopSink), clock).unwrap();
+        let job = snapshotter.build_job(JobKey::Funding("BTC".into()), Instant::now());
+        assert_eq!(job.weight, 45);
     }
 
     #[test]

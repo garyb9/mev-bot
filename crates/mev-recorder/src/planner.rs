@@ -123,9 +123,10 @@ impl fmt::Display for Subscription {
 
 /// A per-coin day-notional-volume index used to rank `*:top:N` selectors.
 ///
-/// Perp volumes come from `metaAndAssetCtxs`; spot volumes from
-/// `spotMetaAndAssetCtxs` (shape ⚠ verify V-1). Coins absent from the index
-/// rank last (volume treated as zero).
+/// Perp volumes come from `metaAndAssetCtxs` (positionally aligned with
+/// `meta.universe`); spot volumes from `spotMetaAndAssetCtxs`, whose `ctxs` are
+/// indexed by the spot pair `index` (V-1, 2026-09-28). Coins absent from the
+/// index rank last (volume treated as zero).
 #[derive(Debug, Clone, Default)]
 pub struct VolumeIndex {
     volumes: BTreeMap<String, Decimal>,

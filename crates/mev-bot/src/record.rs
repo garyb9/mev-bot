@@ -62,6 +62,8 @@ const CONNECT_RETRY: Duration = Duration::from_secs(3);
 const FUNDING_BACKFILL_DAYS: u64 = 30;
 /// Candle backfill window on a fresh state file (1m history is short).
 const CANDLE_BACKFILL_DAYS: u64 = 7;
+/// Maximum `fundingHistory` items returned by one call (SPEC-0008 §8, V-1).
+const FUNDING_MAX_PAGE: u32 = 500;
 
 // ---------------------------------------------------------------------------
 // Configuration (config/record.toml)
@@ -279,8 +281,10 @@ impl Universe {
         let map = AssetMap::load(&info, include_hip3).await?;
         let spot_meta = info.spot_meta().await?;
         let mut volumes = VolumeIndex::from_perp_ctxs(&info.meta_and_asset_ctxs().await?);
-        // Spot volumes: `spotMetaAndAssetCtxs` rows align positionally with
-        // `spotMeta.universe` (shape ⚠ verify V-1). Missing volumes rank last.
+        // Spot volumes: `spotMetaAndAssetCtxs.ctxs` is indexed by the spot pair
+        // `index`, not by position in `spotMeta.universe` (V-1, 2026-09-28), so
+        // matching `market.index == ctxs position` joins on that index. Missing
+        // volumes rank last.
         if let Ok(value) = info
             .info::<Value>(json!({ "type": "spotMetaAndAssetCtxs" }))
             .await
@@ -941,31 +945,39 @@ impl EnvelopeSink for CountingSink {
 }
 
 /// The §8 weight of a `/info` request, mirroring the snapshotter's schedule.
+///
+/// Weights follow the V-1 facts (2026-09-28): `candleSnapshot` is
+/// `20 + 1 per 60 items returned`, and `fundingHistory` is
+/// `20 + 1 per 20 items returned`, pre-charged by its 500-item page maximum
+/// (`20 + 25`) because the item count is not known before the response.
 fn request_weight(request: &Value) -> u32 {
-    if request.get("type").and_then(Value::as_str) != Some("candleSnapshot") {
-        return 20;
+    match request.get("type").and_then(Value::as_str) {
+        Some("fundingHistory") => 20 + FUNDING_MAX_PAGE / 20,
+        Some("candleSnapshot") => {
+            let req = request.get("req");
+            let interval = req
+                .and_then(|req| req.get("interval"))
+                .and_then(Value::as_str)
+                .unwrap_or("1m");
+            let start = req
+                .and_then(|req| req.get("startTime"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let end = req
+                .and_then(|req| req.get("endTime"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let step = match interval {
+                "1m" => 60_000,
+                "5m" => 300_000,
+                "1h" => 3_600_000,
+                _ => 60_000,
+            };
+            let candles = end.saturating_sub(start) / step.max(1);
+            20 + (candles / 60) as u32
+        }
+        _ => 20,
     }
-    let req = request.get("req");
-    let interval = req
-        .and_then(|req| req.get("interval"))
-        .and_then(Value::as_str)
-        .unwrap_or("1m");
-    let start = req
-        .and_then(|req| req.get("startTime"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let end = req
-        .and_then(|req| req.get("endTime"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let step = match interval {
-        "1m" => 60_000,
-        "5m" => 300_000,
-        "1h" => 3_600_000,
-        _ => 60_000,
-    };
-    let candles = end.saturating_sub(start) / step.max(1);
-    20 + (20 * (candles / 60)) as u32
 }
 
 /// Run the REST snapshotter until `shutdown` is notified, then finalize.
@@ -1165,6 +1177,27 @@ fn base64_encode(bytes: &[u8]) -> String {
 // Clock discipline (SPEC-0008 §11)
 // ---------------------------------------------------------------------------
 
+/// Parse a `chronyc -c tracking` CSV line into `(offset_ns, stratum)`.
+///
+/// The verified column order (V-1, 2026-09-28) is `RefID, RefName, Stratum,
+/// RefTime, SystemTime, LastOffset, …`; `SystemTime` (the current offset in
+/// seconds, `0.000012345` ≈ 12.3 µs) is column **4**. A line with fewer than
+/// five columns is malformed and returns `None` rather than panicking.
+fn parse_chrony_tracking(line: &str) -> Option<(Option<i64>, Option<u8>)> {
+    let columns: Vec<&str> = line.split(',').collect();
+    // `SystemTime` (index 4) is the offset; index 3 is the RefTime epoch.
+    let system_time = columns.get(4)?;
+    let offset_ns = system_time
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|seconds| (seconds * 1_000_000_000.0) as i64);
+    let stratum = columns
+        .get(2)
+        .and_then(|value| value.trim().parse::<u8>().ok());
+    Some((offset_ns, stratum))
+}
+
 /// Read the chrony offset/stratum via `chronyc -c tracking`, if available.
 async fn chrony_tracking() -> (Option<i64>, Option<u8>) {
     let parsed = tokio::task::spawn_blocking(|| {
@@ -1177,17 +1210,7 @@ async fn chrony_tracking() -> (Option<i64>, Option<u8>) {
         }
         let text = String::from_utf8(output.stdout).ok()?;
         let line = text.lines().next()?;
-        let columns: Vec<&str> = line.split(',').collect();
-        // `chronyc -c tracking` columns: RefID, Name, Stratum, System time,
-        // Last offset, ... (⚠ verify the column order).
-        let stratum = columns
-            .get(2)
-            .and_then(|value| value.trim().parse::<u8>().ok());
-        let offset_ns = columns
-            .get(3)
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .map(|seconds| (seconds * 1_000_000_000.0) as i64);
-        Some((offset_ns, stratum))
+        parse_chrony_tracking(line)
     })
     .await
     .ok()
@@ -1472,6 +1495,62 @@ mod tests {
             authority("http://127.0.0.1:8080/info").unwrap(),
             ("127.0.0.1".to_string(), 8080)
         );
+    }
+
+    #[test]
+    fn chrony_tracking_reads_system_time_column() {
+        // Realistic `chronyc -c tracking` order (V-1): RefID, RefName, Stratum,
+        // RefTime, SystemTime, LastOffset, …. SystemTime is column 4.
+        let line = "C0000000,time.cloudflare.com,3,1790000000.123,0.000012345,\
+                    0.000004,0.000006,12.345,0.001,-0.000123,0.012345,0.006789,8.0,Normal";
+        let (offset_ns, stratum) = parse_chrony_tracking(line).expect("well-formed line");
+        assert_eq!(offset_ns, Some(12_345));
+        assert_eq!(stratum, Some(3));
+    }
+
+    #[test]
+    fn chrony_tracking_rejects_short_lines() {
+        assert_eq!(
+            parse_chrony_tracking("C0000000,time.cloudflare.com,3"),
+            None
+        );
+        assert_eq!(parse_chrony_tracking(""), None);
+    }
+
+    #[test]
+    fn request_weight_matches_v1_weights() {
+        // fundingHistory: `20 + 1 per 20 items`, pre-charged at the 500-item max.
+        assert_eq!(
+            request_weight(&serde_json::json!({
+                "type": "fundingHistory",
+                "coin": "BTC",
+                "startTime": 0,
+            })),
+            20 + 25
+        );
+        // candleSnapshot: `20 + 1 per 60 items` over the requested window; 6 h of
+        // 1m is 360 candles -> 26.
+        assert_eq!(
+            request_weight(&serde_json::json!({
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": "BTC",
+                    "interval": "1m",
+                    "startTime": 0,
+                    "endTime": 21_600_000,
+                },
+            })),
+            26
+        );
+        // 6 h of 1h is 6 candles -> base weight only.
+        assert_eq!(
+            request_weight(&serde_json::json!({
+                "type": "candleSnapshot",
+                "req": { "interval": "1h", "startTime": 0, "endTime": 21_600_000 },
+            })),
+            20
+        );
+        assert_eq!(request_weight(&serde_json::json!({ "type": "meta" })), 20);
     }
 
     /// End-to-end wiring test: a mock WS server and a mock REST server feed the
