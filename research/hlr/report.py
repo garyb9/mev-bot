@@ -35,15 +35,32 @@ report whose buffered-cost robustness re-run does not stay positive is FAIL, and
 a report whose episode parquet no longer matches its stored sha256 digest is
 INCONCLUSIVE.
 
+Backfill plumbing (task B-9, §13.4, §13.11):
+
+* A study may force the historical lane with ``data_source="backfill"`` (the
+  ``hlr-report --data-source backfill`` flag). It can only ever *demote* a study:
+  ``forward`` cannot be asserted, because forward vs backfill is decided by the
+  input tables' ``source`` column alone. A backfill report is marked preliminary
+  and its §13.7 header is stamped ``PRELIMINARY (backfill: <sources>)``.
+* ``days`` and ``coverage_pct`` are computed over the **sampled** days only. A
+  sparse backfill (for example Tardis first-of-month days) has gaps between its
+  sampled days; those are sourcing gaps, not missing data, so they never enter
+  the denominator (:func:`sampled_coverage_pct`).
+* ``reveal_lag_ms`` shifts every latency in the report (grid, headline and every
+  metric row) by the measured HL publish lag, because historical data carries
+  the exchange timestamp rather than our receive time.
+
 This is research code. It is never imported by, or deployed with, the bot; it
 reads no keys and no network.
 """
 
 from __future__ import annotations
 
+import argparse
 import datetime as _dt
 import hashlib
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +86,7 @@ from hlr.thresholds import (
 )
 
 __all__ = [
+    "BACKFILL",
     "HIST_PRELIM",
     "INCONCLUSIVE",
     "RANKING_FILENAME",
@@ -82,11 +100,13 @@ __all__ = [
     "episode_provenance",
     "grade_study",
     "is_forward",
+    "main",
     "parse_front_matter",
     "rank_studies",
     "render_front_matter",
     "render_ranking",
     "render_report",
+    "sampled_coverage_pct",
     "top_episodes",
     "valid_backfill_sources",
     "write_daily_chart",
@@ -96,6 +116,8 @@ __all__ = [
 INCONCLUSIVE = "INCONCLUSIVE"
 #: The §13.11 qualifier for a result from the historical backfill lane.
 HIST_PRELIM = "HIST-PRELIM"
+#: The historical backfill lane a study may force (never to ``forward``).
+BACKFILL = "backfill"
 #: The generated ranking file name inside the reports directory.
 RANKING_FILENAME = "RANKING.md"
 
@@ -212,10 +234,11 @@ def build_front_matter(
     hypothesis: str,
     implementation_cost: str,
     days: int,
-    coverage_pct: float,
     capital_runs: Mapping[float, pl.DataFrame],
     max_notional: Mapping[float, float],
     all_dates: Sequence[_dt.date],
+    coverage_pct: float | None = None,
+    day_coverage: Mapping[_dt.date, float] | None = None,
     prereg_sha: str = "",
     cells_k: int | None = None,
     preliminary: bool = False,
@@ -230,6 +253,8 @@ def build_front_matter(
     bootstrap_draws: int = 2000,
     bootstrap_seed: int = 0,
     sections: Mapping[str, Any] | None = None,
+    data_source: str | None = None,
+    reveal_lag_ms: int = 0,
 ) -> dict[str, Any]:
     """Compute the §13.5 metrics and assemble a study's report front-matter.
 
@@ -246,6 +271,13 @@ def build_front_matter(
     ``backfill``, which makes the verdict ``HIST-PRELIM`` (§13.11). The canonical
     episode digest (and optional parquet path) let ``hlr-rank`` detect a report
     that no longer matches its data.
+
+    ``coverage_pct`` (given directly) or ``day_coverage`` (per sampled day, see
+    :func:`sampled_coverage_pct`) supplies the §13.5 coverage; exactly one is
+    required. ``data_source`` may force ``"backfill"`` (or ``"unknown"``) but can
+    never force ``"forward"``: forward provenance is decided by the input tables'
+    ``source`` column only, and a forced/mixed backfill study is preliminary.
+    ``reveal_lag_ms`` shifts every latency in the report by that lag (§13.4).
     """
     if implementation_cost not in _IMPL_ORDER:
         raise ReportError(
@@ -256,10 +288,22 @@ def build_front_matter(
     dates = _clean_dates(all_dates, "all_dates")
     if days != len(dates):
         raise ReportError(f"days ({days}) must equal len(all_dates) ({len(dates)})")
+    coverage = _resolve_coverage(coverage_pct, day_coverage, dates)
+    lag_ms = _validated_reveal_lag(reveal_lag_ms)
+    forced_source = _validated_data_source(data_source)
     in_sample, out_sample = oos_split(dates)
     sorted_capitals = sorted(float(c) for c in capital_runs)
     provenance_frames = list(capital_runs.values()) + list((robustness_runs or {}).values())
     data_source, backfill_sources, derived_fidelity = episode_provenance(provenance_frames)
+    if forced_source is not None:
+        if forced_source == BACKFILL:
+            data_source, derived_fidelity = BACKFILL, (
+                derived_fidelity if derived_fidelity is not None else fidelity_class
+            )
+        else:
+            data_source, backfill_sources, derived_fidelity = "unknown", (), None
+    if data_source == BACKFILL:
+        preliminary = True
     _require_dates_in_all_dates(provenance_frames, dates)
 
     capital_blocks: list[dict[str, Any]] = []
@@ -328,7 +372,7 @@ def build_front_matter(
             HEADLINE_VARIANT,
         )
 
-    return _json_safe(
+    front_matter = _json_safe(
         {
             "spec": "SPEC-0008",
             "study_id": study_id,
@@ -337,7 +381,7 @@ def build_front_matter(
             "hypothesis": hypothesis,
             "implementation_cost": implementation_cost,
             "days": days,
-            "coverage_pct": float(coverage_pct),
+            "coverage_pct": float(coverage),
             "prereg_sha": prereg_sha,
             "cells_K": cells_k,
             "preliminary": bool(preliminary),
@@ -357,8 +401,12 @@ def build_front_matter(
             "oos_dates": [day.isoformat() for day in out_sample],
             "capital": capital_blocks,
             "sections": merged,
+            "reveal_lag_ms": lag_ms,
         }
     )
+    if lag_ms:
+        _apply_reveal_lag(front_matter, lag_ms)
+    return front_matter
 
 
 def build_report(
@@ -653,7 +701,12 @@ def render_report(front_matter: Mapping[str, Any]) -> str:
 
     lines: list[str] = [render_front_matter(fm).rstrip("\n"), ""]
     lines.append(f"# {fm.get('study_id')} — {fm.get('title')}")
-    if verdict.qualifier:
+    stamp = _preliminary_stamp(fm)
+    if stamp and verdict.qualifier:
+        lines += ["", f"> **{stamp}** — {verdict.qualifier}"]
+    elif stamp:
+        lines += ["", f"> **{stamp}**"]
+    elif verdict.qualifier:
         lines += ["", f"> **PRELIMINARY ({verdict.qualifier})**"]
     lines += ["", "## 1. Hypothesis", "", str(fm.get("hypothesis") or "")]
     lines += ["", "## 2. Data"]
@@ -1150,8 +1203,48 @@ def episode_provenance(
     non_recorder = tuple(sorted(source for source in sources if source != "recorder"))
     fidelity_class = ", ".join(sorted(fidelities)) if fidelities else None
     if non_recorder:
-        return "backfill", non_recorder, fidelity_class
+        return BACKFILL, non_recorder, fidelity_class
     return "forward", (), fidelity_class
+
+
+def sampled_coverage_pct(
+    sampled_days: Sequence[_dt.date],
+    day_valid_fraction: Mapping[_dt.date, float] | None = None,
+) -> float:
+    """Mean valid-time share over the **sampled** days only (§13.5, B-9).
+
+    Historical backfills sample discrete days — for example the Tardis
+    first-of-month days — and leave the intervals between them unsampled. Those
+    intervals are sourcing gaps, not missing data, so they must never enter the
+    coverage denominator: ``sampled_days`` is the denominator and
+    ``day_valid_fraction`` maps each sampled day to its valid share in ``[0, 1]``
+    (a day absent from the mapping counts as fully valid, the default). Raises
+    :class:`ReportError` on an empty day set or a fraction outside ``[0, 1]``.
+    """
+    days = list(sampled_days)
+    if not days:
+        raise ReportError("sampled_days must not be empty")
+    if len(set(days)) != len(days):
+        raise ReportError("sampled_days must not contain duplicates")
+    if day_valid_fraction is None:
+        return 1.0
+    total = 0.0
+    for day in days:
+        fraction = day_valid_fraction.get(day)
+        if fraction is None:
+            raise ReportError(f"day_valid_fraction is missing sampled day {day}")
+        try:
+            value = float(fraction)
+        except (TypeError, ValueError) as err:
+            raise ReportError(
+                f"day_valid_fraction[{day}] must be numeric, got {fraction!r}"
+            ) from err
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ReportError(
+                f"day_valid_fraction[{day}] must be in [0, 1], got {fraction!r}"
+            )
+        total += value
+    return total / len(days)
 
 
 def _require_dates_in_all_dates(
@@ -1408,6 +1501,20 @@ def _qualifier(front_matter: Mapping[str, Any]) -> str:
     return f"{HIST_PRELIM} ({'; '.join(parts)})" if parts else HIST_PRELIM
 
 
+def _preliminary_stamp(front_matter: Mapping[str, Any]) -> str | None:
+    """The §13.7 ``PRELIMINARY (backfill: <sources>)`` stamp, or ``None``.
+
+    Only a ``backfill``-sourced study is stamped; a forward preliminary report
+    (fewer than 14 days) or an ``unknown`` provenance study carries the
+    ``HIST-PRELIM`` qualifier alone.
+    """
+    if str(front_matter.get("data_source", "unknown")) != BACKFILL:
+        return None
+    sources = valid_backfill_sources(front_matter)
+    names = ", ".join(sources) if sources else "unspecified"
+    return f"PRELIMINARY (backfill: {names})"
+
+
 # --------------------------------------------------------------------------
 # Formatting helpers
 # --------------------------------------------------------------------------
@@ -1555,6 +1662,82 @@ def _clean_dates(dates: Sequence[_dt.date], where: str) -> list[_dt.date]:
     return values
 
 
+def _resolve_coverage(
+    coverage_pct: float | None,
+    day_coverage: Mapping[_dt.date, float] | None,
+    dates: Sequence[_dt.date],
+) -> float:
+    """Return the §13.5 coverage from either an explicit value or per-day shares.
+
+    Exactly one source is required. With per-day shares the coverage is the mean
+    over the sampled ``dates`` only (:func:`sampled_coverage_pct`); an explicit
+    ``coverage_pct`` is normalized to a finite fraction in ``[0, 1]``.
+    """
+    if coverage_pct is not None and day_coverage is not None:
+        raise ReportError("pass coverage_pct or day_coverage, not both")
+    if day_coverage is not None:
+        return sampled_coverage_pct(dates, day_coverage)
+    if coverage_pct is None:
+        raise ReportError("coverage_pct or day_coverage is required")
+    value = _as_float(coverage_pct)
+    if not 0.0 <= value <= 1.0:
+        raise ReportError(f"coverage_pct must be in [0, 1], got {coverage_pct!r}")
+    return value
+
+
+def _validated_reveal_lag(reveal_lag_ms: Any) -> int:
+    """Return a finite, non-negative, whole-millisecond reveal lag.
+
+    A negative, non-numeric, fractional or non-finite lag is a :class:`ReportError`
+    (a study parameter cannot silently round or invert the latency shift)."""
+    if isinstance(reveal_lag_ms, bool) or not isinstance(reveal_lag_ms, (int, float)):
+        raise ReportError(f"reveal_lag_ms must be a number, got {reveal_lag_ms!r}")
+    value = float(reveal_lag_ms)
+    if not math.isfinite(value) or value < 0.0 or value != int(value):
+        raise ReportError(
+            f"reveal_lag_ms must be a non-negative whole number, got {reveal_lag_ms!r}"
+        )
+    return int(value)
+
+
+def _validated_data_source(data_source: Any) -> str | None:
+    """Return the forced historical lane, or ``None`` to derive it from the data.
+
+    Only ``"backfill"`` and ``"unknown"`` may be forced. ``forward`` is decided by
+    the tables' ``source`` column alone, so asserting it is rejected rather than
+    trusted (a flag can only ever demote a study)."""
+    if data_source is None:
+        return None
+    if not isinstance(data_source, str):
+        raise ReportError(f"data_source must be a string, got {data_source!r}")
+    value = data_source.strip().lower()
+    if value not in (BACKFILL, "unknown"):
+        raise ReportError(
+            "data_source may only force 'backfill' or 'unknown'; forward provenance "
+            "is derived from the source column"
+        )
+    return value
+
+
+def _apply_reveal_lag(front_matter: dict[str, Any], lag_ms: int) -> None:
+    """Shift every latency in ``front_matter`` up by ``lag_ms`` (§13.4).
+
+    The §13.4 reveal lag is added to the grid, the headline and every metric
+    row's ``latency_ms`` together, so the latency table, the headline cell and
+    the grader all stay on the same (lagged) clock. ``reveal_lag_ms`` is stored
+    for transparency; the top-episode capture columns are already materialized by
+    latency and are not renamed.
+    """
+    front_matter["headline_latency_ms"] = int(front_matter["headline_latency_ms"]) + lag_ms
+    front_matter["latency_grid_ms"] = [
+        int(value) + lag_ms for value in front_matter.get("latency_grid_ms", [])
+    ]
+    for block in front_matter.get("capital", []) or []:
+        for sample in ("in_sample", "oos"):
+            for row in block.get(sample, []) or []:
+                row["latency_ms"] = int(row["latency_ms"]) + lag_ms
+
+
 def _optional_float(value: Any) -> float | None:
     """Return ``value`` as a finite float, or ``None`` for missing/non-finite."""
     if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1609,3 +1792,170 @@ def write_daily_chart(daily: pl.DataFrame, path: Path, *, title: str = "") -> Pa
     figure.savefig(path, dpi=100)
     plt.close(figure)
     return path
+
+
+# --------------------------------------------------------------------------
+# CLI (task B-9)
+# --------------------------------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the ``hlr-report`` argument parser (task B-9)."""
+    parser = argparse.ArgumentParser(
+        prog="hlr-report",
+        description=(
+            "Build a SPEC-0008 §13.7 study report from a detected-episode parquet. "
+            "Sampled days and coverage come from the data/flags; --data-source "
+            "backfill and --reveal-lag-ms are the B-9 study parameters."
+        ),
+    )
+    parser.add_argument("--study-id", required=True, help="e.g. O7")
+    parser.add_argument("--slug", required=True, help="report filename slug")
+    parser.add_argument("--title", required=True)
+    parser.add_argument("--hypothesis", default="")
+    parser.add_argument(
+        "--implementation-cost", default="M", choices=("S", "M", "L")
+    )
+    parser.add_argument(
+        "--episodes", required=True, metavar="PATH", help="detected-episode parquet"
+    )
+    parser.add_argument("--capital-usd", type=float, required=True)
+    parser.add_argument("--max-notional", type=float, required=True)
+    parser.add_argument(
+        "--coverage-pct",
+        type=float,
+        default=None,
+        help="share of sampled wall time with valid inputs "
+        "(required unless --day-coverage is used)",
+    )
+    parser.add_argument(
+        "--day-coverage",
+        action="append",
+        default=[],
+        metavar="DAY=FRACTION",
+        help="per sampled-day valid fraction (repeatable); coverage is the mean "
+        "over the sampled days only",
+    )
+    parser.add_argument(
+        "--all-dates",
+        default=None,
+        metavar="CSV",
+        help="comma-separated sampled days to declare (default: the parquet dates); "
+        "use this to keep sampled days with no episode in the day count",
+    )
+    parser.add_argument(
+        "--data-source",
+        default=None,
+        choices=(BACKFILL, "unknown"),
+        help="force the historical lane (forward can never be forced)",
+    )
+    parser.add_argument(
+        "--reveal-lag-ms",
+        type=int,
+        default=0,
+        metavar="MS",
+        help="measured HL publish lag added to every latency (default 0)",
+    )
+    parser.add_argument(
+        "--headline-latency-ms", type=int, default=250, metavar="MS"
+    )
+    parser.add_argument("--headline-capital-usd", type=float, default=None)
+    parser.add_argument(
+        "--latency-ms",
+        action="append",
+        type=int,
+        default=[],
+        metavar="MS",
+        help="episode latency grid (repeatable; default: the §13.4 grid)",
+    )
+    parser.add_argument("--out", required=True, metavar="PATH")
+    parser.add_argument("--img-dir", default=None, metavar="PATH")
+    return parser
+
+
+def _cli_sampled_dates(all_dates: str | None, frame: pl.DataFrame) -> list[_dt.date]:
+    """The sampled days for the CLI: the explicit list, else the parquet's dates."""
+    if all_dates:
+        raw = [item.strip() for item in all_dates.split(",") if item.strip()]
+        try:
+            return sorted({_dt.date.fromisoformat(item) for item in raw})
+        except ValueError as err:
+            raise ReportError(f"--all-dates has an invalid ISO date: {err}") from err
+    if "date" not in frame.columns:
+        raise ReportError("episode parquet has no `date` column; pass --all-dates")
+    days: set[_dt.date] = set()
+    for value in frame["date"].to_list():
+        if isinstance(value, _dt.datetime):
+            days.add(value.date())
+        elif isinstance(value, _dt.date):
+            days.add(value)
+        elif isinstance(value, str):
+            try:
+                days.add(_dt.date.fromisoformat(value))
+            except ValueError as err:
+                raise ReportError(f"episode parquet has an invalid date {value!r}") from err
+        else:
+            raise ReportError(f"episode parquet has a non-date value {value!r}")
+    return sorted(days)
+
+
+def _cli_day_coverage(items: Sequence[str]) -> dict[_dt.date, float]:
+    """Parse repeatable ``DAY=FRACTION`` coverage items."""
+    coverage: dict[_dt.date, float] = {}
+    for item in items:
+        day, sep, fraction = item.partition("=")
+        if not sep:
+            raise ReportError(f"--day-coverage must be DAY=FRACTION, got {item!r}")
+        try:
+            date = _dt.date.fromisoformat(day.strip())
+            coverage[date] = float(fraction)
+        except ValueError as err:
+            raise ReportError(f"invalid --day-coverage {item!r}: {err}") from err
+    return coverage
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point for ``hlr-report`` (task B-9)."""
+    args = _build_parser().parse_args(argv)
+    out = Path(args.out)
+    try:
+        frame = pl.read_parquet(args.episodes)
+        dates = _cli_sampled_dates(args.all_dates, frame)
+        day_coverage = _cli_day_coverage(args.day_coverage)
+        if day_coverage and args.coverage_pct is not None:
+            raise ReportError("pass --coverage-pct or --day-coverage, not both")
+        if not day_coverage and args.coverage_pct is None:
+            raise ReportError("--coverage-pct or --day-coverage is required")
+        kwargs: dict[str, Any] = {
+            "study_id": args.study_id,
+            "slug": args.slug,
+            "title": args.title,
+            "hypothesis": args.hypothesis,
+            "implementation_cost": args.implementation_cost,
+            "days": len(dates),
+            "capital_runs": {args.capital_usd: frame},
+            "max_notional": {args.capital_usd: args.max_notional},
+            "all_dates": dates,
+            "data_source": args.data_source,
+            "reveal_lag_ms": args.reveal_lag_ms,
+            "headline_latency_ms": args.headline_latency_ms,
+            "headline_capital_usd": args.headline_capital_usd,
+        }
+        if day_coverage:
+            kwargs["day_coverage"] = day_coverage
+        else:
+            kwargs["coverage_pct"] = args.coverage_pct
+        if args.latency_ms:
+            kwargs["latencies_ms"] = tuple(args.latency_ms)
+        text = build_report(img_dir=args.img_dir, **kwargs)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+    except (ReportError, OSError, ValueError, pl.exceptions.PolarsError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    print(f"wrote {out}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised through the console script
+    raise SystemExit(main())

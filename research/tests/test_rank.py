@@ -400,6 +400,9 @@ def test_hist_prelim_groups_below_forward(tmp_path: Path) -> None:
     assert [result.study_id for result in ranked] == ["O1", "O2"]
     both = [result.verdict for result in ranked]
     assert both == [MARGINAL, MARGINAL]
+    # RANKING.md lists the forward study above the HIST-PRELIM one in its tier.
+    text = render_ranking(ranked, th)
+    assert text.index("O1") < text.index("O2")
 
 
 def test_score_then_impl_cost_tiebreak(tmp_path: Path) -> None:

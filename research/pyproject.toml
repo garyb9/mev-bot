@@ -28,6 +28,7 @@ hlr-tardis-normalize = "hlr.backfill.tardis_normalize:main"
 hlr-normalize = "hlr.normalize:main"
 hlr-hl-rest = "hlr.backfill.hl_rest:main"
 hlr-rank = "hlr.rank:main"
+hlr-report = "hlr.report:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hlr"]

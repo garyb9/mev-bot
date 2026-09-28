@@ -984,7 +984,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | B-6 | Official HL S3 archives (**owner AWS account**; completes V-8) | T1 | M–L | owner approval | ☐ |
 | B-7 | Deribit history | T1 | S–M | V-10 | ☐ |
 | B-8 | Equity minute bars (**owner account**; after V-11) | T1 | S | V-11 | ☐ |
-| B-9 | HIST-PRELIM report plumbing | T1 | S | P-5 | ☐ |
+| B-9 | HIST-PRELIM report plumbing | T1 | S | P-5 | ✅ |
 | S-1 | Study O1 HIP-3 dislocations | T1 | M | P-5 | ☐ |
 | S-2 | Study O2 spot triangles | T1 | M | P-5 | ☐ |
 | S-3 | Study O3 spot-perp dislocation | T1 | S | P-5 | ☐ |

@@ -23,9 +23,11 @@ from hlr.report import (
     canonical_digest,
     episode_digest,
     grade_study,
+    main,
     parse_front_matter,
     render_front_matter,
     render_report,
+    sampled_coverage_pct,
     top_episodes,
 )
 from hlr.thresholds import MARGINAL, PASS, load_thresholds
@@ -377,3 +379,173 @@ def test_episode_date_outside_all_dates_raises() -> None:
             all_dates=[day(i) for i in range(3)],
             latencies_ms=(100, 250),
         )
+
+
+# --------------------------------------------------------------------------
+# B-9: HIST-PRELIM report plumbing
+# --------------------------------------------------------------------------
+
+
+def test_sparse_day_set_coverage_counts_only_sampled_days() -> None:
+    """Coverage is the mean over the sampled days, not the whole calendar."""
+    sampled = [day(0), day(30), day(60)]
+    coverage = sampled_coverage_pct(
+        sampled, {day(0): 1.0, day(30): 0.5, day(60): 1.0}
+    )
+    assert coverage == pytest.approx(2.5 / 3)
+    # Three days sampled across a 61-day span still score 1.0 when fully valid:
+    # the 58 unsampled days are gaps, not missing data.
+    assert sampled_coverage_pct(sampled, {d: 1.0 for d in sampled}) == pytest.approx(1.0)
+
+    episodes = synthetic_episodes([0, 30, 60])
+    front_matter = build(
+        episodes,
+        days=3,
+        all_dates=sampled,
+        coverage_pct=None,
+        day_coverage={day(0): 1.0, day(30): 0.5, day(60): 0.75},
+        latencies_ms=(100, 250),
+    )
+    assert front_matter["days"] == 3
+    assert front_matter["coverage_pct"] == pytest.approx(2.25 / 3)
+
+
+def test_backfill_report_header_stamps_preliminary() -> None:
+    episodes = passing_episodes(days=5, per_day=3, mixed=True)
+    text = build_report(
+        study_id="O2",
+        slug="backfill",
+        title="Backfill study",
+        hypothesis="h",
+        implementation_cost="M",
+        days=5,
+        coverage_pct=0.99,
+        capital_runs={25_000.0: episodes},
+        max_notional={25_000.0: 5_000.0},
+        all_dates=[day(i) for i in range(5)],
+        latencies_ms=(100, 250, 500),
+    )
+    assert "PRELIMINARY (backfill: tardis)" in text
+    assert "HIST-PRELIM" in text
+
+    # A forced backfill with no derivable source still stamps the lane.
+    forced = build_report(
+        study_id="O3",
+        slug="forced",
+        title="Forced backfill",
+        hypothesis="h",
+        implementation_cost="M",
+        days=5,
+        coverage_pct=0.99,
+        capital_runs={25_000.0: synthetic_episodes([0, 1, 2, 3, 4])},
+        max_notional={25_000.0: 5_000.0},
+        all_dates=[day(i) for i in range(5)],
+        latencies_ms=(100, 250),
+        data_source="backfill",
+    )
+    assert "PRELIMINARY (backfill: unspecified)" in forced
+    assert "HIST-PRELIM" in forced
+
+
+def test_reveal_lag_shifts_every_latency() -> None:
+    episodes = synthetic_episodes([0, 1, 2, 3, 4])
+    base = build(episodes, latencies_ms=(100, 250))
+    shifted = build(episodes, latencies_ms=(100, 250), reveal_lag_ms=200)
+    assert shifted["reveal_lag_ms"] == 200
+    assert shifted["headline_latency_ms"] == base["headline_latency_ms"] + 200
+    assert shifted["latency_grid_ms"] == [value + 200 for value in base["latency_grid_ms"]]
+    for sample in ("in_sample", "oos"):
+        before = base["capital"][0][sample]
+        after = shifted["capital"][0][sample]
+        assert [row["latency_ms"] for row in after] == [
+            row["latency_ms"] + 200 for row in before
+        ]
+    text = render_report(shifted)
+    # The embedded front-matter (the report's headline/grid/rows) is shifted.
+    assert '"headline_latency_ms": 450' in text
+    assert '"latency_grid_ms": [' in text and "300" in text and "450" in text
+    grid_section = text.split("### Latency grid", 1)[1].split("### Capital grid", 1)[0]
+    assert "| 300 |" in grid_section and "| 450 |" in grid_section
+    assert "| 100 |" not in grid_section and "| 250 |" not in grid_section
+
+
+def test_reveal_lag_zero_leaves_report_identical() -> None:
+    episodes = synthetic_episodes([0, 1, 2, 3, 4])
+    plain = build(episodes)
+    zero = build(episodes, reveal_lag_ms=0)
+    assert render_front_matter(plain) == render_front_matter(zero)
+    assert render_report(plain) == render_report(zero)
+
+
+def test_negative_or_non_numeric_reveal_lag_rejected() -> None:
+    episodes = synthetic_episodes([0, 1, 2, 3, 4])
+    for bad in (-1, "fast", 1.5, float("nan")):
+        with pytest.raises(ReportError, match="reveal_lag_ms"):
+            build(episodes, reveal_lag_ms=bad)
+
+
+def test_report_cli_rejects_negative_lag(tmp_path: Path) -> None:
+    parquet = tmp_path / "O1-episodes.parquet"
+    synthetic_episodes([0, 1, 2, 3, 4]).write_parquet(parquet)
+    out = tmp_path / "O1.md"
+    code = main(
+        [
+            "--study-id",
+            "O1",
+            "--slug",
+            "s",
+            "--title",
+            "t",
+            "--episodes",
+            str(parquet),
+            "--capital-usd",
+            "25000",
+            "--max-notional",
+            "10000",
+            "--coverage-pct",
+            "0.99",
+            "--reveal-lag-ms",
+            "-1",
+            "--out",
+            str(out),
+        ]
+    )
+    assert code != 0
+    assert not out.exists()
+
+
+def test_report_cli_builds_backfill_report(tmp_path: Path) -> None:
+    parquet = tmp_path / "O2-episodes.parquet"
+    synthetic_episodes([0, 1, 2, 3, 4]).write_parquet(parquet)
+    out = tmp_path / "O2.md"
+    code = main(
+        [
+            "--study-id",
+            "O2",
+            "--slug",
+            "backfill",
+            "--title",
+            "t",
+            "--episodes",
+            str(parquet),
+            "--capital-usd",
+            "25000",
+            "--max-notional",
+            "10000",
+            "--coverage-pct",
+            "0.99",
+            "--data-source",
+            "backfill",
+            "--reveal-lag-ms",
+            "150",
+            "--out",
+            str(out),
+        ]
+    )
+    assert code == 0
+    text = out.read_text()
+    assert "PRELIMINARY (backfill:" in text
+    assert "HIST-PRELIM" in text
+    # The reveal lag reached the report's embedded front-matter: 250 + 150.
+    assert '"headline_latency_ms": 400' in text
+    assert '"reveal_lag_ms": 150' in text
