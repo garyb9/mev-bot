@@ -19,6 +19,7 @@ from hlr.report import (
     HIST_PRELIM,
     INCONCLUSIVE,
     ReportError,
+    _check_day_counts,
     canonical_episodes,
     episode_digest,
     grade_study,
@@ -347,7 +348,7 @@ def test_hist_prelim_cannot_pass(tmp_path: Path) -> None:
     assert any("HIST-PRELIM" in reason for reason in result.reasons)
 
 
-def test_forward_fields_with_any_backfill_marker_is_hist(tmp_path: Path) -> None:
+def test_forward_backfill_sources_demote_but_fidelity_does_not(tmp_path: Path) -> None:
     th = thresholds(tmp_path)
     assert grade_study(make_fm(apr=0.6, ci_lo=0.6), thresholds=th).verdict == PASS
     assert (
@@ -355,12 +356,13 @@ def test_forward_fields_with_any_backfill_marker_is_hist(tmp_path: Path) -> None
         == MARGINAL
     )
     assert (
-        grade_study(make_fm(apr=0.6, ci_lo=0.6, fidelity_class="H1"), thresholds=th).verdict
-        == MARGINAL
-    )
-    assert (
         grade_study(make_fm(apr=0.6, ci_lo=0.6, data_source="unknown"), thresholds=th).verdict
         == MARGINAL
+    )
+    # A fidelity class is informational and does not demote a recorder study.
+    assert (
+        grade_study(make_fm(apr=0.6, ci_lo=0.6, fidelity_class="H2"), thresholds=th).verdict
+        == PASS
     )
 
 
@@ -445,26 +447,31 @@ def test_headline_capital_must_be_exact(tmp_path: Path) -> None:
 def test_days_must_equal_sample_dates(tmp_path: Path) -> None:
     front_matter = make_fm(days=20)
     front_matter["oos_dates"] = front_matter["oos_dates"][:-1]
-    with pytest.raises(ReportError, match="in_sample_dates"):
-        grade_study(front_matter, thresholds=thresholds(tmp_path))
+    result = grade_study(front_matter, thresholds=thresholds(tmp_path))
+    assert result.verdict == INCONCLUSIVE
+    assert any("in_sample_dates" in reason for reason in result.reasons)
 
 
-def test_day_split_must_be_disjoint_and_chronological(tmp_path: Path) -> None:
-    th = thresholds(tmp_path)
+def test_check_day_counts_rejects_bad_splits(tmp_path: Path) -> None:
+    del tmp_path  # the validator does not need thresholds
     missing = make_fm(days=20)
     del missing["oos_dates"]
     with pytest.raises(ReportError, match="oos_dates"):
-        grade_study(missing, thresholds=th)
+        _check_day_counts(missing, 20)
 
     duplicated = make_fm(days=20)
     duplicated["oos_dates"] = duplicated["oos_dates"][:-1] + [duplicated["oos_dates"][0]]
     with pytest.raises(ReportError, match="duplicate"):
-        grade_study(duplicated, thresholds=th)
+        _check_day_counts(duplicated, 20)
 
+    # One date in both lists, but the total still equals `days`: hits overlap.
     overlapping = make_fm(days=20)
-    overlapping["oos_dates"] = [overlapping["in_sample_dates"][-1], *overlapping["oos_dates"]]
-    with pytest.raises(ReportError):
-        grade_study(overlapping, thresholds=th)
+    overlapping["oos_dates"] = [
+        overlapping["in_sample_dates"][-1],
+        *overlapping["oos_dates"][1:],
+    ]
+    with pytest.raises(ReportError, match="overlap"):
+        _check_day_counts(overlapping, 20)
 
     reversed_split = make_fm(days=20)
     reversed_split["in_sample_dates"], reversed_split["oos_dates"] = (
@@ -472,7 +479,38 @@ def test_day_split_must_be_disjoint_and_chronological(tmp_path: Path) -> None:
         reversed_split["in_sample_dates"],
     )
     with pytest.raises(ReportError, match="chronological"):
-        grade_study(reversed_split, thresholds=th)
+        _check_day_counts(reversed_split, 20)
+
+
+def test_one_bad_report_does_not_abort_ranking(tmp_path: Path) -> None:
+    th = thresholds(tmp_path)
+    good = make_fm("O1", apr=0.5, ci_lo=0.5)
+    bad = make_fm("O2", apr=0.5, ci_lo=0.5)
+    bad["oos_dates"] = []  # empty list -> INCONCLUSIVE, not an exception
+    ranked = rank_studies([bad, good], thresholds=th)
+    assert [result.study_id for result in ranked] == ["O1", "O2"]
+    assert ranked[0].verdict == PASS
+    assert ranked[1].verdict == INCONCLUSIVE
+    assert ranked[1].reasons
+
+
+def test_malformed_capital_block_is_inconclusive(tmp_path: Path) -> None:
+    th = thresholds(tmp_path)
+    front_matter = make_fm(days=20)
+    front_matter["capital"][0]["capital_usd"] = "not a number"
+    result = grade_study(front_matter, thresholds=th)
+    assert result.verdict == INCONCLUSIVE
+    assert any("capital_usd" in reason for reason in result.reasons)
+
+
+def test_rank_survives_malformed_capital_block(tmp_path: Path) -> None:
+    reports = tmp_path / "reports"
+    front_matter = make_fm("O1", apr=0.5, ci_lo=0.5)
+    attach_episode_file(front_matter, reports)  # digest matches the parquet
+    front_matter["capital"][0]["capital_usd"] = "not a number"
+    (reports / "O1-o1.md").write_text(render_front_matter(front_matter) + "\n# body\n")
+    result = grade_study(scan_reports(reports)[0], thresholds=thresholds(tmp_path))
+    assert result.verdict == INCONCLUSIVE
 
 
 def test_render_report_when_headline_capital_not_run(tmp_path: Path) -> None:
@@ -526,11 +564,14 @@ def test_rank_digest_mismatch_is_inconclusive(tmp_path: Path) -> None:
     th = thresholds(tmp_path)
     assert grade_study(scan_reports(reports)[0], thresholds=th).verdict != INCONCLUSIVE
 
-    # Tampering with the parquet changes the digest (and the count) -> INCONCLUSIVE.
-    pl.DataFrame({"date": [_dt.date(2024, 1, 1)], "capital_usd": [25_000.0]}).write_parquet(
-        reports / "O1-o1-episodes.parquet"
-    )
-    assert grade_study(scan_reports(reports)[0], thresholds=th).verdict == INCONCLUSIVE
+    # Change only the declared digest; the parquet (counts, dates) is untouched.
+    front_matter = make_fm("O1", apr=0.5, ci_lo=0.5)
+    attach_episode_file(front_matter, reports)
+    front_matter["episode_digest"] = "0" * 64
+    (reports / "O1-o1.md").write_text(render_front_matter(front_matter) + "\n# body\n")
+    result = grade_study(scan_reports(reports)[0], thresholds=th)
+    assert result.verdict == INCONCLUSIVE
+    assert any("digest" in reason for reason in result.reasons)
 
 
 def test_missing_declared_parquet_is_inconclusive(tmp_path: Path) -> None:
@@ -561,6 +602,27 @@ def test_parquet_provenance_overrides_front_matter(tmp_path: Path) -> None:
     assert scanned[0]["data_source"] == "backfill"
     result = grade_study(scanned[0], thresholds=thresholds(tmp_path))
     assert result.verdict == MARGINAL
+    assert result.qualifier is not None and result.qualifier.startswith(HIST_PRELIM)
+
+
+def test_rank_never_upgrades_declared_provenance(tmp_path: Path) -> None:
+    reports = tmp_path / "reports"
+    # Declared backfill (e.g. a tardis robustness re-run) but a recorder parquet.
+    front_matter = make_fm(
+        "O1",
+        apr=0.60,
+        ci_lo=0.60,
+        data_source="backfill",
+        backfill_sources=["tardis"],
+        fidelity_class="H1",
+    )
+    attach_episode_file(front_matter, reports, source="recorder")
+    (reports / "O1-o1.md").write_text(render_front_matter(front_matter) + "\n# body\n")
+    scanned = scan_reports(reports)
+    assert scanned[0]["data_source"] == "backfill"
+    assert "tardis" in scanned[0]["backfill_sources"]
+    result = grade_study(scanned[0], thresholds=thresholds(tmp_path))
+    assert result.verdict != PASS
     assert result.qualifier is not None and result.qualifier.startswith(HIST_PRELIM)
 
 

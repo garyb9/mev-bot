@@ -246,29 +246,39 @@ def test_missing_date_column_raises() -> None:
         build(episodes)
 
 
-def passing_episodes(days: int = 20, per_day: int = 12, *, mixed: bool = False) -> pl.DataFrame:
+def passing_episodes(
+    days: int = 20,
+    per_day: int = 12,
+    *,
+    mixed: bool = False,
+    fidelity: str = "H1",
+    net: float = 5.0,
+) -> pl.DataFrame:
     """A synthetic study dense enough to clear every §13.6 gate, with provenance."""
     times: list[int] = []
-    net: list[float] = []
+    net_bps: list[float] = []
     size: list[float] = []
     compete: list[float] = []
     sources: list[str] = []
+    fidelities: list[str] = []
     for index in range(days):
         for slot in range(per_day):
             base = BASE_NS + index * DAY + slot * 10_000 * MS
             times += [base, base + 400 * MS, base + 2_000 * MS, base + 2_001 * MS]
-            net += [5.0, 5.0, -1.0, -1.0]
+            net_bps += [net, net, -1.0, -1.0]
             size += [5_000.0, 5_000.0, 5_000.0, 5_000.0]
             compete += [0.0, 0.0, 0.0, 0.0]
             source = "tardis" if mixed and index % 2 else "recorder"
             sources += [source, source, source, source]
+            fidelities += [fidelity, fidelity, fidelity, fidelity]
     frame = pl.DataFrame(
         {
             "t_ns": times,
-            "net_bps": net,
+            "net_bps": net_bps,
             "size_usd": size,
             "compete_usd": compete,
             "source": sources,
+            "fidelity": fidelities,
         }
     )
     config = EpisodeConfig(latencies_ms=(100, 250, 500), jitter=True, jitter_seed=0)
@@ -285,12 +295,14 @@ def test_detect_episodes_carries_provenance() -> None:
     episodes = passing_episodes(days=1, per_day=1)
     assert "source" in episodes.columns
     assert set(episodes["source"].to_list()) == {"recorder"}
+    assert set(episodes["fidelity"].to_list()) == {"H1"}
     # An input without the provenance columns stays without them.
     assert "source" not in synthetic_episodes([0]).columns
 
 
-def test_recorder_study_can_reach_pass_end_to_end(tmp_path: Path) -> None:
-    episodes = passing_episodes()
+def test_recorder_study_with_fidelity_can_reach_pass_end_to_end(tmp_path: Path) -> None:
+    episodes = passing_episodes(fidelity="H1")
+    intervals = passing_episodes(fidelity="H1", net=3.0)  # genuinely different re-run
     reports = tmp_path / "reports"
     text = build_report(
         study_id="O1",
@@ -302,7 +314,7 @@ def test_recorder_study_can_reach_pass_end_to_end(tmp_path: Path) -> None:
         coverage_pct=0.99,
         capital_runs={25_000.0: episodes},
         max_notional={25_000.0: 5_000.0},
-        robustness_runs={25_000.0: episodes},
+        robustness_runs={25_000.0: intervals},
         all_dates=[day(i) for i in range(20)],
         latencies_ms=(100, 250, 500),
         episode_parquet="O1-pass-episodes.parquet",
@@ -312,6 +324,7 @@ def test_recorder_study_can_reach_pass_end_to_end(tmp_path: Path) -> None:
     scanned = scan_reports(reports)
     assert scanned[0]["_digest_issue"] is None
     assert scanned[0]["data_source"] == "forward"
+    assert scanned[0]["fidelity_class"] == "H1"
     assert grade_study(scanned[0], thresholds=load_thresholds()).verdict == PASS
 
 
@@ -338,3 +351,29 @@ def test_provenance_checks_robustness_tables() -> None:
     without_source = synthetic_episodes([0, 1, 2, 3, 4])
     values = build(episodes, robustness_runs={25_000.0: without_source})
     assert values["data_source"] == "unknown"
+
+
+def test_fidelity_is_informational() -> None:
+    episodes = passing_episodes(fidelity="H2")
+    intervals = passing_episodes(fidelity="H2", net=3.0)
+    values = build(
+        episodes,
+        days=20,
+        all_dates=[day(i) for i in range(20)],
+        latencies_ms=(100, 250, 500),
+        max_notional={25_000.0: 5_000.0},
+        robustness_runs={25_000.0: intervals},
+    )
+    assert values["data_source"] == "forward"
+    assert values["fidelity_class"] == "H2"
+
+
+def test_episode_date_outside_all_dates_raises() -> None:
+    episodes = synthetic_episodes([0, 1, 2, 3, 4])
+    with pytest.raises(ReportError, match="not in all_dates"):
+        build(
+            episodes,
+            days=3,
+            all_dates=[day(i) for i in range(3)],
+            latencies_ms=(100, 250),
+        )

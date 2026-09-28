@@ -13,6 +13,7 @@ This is research code. It reads no keys and no network.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -25,6 +26,7 @@ from hlr.report import (
     ReportError,
     canonical_digest,
     episode_provenance,
+    is_forward,
     parse_front_matter,
     rank_studies,
     render_ranking,
@@ -91,11 +93,38 @@ def _validate_episodes(front_matter: dict[str, Any], directory: Path) -> str | N
     if canonical_digest(frame) != digest:
         return "episode parquet digest does not match the report"
 
-    data_source, sources, fidelity = episode_provenance([frame])
-    front_matter["data_source"] = data_source
-    front_matter["backfill_sources"] = list(sources)
-    front_matter["fidelity_class"] = fidelity
+    _merge_provenance(front_matter, frame)
     return _consistency_issue(front_matter, frame)
+
+
+def _merge_provenance(front_matter: dict[str, Any], frame: pl.DataFrame) -> None:
+    """Set the stricter of the declared and parquet-derived provenance.
+
+    The front-matter is the floor: a parquet can never upgrade a study to
+    forward. Forward requires **both** the declared front-matter and the parquet
+    to be forward; otherwise the stricter (backfill, or unknown if either is
+    unknown) label is kept, and the declared backfill sources are preserved
+    (they include the robustness re-runs' provenance, which is not in the
+    parquet).
+    """
+    declared_forward = is_forward(front_matter)
+    declared_source = str(front_matter.get("data_source", "unknown"))
+    derived_source, derived_sources, derived_fidelity = episode_provenance([frame])
+    if declared_forward and derived_source == "forward":
+        data_source, backfill = "forward", ()
+        fidelity = front_matter.get("fidelity_class") or derived_fidelity
+    elif declared_source == "unknown" or derived_source == "unknown":
+        data_source, backfill, fidelity = "unknown", (), None
+    else:
+        merged = sorted(
+            {str(source) for source in (front_matter.get("backfill_sources") or [])}
+            | set(derived_sources)
+        )
+        data_source, backfill = "backfill", tuple(merged)
+        fidelity = front_matter.get("fidelity_class") or derived_fidelity
+    front_matter["data_source"] = data_source
+    front_matter["backfill_sources"] = list(backfill)
+    front_matter["fidelity_class"] = fidelity
 
 
 def _consistency_issue(front_matter: Mapping[str, Any], frame: pl.DataFrame) -> str | None:
@@ -120,7 +149,9 @@ def _consistency_issue(front_matter: Mapping[str, Any], frame: pl.DataFrame) -> 
     for block in blocks:
         if not isinstance(block, dict):
             return "front-matter capital entry is malformed"
-        capital = float(block.get("capital_usd"))
+        capital = _safe_float(block.get("capital_usd"))
+        if capital is None:
+            return "front-matter capital entry has a non-numeric capital_usd"
         expected = _declared_episodes(block)
         if expected is None:
             continue
@@ -131,6 +162,16 @@ def _consistency_issue(front_matter: Mapping[str, Any], frame: pl.DataFrame) -> 
                 f"but the report declares {expected}"
             )
     return None
+
+
+def _safe_float(value: Any) -> float | None:
+    """Return ``value`` as a finite float, or ``None`` for anything else."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return number
 
 
 def _declared_episodes(block: Mapping[str, Any]) -> int | None:

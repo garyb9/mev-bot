@@ -81,6 +81,7 @@ __all__ = [
     "episode_digest",
     "episode_provenance",
     "grade_study",
+    "is_forward",
     "parse_front_matter",
     "rank_studies",
     "render_front_matter",
@@ -258,6 +259,7 @@ def build_front_matter(
     sorted_capitals = sorted(float(c) for c in capital_runs)
     provenance_frames = list(capital_runs.values()) + list((robustness_runs or {}).values())
     data_source, backfill_sources, derived_fidelity = episode_provenance(provenance_frames)
+    _require_dates_in_all_dates(provenance_frames, dates)
 
     capital_blocks: list[dict[str, Any]] = []
     for capital in sorted_capitals:
@@ -391,24 +393,33 @@ def grade_study(
     """Recompute one study's verdict against the thresholds (§13.6, §13.10).
 
     Runs entirely off the front-matter metrics, so a thresholds edit changes the
-    verdict without regenerating the report. Never raises for a zero-episode
-    study: it grades FAIL and stays in the ranking.
+    verdict without regenerating the report. A malformed report (bad day split,
+    missing days, malformed capital list) is graded INCONCLUSIVE with the reason
+    rather than raising, so one bad report never aborts a ranking run. Never
+    raises for a zero-episode study: it grades FAIL and stays in the ranking.
     """
     th = thresholds if thresholds is not None else load_thresholds()
     study_id = str(front_matter.get("study_id") or "?")
     slug = str(front_matter.get("slug") or "")
     title = str(front_matter.get("title") or "")
     implementation_cost = str(front_matter.get("implementation_cost") or "M")
-    days = _as_int(front_matter.get("days"), "days")
     preliminary = bool(front_matter.get("preliminary", False))
-    forward = _is_forward(front_matter)
+    forward = is_forward(front_matter)
     hist = not forward
     qualifier = _qualifier(front_matter) if hist else None
 
-    _check_day_counts(front_matter, days)
-
     reasons: list[str] = []
-    capital_runs = _capital_runs(front_matter)
+    days: int | None = None
+    validation_error: str | None = None
+    capital_runs: list[dict[str, Any]] = []
+    try:
+        days = _as_int(front_matter.get("days"), "days")
+        _check_day_counts(front_matter, days)
+        capital_runs = _capital_runs(front_matter)
+    except ReportError as err:
+        validation_error = str(err)
+    day_count = days if days is not None else 0
+
     lat = _ceiling_latency(_latency_grid(front_matter, th), th.latency.headline_ms)
     run = _exact_run(capital_runs, float(th.capital.headline_usd))
     cap = float(run.get("capital_usd")) if run is not None else None
@@ -444,9 +455,12 @@ def grade_study(
 
     min_days = _MIN_DAYS_PRELIM if preliminary else _MIN_DAYS_FINAL
     verdict: str
-    if days < min_days:
+    if validation_error is not None:
         verdict = INCONCLUSIVE
-        reasons.append(f"only {days} valid day(s); need >= {min_days} for this report")
+        reasons.append(validation_error)
+    elif day_count < min_days:
+        verdict = INCONCLUSIVE
+        reasons.append(f"only {day_count} valid day(s); need >= {min_days} for this report")
     elif front_matter.get("_digest_issue"):
         verdict = INCONCLUSIVE
         reasons.append(str(front_matter["_digest_issue"]))
@@ -504,7 +518,7 @@ def grade_study(
         episodes_per_day=_optional_float(row.get("episodes_per_day_p50")) if row else None,
         concentration=concentration,
         coverage_pct=coverage,
-        days=days,
+        days=day_count,
         preliminary=preliminary,
         apr_by_capital=apr_by_capital,
         reasons=tuple(reasons),
@@ -1081,12 +1095,14 @@ def episode_provenance(
 ) -> tuple[str, tuple[str, ...], str | None]:
     """Derive ``(data_source, backfill_sources, fidelity_class)`` from the tables.
 
-    Every input table (capital runs and the buffered-cost robustness re-runs) must
-    carry a ``source`` column; if any frame lacks one its provenance cannot be
-    proven and the study is ``unknown`` (conservative: HIST-PRELIM). A
-    ``recorder`` source is the forward lane; any other source, or any non-null
-    ``fidelity`` value, is backfill. Mixed inputs therefore yield a non-forward
-    study.
+    Forward vs backfill is decided by the ``source`` column **only**. Every input
+    table (capital runs and the buffered-cost robustness re-runs) must carry a
+    ``source`` column; if any frame lacks one, or has a null source, provenance
+    cannot be proven and the study is ``unknown`` (conservative: HIST-PRELIM).
+    All-``recorder`` sources are the forward lane; any other source is backfill
+    (mixed inputs are therefore non-forward). The ``fidelity`` column is
+    informational only: it is reported as the fidelity class but never forces a
+    study out of the forward lane.
     """
     if not frames:
         return "unknown", (), None
@@ -1105,9 +1121,25 @@ def episode_provenance(
             )
     non_recorder = tuple(sorted(source for source in sources if source != "recorder"))
     fidelity_class = ", ".join(sorted(fidelities)) if fidelities else None
-    if non_recorder or fidelities:
+    if non_recorder:
         return "backfill", non_recorder, fidelity_class
-    return "forward", (), None
+    return "forward", (), fidelity_class
+
+
+def _require_dates_in_all_dates(
+    frames: Sequence[pl.DataFrame], dates: Sequence[_dt.date]
+) -> None:
+    """Raise when an episode table holds a ``date`` outside the declared days."""
+    allowed = set(dates)
+    for frame in frames:
+        if "date" not in frame.columns:
+            continue
+        stray = sorted({value for value in frame["date"].to_list() if value not in allowed})
+        if stray:
+            raise ReportError(
+                f"episode date(s) {stray} are not in all_dates; a report may only "
+                "cover its declared days"
+            )
 
 
 def top_episodes(
@@ -1149,6 +1181,9 @@ def _capital_runs(front_matter: Mapping[str, Any]) -> list[dict[str, Any]]:
         raise ReportError("front-matter has no non-empty `capital` list")
     if not all(isinstance(block, dict) for block in blocks):
         raise ReportError("every `capital` entry must be an object")
+    for block in blocks:
+        if _optional_float(block.get("capital_usd")) is None:
+            raise ReportError("every `capital` entry needs a numeric capital_usd")
     return blocks
 
 
@@ -1261,10 +1296,10 @@ def _nearest_capital_of(
 def _check_day_counts(front_matter: Mapping[str, Any], days: int) -> None:
     """Validate the chronological 60/40 day split declared by the front-matter.
 
-    Both ``in_sample_dates`` and ``oos_dates`` are required; they must be
-    duplicate-free, disjoint, and strictly ordered (every in-sample day before
-    every out-of-sample day), and together account for ``days``. Anything else
-    raises :class:`ReportError`.
+    Both ``in_sample_dates`` and ``oos_dates`` are required and must be non-empty
+    (a one-day study is not gradeable); they must be duplicate-free, disjoint, and
+    strictly ordered (every in-sample day before every out-of-sample day), and
+    together account for ``days``. Anything else raises :class:`ReportError`.
     """
     in_dates = _require_date_list(front_matter, "in_sample_dates")
     oos_dates = _require_date_list(front_matter, "oos_dates")
@@ -1285,12 +1320,12 @@ def _check_day_counts(front_matter: Mapping[str, Any], days: int) -> None:
 def _require_date_list(front_matter: Mapping[str, Any], key: str) -> list[_dt.date]:
     """Return a front-matter date list as parsed dates, raising on any problem.
 
-    The key must exist and be a list; an empty list is allowed (a one-day study
-    has no out-of-sample days), but every entry must be a valid, unique ISO date.
+    The key must exist and be a non-empty list, and every entry must be a valid,
+    unique ISO date.
     """
     raw = front_matter.get(key)
-    if not isinstance(raw, list):
-        raise ReportError(f"front-matter is missing the `{key}` list")
+    if not isinstance(raw, list) or not raw:
+        raise ReportError(f"front-matter is missing a non-empty `{key}` list")
     dates: list[_dt.date] = []
     for value in raw:
         if isinstance(value, _dt.date):
@@ -1307,16 +1342,16 @@ def _require_date_list(front_matter: Mapping[str, Any], key: str) -> list[_dt.da
     return dates
 
 
-def _is_forward(front_matter: Mapping[str, Any]) -> bool:
+def is_forward(front_matter: Mapping[str, Any]) -> bool:
     """Whether the front-matter proves forward provenance (§13.11).
 
-    Only ``data_source == "forward"`` exactly, with no backfill sources and no
-    fidelity class, counts as forward; anything else is HIST-PRELIM.
+    Decided by ``source`` only: exactly ``data_source == "forward"`` with no
+    backfill sources. The fidelity class is informational and never disqualifies a
+    forward study.
     """
     return (
         str(front_matter.get("data_source", "unknown")) == "forward"
         and not (front_matter.get("backfill_sources") or [])
-        and front_matter.get("fidelity_class") is None
     )
 
 
