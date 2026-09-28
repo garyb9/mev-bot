@@ -50,6 +50,10 @@ pub mod names {
     /// Restored nonce leases beyond the venue's future window at resume: the bot
     /// fails closed until an operator resets the nonce (SPEC-0002 H-6).
     pub const NONCE_RESUME_CORRUPT_TOTAL: &str = "hl_nonce_resume_corrupt_total";
+    /// Runtime nonce candidates beyond the venue's future window (corruption or
+    /// a far-backwards clock step). Distinct from the boot corruption counter;
+    /// the refusal self-clears once the clock catches up (SPEC-0002 H-6).
+    pub const NONCE_FUTURE_REFUSALS_TOTAL: &str = "hl_nonce_future_refusals_total";
     /// Whether the dead-man's switch is currently armed (0/1).
     pub const DEADMAN_ARMED: &str = "hl_deadman_armed";
     /// Dead-man's switch arm/refresh submissions.

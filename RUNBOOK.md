@@ -133,21 +133,26 @@ window`), increments `hl_nonce_resume_corrupt_total`, and **refuses every order*
 clamp or issue a lower nonce on its own. Reset it explicitly:
 
 ```sh
-# Stop the bot first so it does not rewrite the row.
+# Stop the bot first. A running `hl run` holds an exclusive flock on
+# <HL_DB_PATH>.lock, and `hl nonce reset` refuses while it is held.
 kill -TERM "$(pgrep -f 'hl run')"
 
-# Rewrites a *corrupt* row to now + the write-behind lease. Opens the
-# configured SQLite (HL_DB_PATH) directly; needs no agent key.
+# Rewrites a *corrupt* row to now + the write-behind lease. Takes the same
+# lock (so it cannot race a live bot), opens the configured SQLite
+# (HL_DB_PATH) directly; needs no agent key.
 hl nonce reset
 
 # Then restart; the first logs should show "starting", not the corruption error.
 hl run --mode live
 ```
 
-`hl nonce reset` refuses unless the stored value is actually corrupt by the
-rule above, so it cannot force a reuse while the bot is trading. A normal
-nonce reset (`HttpExchange::reset_nonce`/`WsExchange::reset_nonce`) is likewise
-gated on the corruption state.
+`hl run` holds an exclusive `flock` on `<db>.lock` for its lifetime; `hl nonce
+reset` refuses with a clear error if that lock is held, so stop the bot first
+(a crash releases the lock automatically). The reset also refuses unless the
+stored value is actually corrupt by the rule above, so it cannot force a reuse
+while the bot is trading. A normal nonce reset
+(`HttpExchange::reset_nonce`/`WsExchange::reset_nonce`) is likewise gated on the
+corruption state.
 
 After a reset the venue may reject a few orders (nonce stale/duplicate) until
 its window of the 100 highest seen nonces rolls past the old corrupt value; the

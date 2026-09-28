@@ -2366,6 +2366,7 @@ dependencies = [
  "crossbeam-channel",
  "figment",
  "futures-util",
+ "libc",
  "metrics",
  "mev-core",
  "mev-engine",

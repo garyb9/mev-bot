@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod db_lock;
 mod engine;
 mod live;
 mod record;
@@ -414,6 +415,10 @@ fn nonce_reset(network: Option<NetworkArg>) -> Result<()> {
 fn reset_nonce_row(db_path: &std::path::Path) -> Result<()> {
     use mev_hl_client::nonce::{DEFAULT_NONCE_LEASE_MS, VENUE_MAX_FUTURE_MS};
 
+    // Refuse while a bot holds the database: it may rewrite the row, and the
+    // reset must not race a live send (SPEC-0002 H-6).
+    let _lock = db_lock::DbLock::acquire(db_path)?;
+
     let db = Db::open(db_path)?;
     let now = SystemClock.now_ms();
     let old = db.nonce_last()?.unwrap_or(0);
@@ -461,6 +466,11 @@ async fn run(
         db_path: db,
     };
     let config = Config::load(overrides)?;
+
+    // Hold the exclusive nonce-database lock for the process lifetime, so
+    // `hl nonce reset` cannot rewrite the row under a running bot (SPEC-0002
+    // H-6). Released when the process exits.
+    let _db_lock = db_lock::DbLock::acquire(&config.db_path)?;
 
     let selector = selector_for(config.network, &config.watchlist).await?;
     let watchlist: Vec<String> = selector
@@ -1537,5 +1547,31 @@ mod tests {
             rewritten >= now && rewritten <= now + DEFAULT_NONCE_LEASE_MS + 60_000,
             "{rewritten} should be the new lease, not the corrupt value"
         );
+    }
+
+    #[test]
+    fn nonce_reset_refuses_while_the_db_lock_is_held() {
+        use mev_hl_client::nonce::VENUE_MAX_FUTURE_MS;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hlbot.db");
+        let now = SystemClock.now_ms();
+        Db::open(&path)
+            .unwrap()
+            .set_nonce_last(now + VENUE_MAX_FUTURE_MS + 60_000)
+            .unwrap();
+
+        // A running bot holds the lock: the reset must refuse, even for a row
+        // that is otherwise corrupt and resettable.
+        let lock = db_lock::DbLock::acquire(&path).unwrap();
+        let err = reset_nonce_row(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("running bot"),
+            "unexpected error: {err}"
+        );
+
+        // Once the bot is gone the reset proceeds.
+        drop(lock);
+        reset_nonce_row(&path).unwrap();
     }
 }

@@ -18,6 +18,7 @@ clap.workspace = true
 crossbeam-channel.workspace = true
 figment.workspace = true
 futures-util.workspace = true
+libc.workspace = true
 metrics.workspace = true
 rust_decimal.workspace = true
 rustls.workspace = true
