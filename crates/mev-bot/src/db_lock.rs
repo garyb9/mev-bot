@@ -27,6 +27,15 @@ impl DbLock {
     /// Take the exclusive lock, failing if another process already holds it.
     pub fn acquire(db_path: &Path) -> Result<Self> {
         let path = Self::path_for(db_path);
+        // Mirror `Db::open`: create the database directory if it is missing, so
+        // `observe` (which never opens the database) still starts on a fresh
+        // checkout.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
