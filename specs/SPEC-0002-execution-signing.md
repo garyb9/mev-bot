@@ -200,7 +200,7 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 | H-2 | Mandatory `cloid` + unknown-outcome reconciliation | **T0** | M | H-1 | ✅ |
 | H-3 | Account stream (`orderUpdates`, `userFills`, `userEvents`) | T1 | M | SPEC-0008 R-3 | ✅ |
 | H-4 | Dead-man's switch policy (arm only when needed; fail closed) | **T0** | S | H-1 | ✅ |
-| H-5 | Apply `bbo` to `MarketState` | T1 | S | — | ☐ |
+| H-5 | Apply `bbo` to `MarketState` | T1 | S | — | ✅ |
 | H-6 | Nonce persistence off the hot path | T1 | S | H-9 | ☐ |
 | H-7 | Latency instrumentation + sign/submit benchmarks | T1 | M | H-1 | ☐ |
 | H-8 | `simulate` without keys (ephemeral signer) | T1 | S | — | ✅ |
@@ -218,6 +218,8 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 **H-4 — Dead-man's switch policy.** (a) Arm only while at least one resting order exists, and disarm when none remain; each `scheduleCancel` spends address rate-limit budget (a 30 s TTL refreshed every 15 s is ~5.8k requests/day against a 10k + 1-per-USDC-traded budget). (b) Default TTL 120 s, refreshed at half the TTL. (c) If arming or refreshing fails, set a sticky **trading-halt** flag that the risk engine reads (fail closed); today the task logs and returns while live continues. (d) Expose remaining address budget by polling `userRateLimit` every 60 s as a metric. *Done when:* unit tests cover arm/disarm on the resting-order count and halt on failure.
 
 **H-5 — `bbo` into `MarketState`.** `MarketState::apply` currently ignores `StreamEvent::Bbo`. Store the latest BBO per coin with its receive time, and expose `best_bid/ask` that prefer the fresher of `bbo` and the `l2Book` top. Subscribe `bbo` for watchlist coins in `ingest`. *Done when:* tests show that the fresher source wins.
+
+**H-5 resolved (2026-09-28) with no code change.** `MarketState` is now health and legacy-replay conversion only; `observe`/`simulate`/`live` trade through the v2 `EngineLoop`, where strategies read prices via `Ctx::best_bid/best_ask` on `MarketSlot` (`crates/mev-engine/src/state.rs`), which already prefers the later of `bbo` and the `l2Book` top by receive stamp (test `best_bid_prefers_the_fresher_source`). `bbo` is subscribed only when a strategy declares `Stream::Bbo`; a watchlist-wide subscription was deliberately not added, since nothing would consume it. Found during this review: an empty `bbo` side decoded as a `px = 0` level that could win as the fresher source; fixed separately in `mev-engine`.
 
 **H-6 — Nonce persistence off the hot path.** `WriteCore::prepare` currently writes the nonce to SQLite synchronously before every send. Once H-9 confirms the nonce rule, move persistence to write-behind (via `DbWriter`, at most once per second), relying on `max(now_ms, restored + 1)` + the future-drift guard for crash safety. Document the argument in §5. *Done when:* a restart test (kill before the write-behind flush) still never produces a nonce ≤ any previously sent nonce under a monotonic clock; H-7 shows the latency drop.
 
