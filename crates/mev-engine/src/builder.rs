@@ -203,8 +203,10 @@ fn slippage_adjusted(touch: Px, is_buy: bool, max_slippage_bps: Decimal) -> Px {
 ///
 /// Cancels are resolved through `orders` (for the coin) and `table` (for the
 /// asset id); places are resolved through `registry`/`table`. `touch` returns
-/// the freshest `(bid, ask)` for a coin, used only for aggressive places. Posts
-/// are emitted cancels-first and all req ids come from `req_ids`.
+/// the freshest reference price on the side an aggressive order crosses (ask
+/// for a buy, bid for a sell), or `None` when that side has no quote; it is
+/// called only for aggressive places. Posts are emitted cancels-first and all
+/// req ids come from `req_ids`.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_iteration(
     actions: &[Action],
@@ -212,7 +214,7 @@ pub fn plan_iteration(
     table: &AssetTable,
     orders: &OrderManager,
     cloids: &CloidAssigner,
-    touch: &dyn Fn(CoinId) -> Option<(Px, Px)>,
+    touch: &dyn Fn(CoinId, bool) -> Option<Px>,
     max_slippage_bps: Decimal,
     req_ids: &mut ReqIds,
 ) -> BuiltBatch {
@@ -294,7 +296,7 @@ fn build_place(
     registry: &CoinRegistry,
     table: &AssetTable,
     cloids: &CloidAssigner,
-    touch: &dyn Fn(CoinId) -> Option<(Px, Px)>,
+    touch: &dyn Fn(CoinId, bool) -> Option<Px>,
     max_slippage_bps: Decimal,
 ) -> Result<(OrderWire, Cloid), (Cloid, DropReason)> {
     let cloid = intent_cloid(intent, cloids);
@@ -312,8 +314,7 @@ fn build_place(
     let limit_px = match intent.limit_px {
         Some(px) => px,
         None => {
-            let (bid, ask) = touch(coin).ok_or((cloid, DropReason::NoReferencePrice))?;
-            let reference = if is_buy { ask } else { bid };
+            let reference = touch(coin, is_buy).ok_or((cloid, DropReason::NoReferencePrice))?;
             if reference <= Decimal::ZERO {
                 return Err((cloid, DropReason::NoReferencePrice));
             }
@@ -417,8 +418,8 @@ mod tests {
         }
     }
 
-    fn touch() -> impl Fn(CoinId) -> Option<(Px, Px)> {
-        |_| Some((ds("9990"), ds("10010")))
+    fn touch() -> impl Fn(CoinId, bool) -> Option<Px> {
+        |_, is_buy| Some(if is_buy { ds("10010") } else { ds("9990") })
     }
 
     fn resting(cloid: Cloid) -> LiveOrder {
@@ -669,7 +670,7 @@ mod tests {
         let table = table(0);
         let orders = OrderManager::new(1);
         let actions = vec![Action::Place(intent(Side::Buy, None, ds("1")))];
-        let no_touch = |_: CoinId| None;
+        let no_touch = |_: CoinId, _: bool| None;
         let mut req_ids = ReqIds::new();
         let batch = plan_iteration(
             &actions,

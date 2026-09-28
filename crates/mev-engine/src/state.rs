@@ -26,23 +26,32 @@ pub struct MarketSlot {
 }
 
 impl MarketSlot {
+    /// Whether the `bbo` source is at least as fresh as the `book` source.
+    ///
+    /// The receive stamp is per source, so both sides of a slot share this
+    /// decision (a tie goes to `bbo`). `None` when the slot has neither source.
+    /// Callers that need a single side use this to pick the source before
+    /// reading it: an empty side in the fresher source is information and must
+    /// not fall back to the older one.
+    pub fn bbo_is_fresher(&self) -> Option<bool> {
+        match (&self.bbo, &self.book) {
+            (Some((_, _, bstamp)), Some((_, kstamp))) => Some(bstamp.mono_ns >= kstamp.mono_ns),
+            (Some(_), None) => Some(true),
+            (None, Some(_)) => Some(false),
+            (None, None) => None,
+        }
+    }
+
     /// The freshest best bid (prefers the later of `bbo` and the book top).
     ///
     /// Whichever source is fresher wins outright: an empty bid side in the
     /// fresher source returns `None` rather than falling back to the older
     /// source's level, because an empty fresh side is information.
     pub fn best_bid(&self) -> Option<Level> {
-        match (&self.bbo, &self.book) {
-            (Some((bid, _, bstamp)), Some((book, kstamp))) => {
-                if bstamp.mono_ns >= kstamp.mono_ns {
-                    *bid
-                } else {
-                    book.best_bid()
-                }
-            }
-            (Some((bid, _, _)), None) => *bid,
-            (None, Some((book, _))) => book.best_bid(),
-            (None, None) => None,
+        if self.bbo_is_fresher()? {
+            self.bbo.as_ref().and_then(|(bid, _, _)| *bid)
+        } else {
+            self.book.as_ref().and_then(|(book, _)| book.best_bid())
         }
     }
 
@@ -76,17 +85,10 @@ impl MarketSlot {
     /// fresher source returns `None` rather than falling back to the older
     /// source's level, because an empty fresh side is information.
     pub fn best_ask(&self) -> Option<Level> {
-        match (&self.bbo, &self.book) {
-            (Some((_, ask, bstamp)), Some((book, kstamp))) => {
-                if bstamp.mono_ns >= kstamp.mono_ns {
-                    *ask
-                } else {
-                    book.best_ask()
-                }
-            }
-            (Some((_, ask, _)), None) => *ask,
-            (None, Some((book, _))) => book.best_ask(),
-            (None, None) => None,
+        if self.bbo_is_fresher()? {
+            self.bbo.as_ref().and_then(|(_, ask, _)| *ask)
+        } else {
+            self.book.as_ref().and_then(|(book, _)| book.best_ask())
         }
     }
 }

@@ -593,31 +593,35 @@ fn stamp(now_ms: u64) -> Stamp {
     }
 }
 
-/// The strategy-facing book for a coin's slot, preferring the full snapshot and
-/// falling back to the bbo. `None` when the slot is absent, stale, or empty.
+/// The strategy-facing book for a coin's slot.
+///
+/// The fresher of the full snapshot and the bbo wins outright, per side, just
+/// like [`MarketSlot::best_bid`]/[`MarketSlot::best_ask`]: an empty side in the
+/// fresher source is information and does not fall back to the older source.
+/// `None` when the slot is absent, stale, or empty.
 fn book_for(coin: CoinId, markets: &[MarketSlot]) -> Option<BookView> {
     let slot = markets.get(coin.index())?;
     if slot.stale {
         return None;
     }
-    if let Some((book, _)) = &slot.book {
-        let view = BookView::from_levels(
+    let view = if slot.bbo_is_fresher()? {
+        let (bid, ask, _) = slot.bbo.as_ref()?;
+        BookView::from_levels(
+            bid.iter().map(|level| (level.px, level.sz)),
+            ask.iter().map(|level| (level.px, level.sz)),
+            0,
+            0,
+        )
+    } else {
+        let (book, _) = slot.book.as_ref()?;
+        BookView::from_levels(
             book.bids.iter().map(|level| (level.px, level.sz)),
             book.asks.iter().map(|level| (level.px, level.sz)),
             0,
             book.time_ms,
-        );
-        if !view.bids.is_empty() || !view.asks.is_empty() {
-            return Some(view);
-        }
-    }
-    let (bid, ask, _) = slot.bbo.as_ref()?;
-    Some(BookView::from_levels(
-        bid.iter().map(|level| (level.px, level.sz)),
-        ask.iter().map(|level| (level.px, level.sz)),
-        0,
-        0,
-    ))
+        )
+    };
+    (!view.bids.is_empty() || !view.asks.is_empty()).then_some(view)
 }
 
 /// The size a resting order could fill as a maker against `book`, if the book
@@ -736,6 +740,100 @@ mod tests {
     /// A one-element slice borrowing `slot`, avoiding a needless clone.
     fn one(slot: &MarketSlot) -> &[MarketSlot] {
         std::slice::from_ref(slot)
+    }
+
+    fn level(px: &str) -> Level {
+        Level {
+            px: ds(px),
+            sz: ds("5"),
+            n: 1,
+        }
+    }
+
+    /// A fixed-size book with the given top of each side (`None` = empty side).
+    fn book_snapshot(bid: Option<&str>, ask: Option<&str>) -> BookSnapshot {
+        let mut bids = [Level::default(); crate::types::BOOK_DEPTH];
+        let mut asks = [Level::default(); crate::types::BOOK_DEPTH];
+        let mut n_bids = 0;
+        let mut n_asks = 0;
+        if let Some(px) = bid {
+            bids[0] = level(px);
+            n_bids = 1;
+        }
+        if let Some(px) = ask {
+            asks[0] = level(px);
+            n_asks = 1;
+        }
+        BookSnapshot {
+            bids,
+            asks,
+            n_bids,
+            n_asks,
+            time_ms: 0,
+        }
+    }
+
+    fn bbo(
+        bid: Option<&str>,
+        ask: Option<&str>,
+        mono_ns: u64,
+    ) -> Option<(Option<Level>, Option<Level>, Stamp)> {
+        Some((bid.map(level), ask.map(level), stamp(mono_ns)))
+    }
+
+    #[test]
+    fn book_for_prefers_the_fresher_source_per_side() {
+        // A fresher empty bbo bid must not fall back to the older book top, but
+        // the fresher bbo ask is used.
+        let slot = MarketSlot {
+            bbo: bbo(None, Some("101"), 20),
+            book: Some((book_snapshot(Some("100"), Some("101")), stamp(10))),
+            ..Default::default()
+        };
+        let view = book_for(CoinId(0), one(&slot)).expect("a one-sided quote");
+        assert!(
+            view.bids.is_empty(),
+            "fresh empty bbo bid leaked the stale book bid: {:?}",
+            view.bids
+        );
+        assert_eq!(view.asks, vec![(ds("101"), ds("5"))]);
+
+        // And vice versa: a fresher empty book bid must not fall back to the
+        // older bbo bid.
+        let slot = MarketSlot {
+            bbo: bbo(Some("99"), Some("99"), 10),
+            book: Some((book_snapshot(None, Some("101")), stamp(20))),
+            ..Default::default()
+        };
+        let view = book_for(CoinId(0), one(&slot)).expect("a one-sided quote");
+        assert!(
+            view.bids.is_empty(),
+            "fresh empty book bid leaked the stale bbo bid: {:?}",
+            view.bids
+        );
+        assert_eq!(view.asks, vec![(ds("101"), ds("5"))]);
+    }
+
+    #[test]
+    fn book_for_uses_the_sole_present_source() {
+        // bbo only: no book snapshot yet.
+        let slot = MarketSlot {
+            bbo: bbo(Some("100"), Some("101"), 20),
+            ..Default::default()
+        };
+        let view = book_for(CoinId(0), one(&slot)).expect("the bbo quote");
+        assert_eq!(view.bids, vec![(ds("100"), ds("5"))]);
+        assert_eq!(view.asks, vec![(ds("101"), ds("5"))]);
+
+        // An older bbo bid is ignored when the book is fresher and has a bid.
+        let slot = MarketSlot {
+            bbo: bbo(None, Some("99"), 10),
+            book: Some((book_snapshot(Some("100"), Some("101")), stamp(20))),
+            ..Default::default()
+        };
+        let view = book_for(CoinId(0), one(&slot)).expect("the book quote");
+        assert_eq!(view.bids, vec![(ds("100"), ds("5"))]);
+        assert_eq!(view.asks, vec![(ds("101"), ds("5"))]);
     }
 
     fn cloid(n: u8) -> Cloid {

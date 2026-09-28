@@ -243,7 +243,13 @@ fn bbo_to_action(c: &mut Criterion) {
             }
 
             // 4. build
-            let touch = |_coin: CoinId| Some((Decimal::from(100), Decimal::from(101)));
+            let touch = |_coin: CoinId, is_buy: bool| {
+                Some(if is_buy {
+                    Decimal::from(101)
+                } else {
+                    Decimal::from(100)
+                })
+            };
             let batch = plan_iteration(
                 actions.as_slice(),
                 &registry,

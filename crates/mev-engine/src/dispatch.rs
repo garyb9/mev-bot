@@ -913,11 +913,17 @@ impl StrategyDispatcher {
         t_decided: u64,
         t_risked: u64,
     ) {
-        let touch = |coin: CoinId| -> Option<(Px, Px)> {
+        let touch = |coin: CoinId, is_buy: bool| -> Option<Px> {
             let slot = state.slot(coin)?;
-            let bid = slot.best_bid()?.px;
-            let ask = slot.best_ask()?.px;
-            Some((bid, ask))
+            // An aggressive order only needs the side it crosses: ask for a
+            // buy, bid for a sell. The other side being empty is not a reason
+            // to drop it.
+            let level = if is_buy {
+                slot.best_ask()
+            } else {
+                slot.best_bid()
+            }?;
+            Some(level.px)
         };
         let mut batch = plan_iteration(
             approved,
@@ -1355,6 +1361,24 @@ mod tests {
         state
     }
 
+    /// A one-sided bbo: `None` marks an empty side reported by the venue.
+    fn state_with_sides(bid: Option<&str>, ask: Option<&str>) -> EngineState {
+        let mut state = EngineState::new(2);
+        let slot = state.slot_mut(CoinId(0)).unwrap();
+        slot.bbo = Some((bid.map(level), ask.map(level), stamp(1_000)));
+        state
+    }
+
+    /// The wire limit price of the single order in a post.
+    fn post_order_price(post: &UnsignedPost) -> Px {
+        match &post.action {
+            VenueAction::Order { orders, .. } => {
+                orders[0].p.as_str().parse().expect("wire price parses")
+            }
+            other => panic!("expected order post, got {other:?}"),
+        }
+    }
+
     fn stamp(mono_ns: u64) -> Stamp {
         Stamp {
             mono_ns,
@@ -1379,6 +1403,14 @@ mod tests {
             cloid: None,
             signal_ms: 0,
             decision_ms: 0,
+        }
+    }
+
+    /// An aggressive (marketable, no limit) variant of [`intent`].
+    fn aggressive(coin: &str, side: Side) -> OrderIntent {
+        OrderIntent {
+            limit_px: None,
+            ..intent(coin, side)
         }
     }
 
@@ -1586,6 +1618,63 @@ mod tests {
                 "each post must carry the triggering frame's read time"
             );
         }
+    }
+
+    #[test]
+    fn aggressive_buy_prices_from_the_ask_when_the_bid_side_is_empty() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(aggressive("BTC", Side::Buy))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+
+        // The bid side is empty, but a buy only needs the ask.
+        let state = state_with_sides(None, Some("100"));
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+
+        let posts = h.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1, "the buy was not dropped");
+        let px = post_order_price(&posts[0]);
+        assert!(
+            px >= ds("100"),
+            "buy must price at or beyond the ask, got {px}"
+        );
+    }
+
+    #[test]
+    fn aggressive_sell_prices_from_the_bid_when_the_ask_side_is_empty() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(aggressive("BTC", Side::Sell))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+
+        // The ask side is empty, but a sell only needs the bid.
+        let state = state_with_sides(Some("100"), None);
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+
+        let posts = h.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1, "the sell was not dropped");
+        let px = post_order_price(&posts[0]);
+        assert!(
+            px <= ds("100"),
+            "sell must price at or below the bid, got {px}"
+        );
+    }
+
+    #[test]
+    fn aggressive_order_is_dropped_when_both_sides_are_empty() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(aggressive("BTC", Side::Buy))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+
+        let state = state_with_sides(None, None);
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+
+        assert!(
+            h.posts.lock().unwrap().is_empty(),
+            "no reference price means no post"
+        );
+        assert!(
+            h.dispatcher.orders.is_empty(),
+            "the dropped place left no live order"
+        );
     }
 
     #[test]

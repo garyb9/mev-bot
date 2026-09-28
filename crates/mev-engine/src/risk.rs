@@ -396,7 +396,7 @@ pub struct RiskCtx<'a> {
     pub orders: &'a OrderManager,
     /// Confirmed positions and margin.
     pub account: &'a AccountState,
-    /// The coin's market slot, for staleness and the reference mid.
+    /// The coin's market slot, for staleness and the reference price.
     pub slot: &'a MarketSlot,
     /// Precomputed asset metadata (tick size).
     pub meta: &'a AssetMeta,
@@ -407,10 +407,18 @@ pub struct RiskCtx<'a> {
 }
 
 impl RiskCtx<'_> {
-    fn mid(&self) -> Option<Px> {
-        let bid = self.slot.best_bid()?.px;
-        let ask = self.slot.best_ask()?.px;
-        Some((bid + ask) / Decimal::TWO)
+    /// The reference price used to value an aggressive (`limit_px: None`) order.
+    ///
+    /// The mid when both sides quote, else the sole quoted side: a buy only
+    /// needs the ask and a sell only needs the bid, so a missing opposite side
+    /// must not block the order. `None` when the slot has no quote at all.
+    fn reference(&self) -> Option<Px> {
+        match (self.slot.best_bid(), self.slot.best_ask()) {
+            (Some(bid), Some(ask)) => Some((bid.px + ask.px) / Decimal::TWO),
+            (Some(bid), None) => Some(bid.px),
+            (None, Some(ask)) => Some(ask.px),
+            (None, None) => None,
+        }
     }
 }
 
@@ -550,7 +558,7 @@ impl RiskGate {
         // 6. reference price and per-order notional.
         let reference = match limit_px {
             Some(px) => px,
-            None => ctx.mid().ok_or(RiskReason::NoReferencePrice)?,
+            None => ctx.reference().ok_or(RiskReason::NoReferencePrice)?,
         };
         if reference <= Decimal::ZERO {
             return Err(RiskReason::NoReferencePrice);
