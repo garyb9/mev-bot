@@ -23,7 +23,10 @@ use mev_core::{
     error::{Error, Result},
 };
 
-use crate::nonce::{DEFAULT_NONCE_LEASE_MS, NONCE_WRITE_QUEUE, NonceLease, NonceManager};
+use crate::nonce::{
+    DEFAULT_MAX_FUTURE_DRIFT_MS, DEFAULT_NONCE_LEASE_MS, NONCE_WRITE_QUEUE, NonceLease,
+    NonceManager,
+};
 use crate::order::{Action, CancelByCloidWire, CancelWire, OrderWire};
 use crate::signing::{AgentSigner, Signature};
 
@@ -375,6 +378,10 @@ pub enum Prepared {
 
 /// Shared write path used by every transport: mode gating, EIP-712 signing,
 /// nonce sequencing, and write-behind lease persistence (SPEC-0002 §5, H-6).
+///
+/// Dropping a `WriteCore` with an attached nonce store drops its [`DbWriter`],
+/// which drains the queue and joins the writer thread — a brief blocking wait
+/// at shutdown.
 pub struct WriteCore {
     signer: Option<AgentSigner>,
     nonce: tokio::sync::Mutex<NonceManager>,
@@ -433,27 +440,53 @@ impl WriteCore {
 
     /// Attach a durable nonce store and restore the persisted high-water mark.
     ///
-    /// The startup prime writes `max(restored, now) + lease` synchronously
+    /// The startup prime writes `max(resumed + 1, now + lease)` synchronously
     /// (once, off the hot path); every later persist is write-behind. The
-    /// nonce manager resumes from the restored value and the drift guard treats
-    /// that value as a trusted floor (SPEC-0002 H-6).
+    /// `+ 1` covers the first send after `resume(resumed)` while keeping a crash
+    /// loop to one nonce per restart rather than a whole lease. The restored
+    /// value is capped at `now + lease + max_future_drift` (beyond that it is
+    /// implausible corruption, not a lease) and becomes the drift guard's floor
+    /// (SPEC-0002 H-6).
     pub fn with_nonce_db(mut self, db: Arc<Mutex<Db>>) -> Result<Self> {
         let now = self.clock.now_ms();
-        let (restored, horizon) = {
+        let (resumed, horizon) = {
             let guard = db
                 .lock()
                 .map_err(|_| Error::Config("db lock poisoned".into()))?;
             let restored = guard.nonce_last()?.unwrap_or(0);
-            let horizon = restored.max(now).saturating_add(self.nonce_lease_ms);
+            let cap = now
+                .saturating_add(self.nonce_lease_ms)
+                .saturating_add(DEFAULT_MAX_FUTURE_DRIFT_MS);
+            let resumed = restored.min(cap);
+            if restored > cap {
+                metrics::counter!(mev_metrics::names::NONCE_RESUME_CAPPED_TOTAL).increment(1);
+                tracing::warn!(
+                    restored,
+                    cap,
+                    "persisted nonce lease beyond the plausible bound; clamping the resume floor"
+                );
+            }
+            let horizon = resumed
+                .saturating_add(1)
+                .max(now.saturating_add(self.nonce_lease_ms));
             guard.set_nonce_last(horizon)?;
-            (restored, horizon)
+            (resumed, horizon)
         };
         let writer = DbWriter::spawn_shared(db, NONCE_WRITE_QUEUE);
         let durable = writer.nonce_hwm();
         let lease = NonceLease::new(writer, horizon, self.nonce_lease_ms, durable, now);
-        self.nonce = tokio::sync::Mutex::new(NonceManager::resume(restored));
+        self.nonce = tokio::sync::Mutex::new(NonceManager::resume(resumed));
         self.nonce_store = Some(lease);
         Ok(self)
+    }
+
+    /// Test-only: attach a lease over an in-memory manager resumed from
+    /// `resume_from`, bypassing SQLite.
+    #[cfg(test)]
+    pub(crate) fn with_test_nonce_store(mut self, lease: NonceLease, resume_from: u64) -> Self {
+        self.nonce = tokio::sync::Mutex::new(NonceManager::resume(resume_from));
+        self.nonce_store = Some(lease);
+        self
     }
 
     /// The effective write gate.
@@ -474,10 +507,18 @@ impl WriteCore {
     }
 
     /// Restore a specific nonce high-water mark.
+    ///
+    /// Clamped to never go below the current in-memory high-water mark, so an
+    /// operator/manual resync cannot force a nonce reuse (SPEC-0002 H-6).
     pub async fn restore_nonce(&self, last: u64) {
-        *self.nonce.lock().await = NonceManager::resume(last);
+        let restore = {
+            let mut guard = self.nonce.lock().await;
+            let restore = last.max(guard.last());
+            *guard = NonceManager::resume(restore);
+            restore
+        };
         if let Some(store) = &self.nonce_store {
-            store.force(last, self.clock.now_ms());
+            store.force(restore, self.clock.now_ms());
         }
     }
 
@@ -735,9 +776,10 @@ impl ExchangeApi for HttpExchange {
 mod tests {
     use super::*;
     use crate::order::{Action, Grouping, Tif, limit_order};
-    use crate::test_metrics::histogram_samples;
+    use crate::test_metrics::{counter_value, histogram_samples};
     use metrics_util::debugging::DebuggingRecorder;
     use mev_core::clock::FixedClock;
+    use mev_metrics::names;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
@@ -1034,6 +1076,196 @@ mod tests {
         // prime: persistence went to the writer channel, not the database.
         assert!(core.last_nonce().await > before);
         assert_eq!(db.lock().unwrap().nonce_last().unwrap(), Some(prime));
+    }
+
+    #[tokio::test]
+    async fn uncommitted_refresh_is_not_trusted_on_restart() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let horizon = 1_000_100u64;
+        let lease_ms = 100u64;
+        let durable = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        // The startup prime is on disk; the sink accepts refreshes but never
+        // commits them, simulating a writer killed mid-write.
+        let lease = NonceLease::with_channel(tx, horizon, lease_ms, durable.clone(), 1_000_000);
+        let core = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_clock(clock.clone())
+            .with_test_nonce_store(lease, 1_000_000);
+
+        let mut sent = Vec::new();
+        for _ in 0..200 {
+            match core.prepare(&simple_action()).await {
+                Ok(Prepared::Send(request)) => sent.push(request.nonce),
+                Ok(Prepared::DryRun(_)) => panic!("live mode must send"),
+                Err(Error::NotSent(_)) => break,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_ok(), "a refresh must have been enqueued");
+        assert_eq!(
+            durable.load(Ordering::Acquire),
+            horizon,
+            "a killed writer must not have advanced the durable mark"
+        );
+        let max_sent = *sent.iter().max().unwrap();
+        assert!(max_sent <= horizon, "{max_sent} must not exceed {horizon}");
+
+        // Restart from the value the writer actually made durable.
+        let restart_horizon = horizon.saturating_add(1).max(1_000_000 + lease_ms);
+        let durable2 = Arc::new(AtomicU64::new(0));
+        let (tx2, rx2) = std::sync::mpsc::sync_channel(64);
+        let restarted = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_clock(clock)
+            .with_test_nonce_store(
+                NonceLease::with_channel(
+                    tx2,
+                    restart_horizon,
+                    lease_ms,
+                    durable2.clone(),
+                    1_000_000,
+                ),
+                horizon,
+            );
+        for _ in 0..10 {
+            match restarted.prepare(&simple_action()).await.unwrap() {
+                Prepared::Send(request) => assert!(
+                    request.nonce > max_sent,
+                    "{} must exceed {max_sent}",
+                    request.nonce
+                ),
+                Prepared::DryRun(_) => panic!("live mode must send"),
+            }
+            // Pretend the writer commits the queued refresh.
+            if let Ok(committed) = rx2.try_recv() {
+                durable2.fetch_max(committed, Ordering::AcqRel);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_refuses_and_counts_when_the_writer_is_gone() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(rx); // writer gone: every enqueue fails
+        let core = metrics::with_local_recorder(&recorder, || {
+            let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            WriteCore::new(Mode::Live, Some(signer()))
+                .unwrap()
+                .with_clock(clock)
+                .with_test_nonce_store(
+                    NonceLease::with_channel(tx, 1_000_100, 100, durable, 1_000_000),
+                    1_000_000,
+                )
+        });
+
+        let mut refused = false;
+        for _ in 0..200 {
+            match core.prepare(&simple_action()).await {
+                Ok(Prepared::Send(_)) => {}
+                Ok(Prepared::DryRun(_)) => panic!("live mode must send"),
+                Err(Error::NotSent(_)) => {
+                    refused = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(refused, "an absent writer must fail closed");
+        assert_eq!(
+            counter_value(
+                snapshotter.snapshot(),
+                names::NONCE_LEASE_REFUSALS_TOTAL,
+                None
+            ),
+            1
+        );
+        assert!(
+            counter_value(
+                snapshotter.snapshot(),
+                names::NONCE_PERSIST_DROPPED_TOTAL,
+                None
+            ) >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn orders_resume_after_a_stalled_write_recovers() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let durable = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u64>(1);
+        let horizon = 1_000_100u64;
+        let lease = NonceLease::with_channel(tx, horizon, 100, durable.clone(), 1_000_000);
+        let core = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_clock(clock)
+            .with_test_nonce_store(lease, 1_000_000);
+
+        let mut refused = false;
+        for _ in 0..200 {
+            match core.prepare(&simple_action()).await {
+                Ok(Prepared::Send(_)) => {}
+                Ok(Prepared::DryRun(_)) => panic!("live mode must send"),
+                Err(Error::NotSent(_)) => {
+                    refused = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(refused, "a stalled writer must fail closed");
+
+        // The writer recovers and commits the highest queued horizon.
+        let mut committed = horizon;
+        while let Ok(value) = rx.try_recv() {
+            committed = committed.max(value);
+        }
+        assert!(committed > horizon, "a refresh must have been queued");
+        durable.store(committed, Ordering::Release);
+
+        match core.prepare(&simple_action()).await {
+            Ok(Prepared::Send(_)) => {}
+            other => panic!("orders should resume after the write recovers: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_persisted_lease_is_capped_on_resume() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        // Persisted far beyond now + lease + max_future_drift: implausible.
+        db.lock()
+            .unwrap()
+            .set_nonce_last(1_000_000 + 10_000_000)
+            .unwrap();
+
+        let core = metrics::with_local_recorder(&recorder, || {
+            WriteCore::new(Mode::Live, Some(signer()))
+                .unwrap()
+                .with_clock(clock)
+                .with_nonce_db(db.clone())
+                .unwrap()
+        });
+
+        let cap = 1_000_000 + DEFAULT_NONCE_LEASE_MS + DEFAULT_MAX_FUTURE_DRIFT_MS;
+        assert_eq!(core.last_nonce().await, cap);
+        assert_eq!(
+            counter_value(
+                snapshotter.snapshot(),
+                names::NONCE_RESUME_CAPPED_TOTAL,
+                None
+            ),
+            1
+        );
     }
 
     #[tokio::test]

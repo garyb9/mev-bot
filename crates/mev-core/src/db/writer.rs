@@ -81,8 +81,11 @@ pub enum WriteCmd {
     Shutdown,
 }
 
-/// Handle to the writer thread. Dropping it does not stop the thread; call
-/// [`DbWriter::shutdown`] for a clean, fully-drained stop.
+/// Handle to the writer thread.
+///
+/// Dropping it drains every queued command and **joins** the writer thread, so
+/// drop blocks briefly at shutdown (it may wait on a slow SQLite write).
+/// [`DbWriter::shutdown`] is the explicit, identically-draining stop.
 pub struct DbWriter {
     tx: SyncSender<WriteCmd>,
     handle: Option<JoinHandle<()>>,

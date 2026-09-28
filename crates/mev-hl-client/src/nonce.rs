@@ -18,7 +18,9 @@
 //! callers that persist the exact sent value.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::mpsc::SyncSender;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mev_core::db::writer::{DbWriter, WriteCmd};
@@ -31,13 +33,21 @@ pub const DEFAULT_MAX_FUTURE_DRIFT_MS: u64 = 60_000;
 
 /// Default look-ahead (in nonce space) persisted ahead of the last sent nonce
 /// by [`NonceLease`] (SPEC-0002 H-6). A 30 s reserve is far larger than the
-/// burst-ahead-of-clock drift of any realistic agent and stays inside the
-/// [`DEFAULT_MAX_FUTURE_DRIFT_MS`] guard.
+/// burst-ahead-of-clock drift of any realistic agent.
 pub const DEFAULT_NONCE_LEASE_MS: u64 = 30_000;
 
 /// Maximum write-behind persist rate for the nonce high-water mark: at most one
-/// enqueue per second once a fresh horizon is due (SPEC-0002 H-6).
+/// enqueue per second once a fresh horizon is due (SPEC-0002 H-6). Urgent (low
+/// headroom) and forced refreshes may exceed this.
 pub const NONCE_WRITE_INTERVAL_MS: u64 = 1_000;
+
+/// Retry interval after a failed or unconfirmed persist, so a dropped enqueue
+/// or a failed SQLite write is retried well before the lease is spent
+/// (SPEC-0002 H-6 review).
+pub const NONCE_RETRY_INTERVAL_MS: u64 = 100;
+
+/// Minimum interval between rate-limited `warn` logs for dropped persists.
+pub const NONCE_WARN_INTERVAL_MS: u64 = 1_000;
 
 /// Bounded queue for coalesced nonce persists. Tiny: a `Copy` value, written at
 /// most once per second.
@@ -179,25 +189,55 @@ impl NonceManager {
     }
 }
 
+/// Where a nonce horizon is written behind (SPEC-0002 H-6).
+enum NonceSink {
+    /// Production: the SQLite write-behind actor.
+    Db(DbWriter),
+    /// Tests: a channel standing in for the writer, so an enqueue can be
+    /// observed (or made to fail) without touching SQLite.
+    #[cfg(test)]
+    Channel(SyncSender<u64>),
+}
+
+impl NonceSink {
+    /// Enqueue `nonce` without blocking; `false` when the queue is full/closed.
+    fn enqueue(&self, nonce: u64) -> bool {
+        match self {
+            NonceSink::Db(writer) => writer.try_send(WriteCmd::Nonce { nonce }),
+            #[cfg(test)]
+            NonceSink::Channel(tx) => tx.try_send(nonce).is_ok(),
+        }
+    }
+}
+
 /// Write-behind nonce durability via a [`DbWriter`] (SPEC-0002 H-6).
 ///
 /// The manager hands out nonces off the wall clock; this controller persists a
-/// high-water mark a *lease* ahead of what is sent, at most once per
-/// [`NONCE_WRITE_INTERVAL_MS`]. Because the persisted value always covers every
-/// sent nonce, a crash that loses the write-behind window cannot reuse a nonce:
-/// on restart the bot resumes from the last durable value (`hwm + 1`, or the
-/// clock if it has passed it).
+/// high-water mark a *lease* ahead of what is sent, coalesced to at most one
+/// enqueue per [`NONCE_WRITE_INTERVAL_MS`] (urgent and forced refreshes may
+/// exceed that). Because the persisted value always covers every sent nonce, a
+/// crash that loses the write-behind window cannot reuse a nonce: on restart the
+/// bot resumes from the last confirmed durable value.
 ///
 /// The durable marker is a shared atomic published by the writer thread *after*
 /// the write is committed. `cover` refuses a send when the reserved nonce is not
-/// covered, so a stalled writer fails closed instead of reusing a nonce.
+/// covered, so a stalled writer fails closed instead of reusing a nonce; a
+/// dropped enqueue or failed write is retried on [`NONCE_RETRY_INTERVAL_MS`].
 pub struct NonceLease {
     lease: u64,
     durable: Arc<AtomicU64>,
     /// Last requested persisted horizon (monotonic).
     requested: AtomicU64,
-    last_request_ms: AtomicU64,
-    writer: DbWriter,
+    /// Time of the last enqueue attempt.
+    last_attempt_ms: AtomicU64,
+    /// The last attempt failed or a requested write is unconfirmed: retry on the
+    /// short interval rather than the coalescing interval.
+    enqueue_failed: AtomicBool,
+    last_warn_ms: AtomicU64,
+    sink: NonceSink,
+    /// Cached metric handles (no per-order label or formatting work).
+    refusals: metrics::Counter,
+    dropped: metrics::Counter,
 }
 
 impl NonceLease {
@@ -211,13 +251,40 @@ impl NonceLease {
         durable: Arc<AtomicU64>,
         now_ms: u64,
     ) -> Self {
+        Self::with_sink(NonceSink::Db(writer), horizon, lease, durable, now_ms)
+    }
+
+    /// Test constructor over a channel sink, returning the shared durable mark
+    /// so a test can simulate the writer confirming (or never confirming).
+    #[cfg(test)]
+    pub(crate) fn with_channel(
+        sink: SyncSender<u64>,
+        horizon: u64,
+        lease: u64,
+        durable: Arc<AtomicU64>,
+        now_ms: u64,
+    ) -> Self {
+        Self::with_sink(NonceSink::Channel(sink), horizon, lease, durable, now_ms)
+    }
+
+    fn with_sink(
+        sink: NonceSink,
+        horizon: u64,
+        lease: u64,
+        durable: Arc<AtomicU64>,
+        now_ms: u64,
+    ) -> Self {
         durable.store(horizon, Ordering::Release);
         Self {
             lease,
             durable,
             requested: AtomicU64::new(horizon),
-            last_request_ms: AtomicU64::new(now_ms),
-            writer,
+            last_attempt_ms: AtomicU64::new(now_ms),
+            enqueue_failed: AtomicBool::new(false),
+            last_warn_ms: AtomicU64::new(0),
+            sink,
+            refusals: metrics::counter!(mev_metrics::names::NONCE_LEASE_REFUSALS_TOTAL),
+            dropped: metrics::counter!(mev_metrics::names::NONCE_PERSIST_DROPPED_TOTAL),
         }
     }
 
@@ -232,19 +299,21 @@ impl NonceLease {
     }
 
     /// Ensure `nonce` is covered by a durable high-water mark, refreshing
-    /// write-behind when the current horizon is spent.
+    /// write-behind when the confirmed mark is half-spent.
     ///
     /// Returns an error (without sending) when durability cannot be guaranteed.
     pub fn cover(&self, nonce: u64, now_ms: u64) -> Result<()> {
-        let requested = self.requested.load(Ordering::Acquire);
-        if nonce.saturating_add(self.lease / 2) >= requested {
-            self.maybe_request(nonce, now_ms);
-        }
         let durable = self.durable.load(Ordering::Acquire);
-        if nonce > durable {
-            return Err(Error::NotSent(format!(
-                "nonce {nonce} exceeds the durable high-water mark {durable}; refusing to send"
-            )));
+        // Trigger on the *confirmed* durable mark (not just the requested
+        // horizon), so a dropped enqueue or failed write is retried.
+        if nonce.saturating_add(self.lease / 2) >= durable {
+            self.maybe_request(nonce, now_ms, durable);
+        }
+        if nonce > self.durable.load(Ordering::Acquire) {
+            self.refusals.increment(1);
+            return Err(Error::NotSent(
+                "nonce not covered by the durable high-water mark; refusing to send".to_string(),
+            ));
         }
         Ok(())
     }
@@ -254,14 +323,22 @@ impl NonceLease {
         self.request(nonce, now_ms);
     }
 
-    fn maybe_request(&self, nonce: u64, now_ms: u64) {
-        let durable = self.durable.load(Ordering::Acquire);
-        let last = self.last_request_ms.load(Ordering::Relaxed);
+    fn maybe_request(&self, nonce: u64, now_ms: u64, durable: u64) {
         // Coalesce to at most one write per interval, unless durability is at
         // risk and we must extend the horizon immediately.
         let urgent = nonce.saturating_add(self.lease / 4) >= durable;
-        if !urgent && now_ms < last.saturating_add(NONCE_WRITE_INTERVAL_MS) {
-            return;
+        if !urgent {
+            let pending = self.enqueue_failed.load(Ordering::Acquire)
+                || self.requested.load(Ordering::Acquire) > durable;
+            let interval = if pending {
+                NONCE_RETRY_INTERVAL_MS
+            } else {
+                NONCE_WRITE_INTERVAL_MS
+            };
+            let last = self.last_attempt_ms.load(Ordering::Relaxed);
+            if now_ms < last.saturating_add(interval) {
+                return;
+            }
         }
         self.request(nonce, now_ms);
     }
@@ -284,11 +361,27 @@ impl NonceLease {
                 Err(current) => prev = current,
             }
         }
-        self.last_request_ms.store(now_ms, Ordering::Relaxed);
+        self.last_attempt_ms.store(now_ms, Ordering::Relaxed);
         // A `Copy` value on a bounded channel; never blocks, never allocates.
-        if !self.writer.try_send(WriteCmd::Nonce { nonce: target }) {
-            // The durable marker will not advance; the next `cover` fails closed.
-            tracing::debug!(horizon = target, "nonce write-behind enqueue dropped");
+        if self.sink.enqueue(target) {
+            self.enqueue_failed.store(false, Ordering::Release);
+            return;
+        }
+        // Roll the horizon back so a later attempt can retry it; if another
+        // thread already advanced past us, leave its higher value in place.
+        let _ = self
+            .requested
+            .compare_exchange(target, prev, Ordering::AcqRel, Ordering::Relaxed);
+        self.enqueue_failed.store(true, Ordering::Release);
+        self.dropped.increment(1);
+        // Rate-limited: a persistent failure must not log per order.
+        let last = self.last_warn_ms.load(Ordering::Relaxed);
+        if now_ms >= last.saturating_add(NONCE_WARN_INTERVAL_MS) {
+            self.last_warn_ms.store(now_ms, Ordering::Relaxed);
+            tracing::warn!(
+                horizon = target,
+                "nonce write-behind enqueue dropped; durability retry scheduled"
+            );
         }
     }
 }
@@ -296,6 +389,9 @@ impl NonceLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_metrics::counter_value;
+    use metrics_util::debugging::DebuggingRecorder;
+    use mev_metrics::names;
 
     #[test]
     fn monotonic_within_same_millisecond() {
@@ -379,5 +475,64 @@ mod tests {
         assert_eq!(lease.requested(), 1_050);
         // Still covered by the confirmed prime.
         assert!(lease.cover(1_000, 2_000).is_ok());
+    }
+
+    #[test]
+    fn lease_retries_after_a_dropped_enqueue() {
+        let durable = Arc::new(AtomicU64::new(0));
+        // Capacity 1 with no consumer: the first refresh is buffered (queue
+        // full), the retry succeeds once the test drains it.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let lease = NonceLease::with_channel(tx, 10_000, 1_000, durable, 0);
+
+        // First refresh: buffered.
+        assert!(lease.cover(9_500, 2_000).is_ok());
+        assert_eq!(lease.requested(), 10_500);
+
+        // Second refresh on a full queue: dropped, requested rolled back.
+        assert!(lease.cover(9_600, 2_100).is_ok());
+        assert_eq!(lease.requested(), 10_500);
+
+        // The short retry interval then re-enqueues the same horizon.
+        assert_eq!(rx.try_recv().unwrap(), 10_500);
+        assert!(lease.cover(9_600, 2_200).is_ok());
+        assert_eq!(lease.requested(), 10_600);
+        assert_eq!(rx.try_recv().unwrap(), 10_600);
+    }
+
+    #[test]
+    fn lease_refuses_and_counts_when_the_writer_is_gone() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let refused = metrics::with_local_recorder(&recorder, || {
+            let durable = Arc::new(AtomicU64::new(0));
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            drop(rx); // writer gone: every enqueue fails
+            let lease = NonceLease::with_channel(tx, 1_000, 100, durable.clone(), 0);
+            // A crossing tries to persist and is dropped.
+            let _ = lease.cover(950, 2_000);
+            // Past the durable prime the lease fails closed.
+            let refused = lease.cover(1_001, 2_000).unwrap_err();
+            assert_eq!(durable.load(Ordering::Acquire), 1_000);
+            refused
+        });
+
+        assert!(matches!(refused, Error::NotSent(_)), "got {refused:?}");
+        assert_eq!(
+            counter_value(
+                snapshotter.snapshot(),
+                names::NONCE_LEASE_REFUSALS_TOTAL,
+                None
+            ),
+            1
+        );
+        assert!(
+            counter_value(
+                snapshotter.snapshot(),
+                names::NONCE_PERSIST_DROPPED_TOTAL,
+                None
+            ) >= 1,
+            "the dropped enqueue must be counted"
+        );
     }
 }

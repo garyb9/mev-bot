@@ -41,6 +41,15 @@ pub mod names {
     pub const NONCE_ERRORS: &str = "hl_nonce_errors_total";
     /// Nonce self-heal resets, tagged by reason.
     pub const NONCE_RESETS: &str = "hl_nonce_resets_total";
+    /// Sends refused because the reserved nonce was not covered by a confirmed
+    /// durable high-water mark (SPEC-0002 H-6).
+    pub const NONCE_LEASE_REFUSALS_TOTAL: &str = "hl_nonce_lease_refusals_total";
+    /// Write-behind nonce persists dropped because the writer queue was full or
+    /// the writer was gone (SPEC-0002 H-6).
+    pub const NONCE_PERSIST_DROPPED_TOTAL: &str = "hl_nonce_persist_dropped_total";
+    /// Restored nonce leases clamped to the plausible future bound at resume
+    /// (SPEC-0002 H-6).
+    pub const NONCE_RESUME_CAPPED_TOTAL: &str = "hl_nonce_resume_capped_total";
     /// Whether the dead-man's switch is currently armed (0/1).
     pub const DEADMAN_ARMED: &str = "hl_deadman_armed";
     /// Dead-man's switch arm/refresh submissions.
