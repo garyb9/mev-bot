@@ -440,13 +440,13 @@ impl WriteCore {
 
     /// Attach a durable nonce store and restore the persisted high-water mark.
     ///
-    /// The startup prime writes `max(resumed + 1, now + lease)` synchronously
-    /// (once, off the hot path); every later persist is write-behind. The
-    /// `+ 1` covers the first send after `resume(resumed)` while keeping a crash
-    /// loop to one nonce per restart rather than a whole lease. The restored
-    /// value is capped at `now + lease + max_future_drift` (beyond that it is
-    /// implausible corruption, not a lease) and becomes the drift guard's floor
-    /// (SPEC-0002 H-6).
+    /// The startup prime is `min(max(resumed, now) + lease, cap)`, at least
+    /// `resumed + 1`, where `cap = now + lease + max_future_drift`. That keeps a
+    /// full lease of headroom after a normal restart while a crash loop cannot
+    /// ratchet the horizon past the plausible bound (it grows by at most a lease
+    /// per restart until capped, then is stable). The restored value is capped
+    /// at `cap` (beyond it the value is implausible corruption, not a lease) and
+    /// becomes the drift guard's floor (SPEC-0002 H-6).
     pub fn with_nonce_db(mut self, db: Arc<Mutex<Db>>) -> Result<Self> {
         let now = self.clock.now_ms();
         let (resumed, horizon) = {
@@ -466,9 +466,13 @@ impl WriteCore {
                     "persisted nonce lease beyond the plausible bound; clamping the resume floor"
                 );
             }
+            // Full lease headroom, but never past the plausible bound; always
+            // cover the first send after `resume(resumed)`.
             let horizon = resumed
-                .saturating_add(1)
-                .max(now.saturating_add(self.nonce_lease_ms));
+                .max(now)
+                .saturating_add(self.nonce_lease_ms)
+                .min(cap)
+                .max(resumed.saturating_add(1));
             guard.set_nonce_last(horizon)?;
             (resumed, horizon)
         };
@@ -1266,6 +1270,32 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn restart_prime_is_bounded_across_a_crash_loop() {
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        // now + lease + max_future_drift, plus the +1 needed to cover resume.
+        let bound = 1_000_000 + 100 + DEFAULT_MAX_FUTURE_DRIFT_MS + 1;
+        let mut last = 0u64;
+        for _ in 0..8 {
+            let core = WriteCore::new(Mode::Live, Some(signer()))
+                .unwrap()
+                .with_clock(clock.clone())
+                .with_nonce_lease(100)
+                .with_nonce_db(db.clone())
+                .unwrap();
+            let prime = db.lock().unwrap().nonce_last().unwrap().unwrap();
+            assert!(prime >= last, "the restart prime must not regress");
+            assert!(prime <= bound, "prime {prime} must stay within {bound}");
+            // The first send after resume is covered by the prime.
+            assert!(matches!(
+                core.prepare(&simple_action()).await.unwrap(),
+                Prepared::Send(_)
+            ));
+            last = prime;
+        }
     }
 
     #[tokio::test]
