@@ -13,6 +13,8 @@ crypto bluechips. The original Ethereum Uniswap V2 bot is retired under
   and roadmap.
 - [`AGENTS.md`](AGENTS.md): how agents and contributors work in this repo.
 
+**Docs:** [GOAL](docs/GOAL.md) · [ARCHITECTURE](docs/ARCHITECTURE.md) · [REFERENCES](docs/REFERENCES.md).
+
 > Status: **M0–M2 done** (platform, HyperCore market data, signing and
 > execution) and the **T0 fix-first list is complete**
 > ([`docs/GOAL.md`](docs/GOAL.md) §2.2: cloid/status/aggressive pricing,

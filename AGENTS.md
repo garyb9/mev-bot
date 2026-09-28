@@ -6,8 +6,11 @@ Instructions for every AI agent (and human) working in this repository.
 
 1. [`docs/GOAL.md`](docs/GOAL.md): what we are building, why, how success is
    measured, the **latency-first** rules, and the roadmap. **Mandatory.**
-2. The spec that owns your task (see §3). Specs live in [`specs/`](specs/).
-3. The code you are about to touch, and its tests.
+2. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): how the processes, crates,
+   hot path, and modes fit together. External links live in
+   [`docs/REFERENCES.md`](docs/REFERENCES.md).
+3. The spec that owns your task (see §3). Specs live in [`specs/`](specs/).
+4. The code you are about to touch, and its tests.
 
 If your task conflicts with `docs/GOAL.md` or with its spec, **stop and say so**.
 Don't pick one silently.
