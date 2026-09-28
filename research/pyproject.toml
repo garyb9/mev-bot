@@ -24,6 +24,7 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 hlr-tardis-fetch = "hlr.backfill.tardis:main"
+hlr-tardis-normalize = "hlr.backfill.tardis_normalize:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hlr"]
