@@ -56,3 +56,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  bench:
+    name: bench (quick, warn-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Self-check the baseline comparison script
+        run: python3 scripts/bench_check.py --self-test
+      # One CRITERION_HOME per bench target: some benchmark ids collide across
+      # binaries (e.g. `decode/l2Book` exists in both the client and engine
+      # benches), and a shared output dir would let the last writer overwrite
+      # the first. An absolute path is required because the bench process runs
+      # with its package directory as the working directory.
+      - name: Quick-mode benchmarks
+        env:
+          MEV_BENCH_QUICK: "1"
+        run: |
+          CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion/hl-decode" \
+            cargo bench -p mev-hl-client --bench decode -- --quick
+          CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion/hl-sign" \
+            cargo bench -p mev-hl-client --bench sign -- --quick
+          CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion/engine-ingest" \
+            cargo bench -p mev-engine --bench ingest -- --quick
+          CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion/bot-engine" \
+            cargo bench -p mev-bot --bench engine -- --quick
+          CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion/recorder-segment" \
+            cargo bench -p mev-recorder --bench segment -- --quick
+      - name: Compare against baseline (warn-only)
+        run: python3 scripts/bench_check.py

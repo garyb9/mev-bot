@@ -1,0 +1,29 @@
+{
+  "generated_at": "2026-09-28T10:21:28+00:00",
+  "host": "GB",
+  "quick_mode": true,
+  "benches": {
+    "bot-engine/bbo_to_action": 27973.44,
+    "bot-engine/drain_1000": 38238.686,
+    "bot-engine/ingest_to_engine/decode_send_dispatch": 271221.775,
+    "bot-engine/ingest_to_engine/legacy_ws_decode": 653699.949,
+    "bot-engine/replay_throughput/ingest_apply": 237563.332,
+    "engine-ingest/decode_ctx": 60197.472,
+    "engine-ingest/decode_l2Book": 114504.9,
+    "engine-ingest/decode_trades": 76351.538,
+    "engine-ingest/handoff_thread_latency": 190.673,
+    "engine-ingest/handoff_try_send": 9.381,
+    "hl-decode/decode_activeAssetCtx": 114704.997,
+    "hl-decode/decode_allMids": 1948852.688,
+    "hl-decode/decode_l2Book": 253812.227,
+    "hl-decode/decode_trades": 187387.139,
+    "hl-decode/json_value_activeAssetCtx": 103748.611,
+    "hl-decode/json_value_allMids": 854971.828,
+    "hl-decode/json_value_l2Book": 259953.51,
+    "hl-decode/json_value_trades": 167338.713,
+    "hl-sign/sign_batch_10": 28083.352,
+    "hl-sign/sign_one_order": 27392.942,
+    "hl-sign/ws_post_round_trip": 41708.697,
+    "recorder-segment/segment_try_send_1k": 126.76
+  }
+}

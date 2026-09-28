@@ -185,7 +185,7 @@ Milestones later in the list may split into smaller commits (e.g. client vs benc
 |---|---|---|---|---|
 | C-1 | `cargo deny` (advisories, licenses, bans incl. `ethers`, duplicate-version warnings) + `deny.toml` | T1 | S | ✅ |
 | C-2 | Switch tests to `cargo nextest` | T1 | S | ✅ |
-| C-3 | Bench job in quick mode (decode, sign, SPEC-0010 engine benches) comparing against a stored baseline; **warn** on > 15% regression (shared runners are noisy, so it doesn't fail the build) | T1 | M | ☐ |
+| C-3 | Bench job in quick mode (decode, sign, SPEC-0010 engine benches) comparing against a stored baseline; **warn** on > 15% regression (shared runners are noisy, so it doesn't fail the build) | T1 | M | ✅ |
 | C-4 | Research CI: `uv run ruff check` + `uv run pytest` in `research/` when that directory changes | T1 | S | ✅ |
 
 *Done when* (each): the job runs on PRs and on `main`, and is green on the current tree. C-1 must fail the build if `ethers` enters the graph.
