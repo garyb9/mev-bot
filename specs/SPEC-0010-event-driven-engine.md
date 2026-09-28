@@ -251,7 +251,7 @@ SPEC-0004 owns the rules; this section fixes the interface and the performance c
 
 `trait EngineClock { fn now(&self) -> Stamp; fn mono_ns(&self) -> u64; }`
 
-- `LiveClock`: `SystemTime` + a monotonic anchor.
+- `LiveClock`: `SystemTime` for wall time (nonces, logs) + the **process-global monotonic clock shared with the raw socket** (`mev_hl_client::raw_ws::mono_ns`), so engine latency spans and received-frame stamps live on one monotonic timeline.
 - `ReplayClock`: the time of the event being processed (from recorded `t_ns`/`mono_ns`); timers fire when replayed time passes their deadline.
 - Nonces use wall time in live, and the replay clock in simulate/replay (signatures in replay are never sent).
 
