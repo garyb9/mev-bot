@@ -23,9 +23,17 @@ Grading follows §13.6: on the out-of-sample 60/40 split, using the §13.10
 headline variant (``adj_jitter`` = competition-adjusted + jittered latency) at
 the threshold's headline latency and headline capital. PASS needs the APR point
 at or above the target **and** the 90% CI lower bound at or above the floor;
-quality gates (episodes/day, concentration, coverage, robustness) must also
-hold. Naive numbers are shown only as context. A ``HIST-PRELIM`` study (§13.11)
-can never PASS: its verdict is capped at MARGINAL.
+quality gates (episodes/day, concentration, coverage) must also hold. Naive
+numbers are shown only as context.
+
+False-PASS paths are closed: the headline cell must be exactly ``adj_jitter`` at
+the smallest grid latency >= the threshold headline (INCONCLUSIVE otherwise),
+and the headline capital must have been run (no nearest-match); data provenance
+is derived from the tables' ``source`` column (anything but ``recorder`` is
+backfill), a ``HIST-PRELIM`` report, a preliminary report, and a report whose
+buffered-cost robustness re-run does not stay positive are all capped at
+MARGINAL; and a report whose episode parquet no longer matches its stored
+sha256 digest is INCONCLUSIVE.
 
 This is research code. It is never imported by, or deployed with, the bot; it
 reads no keys and no network.
@@ -34,6 +42,7 @@ reads no keys and no network.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -67,6 +76,9 @@ __all__ = [
     "ReportError",
     "build_front_matter",
     "build_report",
+    "canonical_digest",
+    "canonical_episodes",
+    "episode_digest",
     "grade_study",
     "parse_front_matter",
     "rank_studies",
@@ -87,10 +99,7 @@ RANKING_FILENAME = "RANKING.md"
 #: Fence that opens and closes the front-matter block.
 _FENCE = "---"
 #: Report-section order for :func:`render_report` (§13.7).
-_SECTION_KEYS = ("data", "method", "artifacts", "sensitivity", "sanity", "reproduce")
-#: The capture variants in preference order for the headline (§13.10 first).
-_VARIANT_FALLBACK = ("adj_jitter", "adj", "jitter", "naive")
-#: ``captured``/``open`` column formats per capture variant (mirrors ``hlr.episodes``).
+_SECTION_KEYS = ("data", "method", "artifacts", "sensitivity", "sanity", "reproduce")#: ``captured``/``open`` column formats per capture variant (mirrors ``hlr.episodes``).
 _CAPTURED_FORMAT = {
     "naive": "captured_{lat}",
     "adj": "captured_adj_{lat}",
@@ -132,6 +141,7 @@ class GradeResult:
     apr: float | None
     apr_ci90_lo: float | None
     usd_per_day: float | None
+    robust_usd_per_day: float | None
     naive_apr: float | None
     naive_usd_per_day: float | None
     in_sample_apr: float | None
@@ -201,16 +211,16 @@ def build_front_matter(
     days: int,
     coverage_pct: float,
     capital_runs: Mapping[float, pl.DataFrame],
+    max_notional: Mapping[float, float],
     all_dates: Sequence[_dt.date],
     prereg_sha: str = "",
     cells_k: int | None = None,
     preliminary: bool = False,
-    data_source: str = "forward",
-    backfill_sources: Sequence[str] = (),
     fidelity_class: str | None = None,
-    robustness_ok: bool = True,
+    robustness_runs: Mapping[float, pl.DataFrame] | None = None,
+    episode_parquet: str | None = None,
+    reports_dir: str | Path | None = None,
     headline_latency_ms: int = 250,
-    headline_variant: str = HEADLINE_VARIANT,
     headline_capital_usd: float | None = None,
     latencies_ms: Sequence[int] = DEFAULT_LATENCIES_MS,
     capture_variants: Sequence[str] | None = None,
@@ -221,12 +231,18 @@ def build_front_matter(
     """Compute the §13.5 metrics and assemble a study's report front-matter.
 
     ``capital_runs`` maps each capital-grid point (USD) to the episode table the
-    study detected with that point's ``max_notional``. The episodes are split
-    chronologically 60/40 (:func:`hlr.episodes.oos_split`); both samples get one
-    metrics row per ``(latency, capture_variant)`` and the headline (§13.10) is
-    the out-of-sample one. ``all_dates`` is every valid day, so zero-episode days
-    count. ``concentration`` is the best OOS day's share of captured USD at the
-    declared headline cell (a §13.6 quality gate).
+    study detected with that point's ``max_notional`` (required, and asserted
+    against ``size_usd_at_start``). The episodes are split chronologically 60/40
+    (:func:`hlr.episodes.oos_split`); both samples get one metrics row per
+    ``(latency, capture_variant)`` with per-cell ``concentration`` and, when
+    ``robustness_runs`` is given, a ``usd_per_day_robust`` from the buffered-cost
+    re-run.
+
+    Data provenance is derived, never asserted by the caller: if any input table
+    carries a non-``recorder`` ``source`` column the study is stamped
+    ``backfill``, which makes the verdict ``HIST-PRELIM`` (§13.11). The canonical
+    episode digest (and optional parquet path) let ``hlr-rank`` detect a report
+    that no longer matches its data.
     """
     if implementation_cost not in _IMPL_ORDER:
         raise ReportError(
@@ -238,14 +254,30 @@ def build_front_matter(
     if days != len(dates):
         raise ReportError(f"days ({days}) must equal len(all_dates) ({len(dates)})")
     in_sample, out_sample = oos_split(dates)
+    if days != len(in_sample) + len(out_sample):
+        raise ReportError("days must equal in-sample plus out-of-sample days")
     sorted_capitals = sorted(float(c) for c in capital_runs)
+    data_source, backfill_sources = _provenance(capital_runs)
 
     capital_blocks: list[dict[str, Any]] = []
     for capital in sorted_capitals:
-        episodes = capital_runs[_as_key(capital_runs, capital)]
+        key = _as_key(capital_runs, capital)
+        episodes = capital_runs[key]
+        if key not in max_notional:
+            raise ReportError(f"missing max_notional for capital ${capital:,.0f}")
+        max_not = _as_float(max_notional[key])
+        sizes = episodes["size_usd_at_start"] if "size_usd_at_start" in episodes.columns else None
+        largest = sizes.max() if sizes is not None else None
+        if largest is not None and float(largest) > max_not:
+            raise ReportError(
+                f"episode size_usd_at_start {float(largest):.2f} exceeds "
+                f"max_notional {max_not:.2f} at capital ${capital:,.0f}"
+            )
+        robust = robustness_runs.get(key) if robustness_runs else None
         capital_blocks.append(
             {
                 "capital_usd": capital,
+                "max_notional": max_not,
                 "in_sample": _sample_rows(
                     episodes,
                     in_sample,
@@ -254,6 +286,7 @@ def build_front_matter(
                     capture_variants=capture_variants,
                     bootstrap_draws=bootstrap_draws,
                     bootstrap_seed=bootstrap_seed,
+                    robust_episodes=robust,
                 ),
                 "oos": _sample_rows(
                     episodes,
@@ -263,12 +296,16 @@ def build_front_matter(
                     capture_variants=capture_variants,
                     bootstrap_draws=bootstrap_draws,
                     bootstrap_seed=bootstrap_seed,
-                ),
-                "concentration": _concentration(
-                    episodes, out_sample, headline_latency_ms, headline_variant
+                    robust_episodes=robust,
                 ),
             }
         )
+
+    digest = episode_digest(capital_runs)
+    if episode_parquet is not None and reports_dir is not None:
+        destination = Path(reports_dir) / episode_parquet
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        canonical_episodes(capital_runs).write_parquet(destination)
 
     merged = _default_sections()
     if sections:
@@ -284,7 +321,8 @@ def build_front_matter(
     if not merged.get("top_episodes"):
         run = capital_runs[_as_key(capital_runs, headline_cap)]
         merged["top_episodes"] = top_episodes(
-            run, _nearest_latency(latencies_ms, headline_latency_ms), headline_variant
+            run, _ceiling_latency(latencies_ms, headline_latency_ms) or max(latencies_ms),
+            HEADLINE_VARIANT,
         )
 
     return _json_safe(
@@ -303,9 +341,10 @@ def build_front_matter(
             "data_source": data_source,
             "backfill_sources": list(backfill_sources),
             "fidelity_class": fidelity_class,
-            "robustness_ok": bool(robustness_ok),
+            "episode_digest": digest,
+            "episode_parquet": episode_parquet,
             "headline_latency_ms": int(headline_latency_ms),
-            "headline_variant": headline_variant,
+            "headline_variant": HEADLINE_VARIANT,
             "headline_capital_usd": headline_cap,
             "latency_grid_ms": [int(lat) for lat in latencies_ms],
             "capture_variants": list(capture_variants)
@@ -362,35 +401,37 @@ def grade_study(
     implementation_cost = str(front_matter.get("implementation_cost") or "M")
     days = _as_int(front_matter.get("days"), "days")
     preliminary = bool(front_matter.get("preliminary", False))
-    hist = str(front_matter.get("data_source", "forward")) == "backfill"
+    forward = _is_forward(front_matter)
+    hist = not forward
     qualifier = _qualifier(front_matter) if hist else None
+
+    _check_day_counts(front_matter, days)
 
     reasons: list[str] = []
     capital_runs = _capital_runs(front_matter)
-    lat = _nearest_latency(_latency_grid(front_matter, th), th.latency.headline_ms)
-    cap, cap_exact = _nearest_capital(capital_runs, float(th.capital.headline_usd))
-    if not cap_exact:
-        reasons.append(
-            f"headline capital ${th.capital.headline_usd:,} not run; using nearest ${cap:,.0f}"
-        )
-    run = _nearest_run(capital_runs, cap)
+    lat = _ceiling_latency(_latency_grid(front_matter, th), th.latency.headline_ms)
+    run = _exact_run(capital_runs, float(th.capital.headline_usd))
+    cap = float(run.get("capital_usd")) if run is not None else None
     oos = run.get("oos", []) if run else []
-    variant = _headline_variant(oos, lat, reasons)
+    variant = (
+        HEADLINE_VARIANT
+        if lat is not None and _find_row(oos, lat, HEADLINE_VARIANT) is not None
+        else None
+    )
     row = _find_row(oos, lat, variant) if variant else None
 
-    concentration = _optional_float(run.get("concentration")) if run else None
+    concentration = _optional_float(row.get("concentration")) if row else None
+    robust = _optional_float(row.get("usd_per_day_robust")) if row else None
     coverage = _optional_float(front_matter.get("coverage_pct"))
 
     apr = _optional_float(row.get("apr")) if row else None
     apr_ci_lo = _optional_float(row.get("apr_ci90_lo")) if row else None
     usd_per_day = _optional_float(row.get("usd_per_day")) if row else None
-    naive_row = _find_row(oos, lat, "naive") if oos else None
+    naive_row = _find_row(oos, lat, "naive") if oos and lat is not None else None
     naive_apr = _optional_float(naive_row.get("apr")) if naive_row else None
     naive_usd = _optional_float(naive_row.get("usd_per_day")) if naive_row else None
     is_row = (
-        _find_row(run.get("in_sample", []), lat, variant)
-        if run and variant
-        else None
+        _find_row(run.get("in_sample", []), lat, variant) if run and variant else None
     )
     in_apr = _optional_float(is_row.get("apr")) if is_row else None
 
@@ -399,13 +440,32 @@ def grade_study(
         if concentration is not None
         else 0.0
     )
-    apr_by_capital = _apr_by_capital(capital_runs, th, lat, variant or "")
+    apr_by_capital = _apr_by_capital(capital_runs, th, lat)
 
     min_days = _MIN_DAYS_PRELIM if preliminary else _MIN_DAYS_FINAL
     verdict: str
     if days < min_days:
         verdict = INCONCLUSIVE
         reasons.append(f"only {days} valid day(s); need >= {min_days} for this report")
+    elif bool(front_matter.get("_digest_mismatch")):
+        verdict = INCONCLUSIVE
+        reasons.append("episode parquet digest does not match the report")
+    elif lat is None:
+        verdict = INCONCLUSIVE
+        reasons.append(
+            f"no grid latency >= headline {th.latency.headline_ms} ms; report is not gradeable"
+        )
+    elif run is None:
+        verdict = INCONCLUSIVE
+        reasons.append(
+            f"headline capital ${th.capital.headline_usd:,} was not run; no nearest match"
+        )
+    elif variant is None:
+        verdict = INCONCLUSIVE
+        reasons.append(
+            f"headline variant `{HEADLINE_VARIANT}` is missing at L = {lat} ms; "
+            "only the §13.10 headline cell may be graded"
+        )
     elif row is None:
         verdict = FAIL
         reasons.append("no out-of-sample metrics for the headline cell")
@@ -417,7 +477,8 @@ def grade_study(
             coverage=coverage,
             episodes_per_day=_optional_float(row.get("episodes_per_day_p50")),
             hist=hist,
-            robustness_ok=bool(front_matter.get("robustness_ok", True)),
+            preliminary=preliminary,
+            robust_usd_per_day=robust,
             thresholds=th,
             reasons=reasons,
         )
@@ -432,10 +493,11 @@ def grade_study(
         implementation_cost=implementation_cost,
         headline_latency_ms=lat,
         headline_capital_usd=cap,
-        headline_variant=variant if variant else None,
+        headline_variant=variant,
         apr=apr,
         apr_ci90_lo=apr_ci_lo,
         usd_per_day=usd_per_day,
+        robust_usd_per_day=robust,
         naive_apr=naive_apr,
         naive_usd_per_day=naive_usd,
         in_sample_apr=in_apr,
@@ -457,11 +519,17 @@ def _grade_cell(
     coverage: float | None,
     episodes_per_day: float | None,
     hist: bool,
-    robustness_ok: bool,
+    preliminary: bool,
+    robust_usd_per_day: float | None,
     thresholds: Thresholds,
     reasons: list[str],
 ) -> str:
-    """Apply the §13.6 quality gates and APR tier; any quality failure is FAIL."""
+    """Apply the §13.6 quality gates and APR tier, then the PASS caps.
+
+    Quality failures (episodes/day, concentration, coverage) are FAIL. A PASS also
+    requires the robustness re-run to stay positive, and is capped at MARGINAL for
+    a HIST-PRELIM report, a preliminary report, or a non-robust one.
+    """
     quality_ok = True
     if episodes_per_day is None:
         quality_ok = False
@@ -488,9 +556,6 @@ def _grade_cell(
         reasons.append(
             f"coverage {coverage:.3f} < {thresholds.quality.min_coverage_pct}"
         )
-    if not robustness_ok:
-        quality_ok = False
-        reasons.append("robustness buffer check failed")
 
     if apr is None or apr_ci_lo is None:
         reasons.append("missing APR / CI")
@@ -503,6 +568,15 @@ def _grade_cell(
     if apr >= thresholds.apr.target and apr_ci_lo >= thresholds.apr.floor:
         if hist:
             reasons.append("HIST-PRELIM cannot PASS (§13.11)")
+            return MARGINAL
+        if preliminary:
+            reasons.append("preliminary report cannot PASS; needs >= 14 valid days")
+            return MARGINAL
+        if robust_usd_per_day is None or robust_usd_per_day <= 0.0:
+            reasons.append(
+                "robustness check failed or missing; usd_per_day at buffered costs "
+                "must stay > 0"
+            )
             return MARGINAL
         return PASS
     reasons.append(
@@ -768,19 +842,23 @@ def _latency_table(fm: Mapping[str, Any], verdict: GradeResult) -> list[str]:
 
 
 def _capital_table(fm: Mapping[str, Any], verdict: GradeResult) -> list[str]:
-    headers = ["Capital (USD)", "usd/day (OOS)", "APR (OOS)", "APR CI lo", "Concentration"]
+    headers = ["Capital (USD)", "max notional", "usd/day (OOS)", "APR (OOS)", "APR CI lo", "Concentration"]
     rows: list[list[str]] = []
     lat = verdict.headline_latency_ms
-    variant = verdict.headline_variant or HEADLINE_VARIANT
     for block in _capital_runs(fm):
-        row = _find_row(block.get("oos", []), lat, variant) if lat is not None else None
+        row = (
+            _find_row(block.get("oos", []), lat, HEADLINE_VARIANT)
+            if lat is not None
+            else None
+        )
         rows.append(
             [
                 f"{_as_float(block.get('capital_usd')):,.0f}",
+                _fmt_usd(block.get("max_notional")),
                 _fmt_usd(_get(row, "usd_per_day")),
                 _fmt_pct(_get(row, "apr")),
                 _fmt_pct(_get(row, "apr_ci90_lo")),
-                _fmt_num(block.get("concentration"), 2),
+                _fmt_num(_get(row, "concentration"), 2),
             ]
         )
     if not rows:
@@ -827,6 +905,10 @@ def _render_verdict(verdict: GradeResult, fm: Mapping[str, Any]) -> list[str]:
             f"concentration {_fmt_num(verdict.concentration, 2)}, "
             f"coverage {_fmt_pct(verdict.coverage_pct)}"
         ),
+        (
+            f"- Robustness (usd/day at buffer × multiplier): "
+            f"{_fmt_usd(verdict.robust_usd_per_day)}"
+        ),
     ]
     if verdict.apr_by_capital:
         grid = ", ".join(
@@ -852,14 +934,22 @@ def _sample_rows(
     capture_variants: Sequence[str] | None,
     bootstrap_draws: int,
     bootstrap_seed: int,
+    robust_episodes: pl.DataFrame | None = None,
 ) -> list[dict[str, Any]]:
-    """One sample split's §13.5 rows, or an empty list for an empty split."""
+    """One sample split's §13.5 rows, or an empty list for an empty split.
+
+    The split is by the ``date`` column, so a frame without one cannot be split
+    and raises instead of silently mixing in-sample rows into the out-of-sample
+    verdict. Each row carries its own ``concentration`` and, when a buffered-cost
+    re-run is supplied, ``usd_per_day_robust``.
+    """
     if not dates:
         return []
-    if "date" in episodes.columns:
-        filtered = episodes.filter(pl.col("date").is_in(list(dates)))
-    else:
-        filtered = episodes
+    if "date" not in episodes.columns:
+        raise ReportError(
+            "episode table has no `date` column; cannot split in-sample/out-of-sample"
+        )
+    filtered = episodes.filter(pl.col("date").is_in(list(dates)))
     metrics = episode_metrics(
         filtered,
         days=len(dates),
@@ -869,8 +959,56 @@ def _sample_rows(
         capital_usd=capital_usd,
         bootstrap_draws=bootstrap_draws,
         bootstrap_seed=bootstrap_seed,
+    ).to_dicts()
+    robust_by_cell = _robust_by_cell(
+        robust_episodes,
+        dates,
+        latencies_ms=latencies_ms,
+        capture_variants=capture_variants,
+        capital_usd=capital_usd,
+        bootstrap_draws=bootstrap_draws,
+        bootstrap_seed=bootstrap_seed,
     )
-    return metrics.to_dicts()
+    for row in metrics:
+        latency = int(row["latency_ms"])
+        variant = str(row["capture_variant"])
+        row["concentration"] = _concentration(filtered, dates, latency, variant)
+        row["usd_per_day_robust"] = robust_by_cell.get((latency, variant))
+    return metrics
+
+
+def _robust_by_cell(
+    robust_episodes: pl.DataFrame | None,
+    dates: Sequence[_dt.date],
+    *,
+    latencies_ms: Sequence[int],
+    capture_variants: Sequence[str] | None,
+    capital_usd: float,
+    bootstrap_draws: int,
+    bootstrap_seed: int,
+) -> dict[tuple[int, str], float | None]:
+    """The buffered-cost ``usd_per_day`` per ``(latency, variant)`` cell."""
+    if robust_episodes is None or not dates:
+        return {}
+    if "date" not in robust_episodes.columns:
+        raise ReportError("robustness table has no `date` column")
+    filtered = robust_episodes.filter(pl.col("date").is_in(list(dates)))
+    rows = episode_metrics(
+        filtered,
+        days=len(dates),
+        all_dates=dates,
+        latencies_ms=latencies_ms,
+        capture_variants=capture_variants,
+        capital_usd=capital_usd,
+        bootstrap_draws=bootstrap_draws,
+        bootstrap_seed=bootstrap_seed,
+    ).to_dicts()
+    return {
+        (int(row["latency_ms"]), str(row["capture_variant"])): _optional_float(
+            row.get("usd_per_day")
+        )
+        for row in rows
+    }
 
 
 def _concentration(
@@ -879,18 +1017,83 @@ def _concentration(
     latency_ms: int,
     variant: str,
 ) -> float | None:
-    """Best day's share of captured USD at the declared headline cell (§13.6)."""
-    if not dates or episodes.height == 0:
-        return 0.0
-    lat = _nearest_latency(DEFAULT_LATENCIES_MS, latency_ms)
+    """Best day's share of captured USD at one cell (§13.6).
+
+    Returns ``None`` when the cell cannot be computed (missing capture column,
+    no dates), so the grader treats it as a failed quality gate rather than a
+    fake zero.
+    """
+    if not dates:
+        return None
     try:
-        daily = daily_capture(episodes, lat, all_dates=dates, variant=variant)
+        daily = daily_capture(episodes, latency_ms, all_dates=dates, variant=variant)
     except EpisodeError:
-        return 0.0
+        return None
     total = float(daily["captured_usd"].sum())
     if total <= 0.0:
         return 0.0
     return float(daily["captured_usd"].max()) / total
+
+
+# --------------------------------------------------------------------------
+# Provenance and digest
+# --------------------------------------------------------------------------
+
+
+def canonical_episodes(capital_runs: Mapping[float, pl.DataFrame]) -> pl.DataFrame:
+    """The canonical combined episode table: every run tagged with ``capital_usd``.
+
+    Column order is normalized so the same runs always produce the same frame (and
+    therefore the same :func:`canonical_digest`), regardless of mapping order.
+    """
+    frames: list[pl.DataFrame] = []
+    for capital in sorted(float(c) for c in capital_runs):
+        frame = capital_runs[_as_key(capital_runs, capital)]
+        frames.append(frame.with_columns(pl.lit(capital).alias("capital_usd")))
+    if not frames:
+        return pl.DataFrame()
+    combined = pl.concat(frames, how="diagonal_relaxed")
+    return combined.select(sorted(combined.columns))
+
+
+def canonical_digest(frame: pl.DataFrame) -> str:
+    """A sha256 over the canonically ordered rows of ``frame``.
+
+    This is the content hash stored in the front-matter and re-checked by
+    ``hlr-rank``; it is independent of parquet metadata and mapping order.
+    """
+    columns = sorted(frame.columns)
+    if frame.height == 0:
+        payload = "|".join(columns)
+    else:
+        view = frame.select(columns).sort(columns)
+        payload = "\n".join(repr(tuple(row)) for row in view.iter_rows())
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def episode_digest(capital_runs: Mapping[float, pl.DataFrame]) -> str:
+    """Canonical sha256 of a study's per-capital episode tables."""
+    return canonical_digest(canonical_episodes(capital_runs))
+
+
+def _provenance(capital_runs: Mapping[float, pl.DataFrame]) -> tuple[str, tuple[str, ...]]:
+    """Derive ``(data_source, backfill_sources)`` from table ``source`` columns.
+
+    A ``recorder`` source is the forward lane; any other source (or no source
+    column at all, which cannot be proven forward) is conservatively backfill.
+    """
+    found_column = False
+    sources: set[str] = set()
+    for frame in capital_runs.values():
+        if "source" in frame.columns:
+            found_column = True
+            sources.update(str(value) for value in frame["source"].unique().to_list())
+    if not found_column:
+        return "unknown", ()
+    non_recorder = tuple(sorted(source for source in sources if source != "recorder"))
+    if non_recorder:
+        return "backfill", non_recorder
+    return "forward", ()
 
 
 def top_episodes(
@@ -935,21 +1138,6 @@ def _capital_runs(front_matter: Mapping[str, Any]) -> list[dict[str, Any]]:
     return blocks
 
 
-def _nearest_run(
-    capital_runs: Sequence[Mapping[str, Any]], capital: float
-) -> Mapping[str, Any] | None:
-    """The run nearest ``capital`` (ties to the lower capital)."""
-    if not capital_runs:
-        return None
-    return min(
-        capital_runs,
-        key=lambda block: (
-            abs(_as_float(block.get("capital_usd")) - capital),
-            _as_float(block.get("capital_usd")),
-        ),
-    )
-
-
 def _find_row(
     rows: Sequence[Mapping[str, Any]], latency_ms: int | None, variant: str
 ) -> Mapping[str, Any] | None:
@@ -965,32 +1153,24 @@ def _find_row(
     return None
 
 
-def _headline_variant(
-    rows: Sequence[Mapping[str, Any]], latency_ms: int, reasons: list[str]
-) -> str | None:
-    """Pick the §13.10 headline variant, falling back to the next best."""
-    variants = {str(row.get("capture_variant")) for row in rows}
-    for variant in _VARIANT_FALLBACK:
-        if variant in variants and _find_row(rows, latency_ms, variant) is not None:
-            if variant != HEADLINE_VARIANT:
-                reasons.append(
-                    f"headline variant `{HEADLINE_VARIANT}` unavailable; used `{variant}`"
-                )
-            return variant
-    return None
-
-
 def _apr_by_capital(
     capital_runs: Sequence[Mapping[str, Any]],
     thresholds: Thresholds,
     latency_ms: int | None,
-    variant: str,
 ) -> tuple[tuple[float, float | None, float | None], ...]:
-    """Per-capital-grid ``(capital, APR, APR CI lo)`` at the headline cell."""
+    """Per-capital-grid ``(capital, APR, APR CI lo)`` at the headline cell.
+
+    A grid point the study did not run has no row and reports ``None`` — it is
+    never approximated from a neighbouring capital.
+    """
     out: list[tuple[float, float | None, float | None]] = []
     for cap in thresholds.capital.grid_usd:
-        run = _nearest_run(capital_runs, float(cap))
-        row = _find_row(run.get("oos", []), latency_ms, variant) if run else None
+        run = _exact_run(capital_runs, float(cap))
+        row = (
+            _find_row(run.get("oos", []), latency_ms, HEADLINE_VARIANT)
+            if run is not None
+            else None
+        )
         out.append(
             (
                 float(cap),
@@ -1005,12 +1185,13 @@ def _headline_block(
     front_matter: Mapping[str, Any], verdict: GradeResult
 ) -> dict[str, Any] | None:
     """The in-sample and out-of-sample headline rows, for the metrics table."""
+    if verdict.headline_capital_usd is None or verdict.headline_latency_ms is None:
+        return None
     run = _run_for_capital(front_matter, verdict.headline_capital_usd)
     if run is None:
         return None
-    variant = verdict.headline_variant or HEADLINE_VARIANT
-    in_row = _find_row(run.get("in_sample", []), verdict.headline_latency_ms, variant)
-    oos_row = _find_row(run.get("oos", []), verdict.headline_latency_ms, variant)
+    in_row = _find_row(run.get("in_sample", []), verdict.headline_latency_ms, HEADLINE_VARIANT)
+    oos_row = _find_row(run.get("oos", []), verdict.headline_latency_ms, HEADLINE_VARIANT)
     if in_row is None and oos_row is None:
         return None
     return {"in_sample": in_row or {}, "oos": oos_row or {}}
@@ -1021,7 +1202,7 @@ def _run_for_capital(
 ) -> Mapping[str, Any] | None:
     if capital is None:
         return None
-    return _nearest_run(_capital_runs(front_matter), float(capital))
+    return _exact_run(_capital_runs(front_matter), float(capital))
 
 
 def _latency_grid(front_matter: Mapping[str, Any], thresholds: Thresholds | None) -> list[int]:
@@ -1034,40 +1215,68 @@ def _latency_grid(front_matter: Mapping[str, Any], thresholds: Thresholds | None
     return list(DEFAULT_LATENCIES_MS)
 
 
-def _nearest(options: Sequence[int], value: int) -> tuple[int, bool]:
-    """Nearest value in ``options`` (ties to the lower); ``(value, exact)``."""
-    ordered = sorted({int(item) for item in options})
-    chosen = min(ordered, key=lambda item: (abs(item - value), item))
-    return chosen, chosen == int(value)
+def _ceiling_latency(options: Sequence[int], value: int) -> int | None:
+    """Smallest ``options`` value >= ``value``, or ``None`` when none exists.
+
+    A study cannot be graded at a latency faster than the grid it evaluated, so
+    the headline latency is rounded *up* to the next grid point; if it is above
+    the whole grid the report is INCONCLUSIVE.
+    """
+    at_or_above = sorted({int(item) for item in options if int(item) >= int(value)})
+    return at_or_above[0] if at_or_above else None
 
 
-def _nearest_latency(options: Sequence[int], value: int) -> int:
-    return _nearest(options, value)[0]
-
-
-def _nearest_capital(
+def _exact_run(
     capital_runs: Sequence[Mapping[str, Any]], capital: float
-) -> tuple[float, bool]:
-    """Nearest run's capital (ties to the lower); ``(capital, exact)``."""
-    ordered = sorted(_as_float(block.get("capital_usd")) for block in capital_runs)
-    chosen = min(ordered, key=lambda item: (abs(item - capital), item))
-    return chosen, chosen == float(capital)
+) -> Mapping[str, Any] | None:
+    """The run whose capital equals ``capital``; no nearest-match fallback."""
+    for block in capital_runs:
+        if _as_float(block.get("capital_usd")) == float(capital):
+            return block
+    return None
 
 
 def _nearest_capital_of(
     capital_runs: Mapping[float, pl.DataFrame], capital: float
 ) -> float:
-    """Nearest key of a ``capital -> episodes`` mapping (ties to the lower)."""
+    """Nearest key of a ``capital -> episodes`` mapping (display only, ties lower)."""
     ordered = sorted(float(key) for key in capital_runs)
     return min(ordered, key=lambda item: (abs(item - capital), item))
 
 
+def _check_day_counts(front_matter: Mapping[str, Any], days: int) -> None:
+    """Verify ``days`` equals the in-sample plus out-of-sample day lists (§13.5)."""
+    in_dates = front_matter.get("in_sample_dates")
+    oos_dates = front_matter.get("oos_dates")
+    if in_dates is None and oos_dates is None:
+        return
+    total = len(in_dates or []) + len(oos_dates or [])
+    if total != days:
+        raise ReportError(
+            f"days ({days}) must equal in_sample_dates + oos_dates ({total})"
+        )
+
+
+def _is_forward(front_matter: Mapping[str, Any]) -> bool:
+    """Whether the front-matter proves forward provenance (§13.11).
+
+    Only ``data_source == "forward"`` exactly, with no backfill sources and no
+    fidelity class, counts as forward; anything else is HIST-PRELIM.
+    """
+    return (
+        str(front_matter.get("data_source", "unknown")) == "forward"
+        and not (front_matter.get("backfill_sources") or [])
+        and front_matter.get("fidelity_class") is None
+    )
+
+
 def _qualifier(front_matter: Mapping[str, Any]) -> str:
-    """The §13.11 qualifier, with the fidelity class when the report has one."""
-    fidelity = front_matter.get("fidelity_class")
-    if fidelity:
-        return f"{HIST_PRELIM} ({fidelity})"
-    return HIST_PRELIM
+    """The §13.11 qualifier, with the fidelity class and backfill sources."""
+    parts: list[str] = []
+    if front_matter.get("fidelity_class"):
+        parts.append(str(front_matter["fidelity_class"]))
+    parts.extend(str(source) for source in (front_matter.get("backfill_sources") or []))
+    return f"{HIST_PRELIM} ({'; '.join(parts)})" if parts else HIST_PRELIM
 
 
 # --------------------------------------------------------------------------

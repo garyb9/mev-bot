@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+import polars as pl
 
 from hlr.report import (
     RANKING_FILENAME,
     ReportError,
+    canonical_digest,
     parse_front_matter,
     rank_studies,
     render_ranking,
@@ -38,8 +41,10 @@ def default_reports_dir() -> Path:
 def scan_reports(reports_dir: str | Path) -> list[dict[str, Any]]:
     """Read the front-matter of every ``O*.md`` report in ``reports_dir``.
 
-    Sorted by path so the scan itself is deterministic. A malformed report raises
-    :class:`hlr.report.ReportError` naming the file.
+    Sorted by path so the scan itself is deterministic. If a report names its
+    episode parquet and that file sits next to it, the digest is re-checked and a
+    mismatch is recorded so :func:`hlr.report.grade_study` returns INCONCLUSIVE.
+    A malformed report raises :class:`hlr.report.ReportError` naming the file.
     """
     directory = Path(reports_dir)
     studies: list[dict[str, Any]] = []
@@ -52,8 +57,30 @@ def scan_reports(reports_dir: str | Path) -> list[dict[str, Any]]:
         except ReportError as err:
             raise ReportError(f"{path}: {err}") from err
         front_matter["_report_path"] = str(path)
+        front_matter["_digest_mismatch"] = _digest_mismatch(front_matter, directory)
         studies.append(front_matter)
     return studies
+
+
+def _digest_mismatch(front_matter: Mapping[str, Any], directory: Path) -> bool:
+    """Whether the report's named episode parquet is present and does not match.
+
+    An absent parquet cannot be checked, so it is not a mismatch; a present but
+    unreadable one is.
+    """
+    parquet = front_matter.get("episode_parquet")
+    if not parquet:
+        return False
+    candidate = Path(str(parquet))
+    if not candidate.is_absolute():
+        candidate = directory / candidate
+    if not candidate.is_file():
+        return False
+    try:
+        frame = pl.read_parquet(candidate)
+    except (OSError, pl.exceptions.PolarsError, ValueError):
+        return True
+    return canonical_digest(frame) != front_matter.get("episode_digest")
 
 
 def build_ranking(

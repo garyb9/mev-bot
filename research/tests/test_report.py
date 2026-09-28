@@ -10,11 +10,15 @@ from __future__ import annotations
 import datetime as _dt
 
 import polars as pl
+import pytest
 
 from hlr.episodes import EpisodeConfig, detect_episodes
 from hlr.report import (
+    ReportError,
     build_front_matter,
     build_report,
+    canonical_digest,
+    episode_digest,
     parse_front_matter,
     render_front_matter,
     render_report,
@@ -79,6 +83,7 @@ def test_front_matter_round_trips() -> None:
         days=5,
         coverage_pct=0.99,
         capital_runs={25_000.0: episodes},
+        max_notional={25_000.0: 10_000.0},
         all_dates=[day(i) for i in range(5)],
         latencies_ms=(100, 250),
     )
@@ -98,6 +103,7 @@ def test_build_report_has_all_seven_sections() -> None:
         days=5,
         coverage_pct=0.99,
         capital_runs={25_000.0: episodes},
+        max_notional={25_000.0: 10_000.0},
         all_dates=[day(i) for i in range(5)],
         latencies_ms=(100, 250),
         sections={"data": {"range": "2024-01-01..05"}, "reproduce": "uv run python -m studies.o1"},
@@ -130,6 +136,7 @@ def test_front_matter_carries_oos_and_in_sample_rows() -> None:
         days=5,
         coverage_pct=0.99,
         capital_runs={25_000.0: episodes},
+        max_notional={25_000.0: 10_000.0},
         all_dates=[day(i) for i in range(5)],
         latencies_ms=(100, 250),
     )
@@ -157,6 +164,7 @@ def test_render_report_requires_front_matter() -> None:
         days=1,
         coverage_pct=1.0,
         capital_runs={25_000.0: episodes},
+        max_notional={25_000.0: 10_000.0},
         all_dates=[day(0)],
         latencies_ms=(250,),
     )
@@ -170,3 +178,64 @@ def test_top_episodes_sorted_by_capture() -> None:
     captured = [row["captured"] for row in rows]
     assert captured == sorted(captured, reverse=True)
     assert len(rows) == 3
+
+
+def build(episodes: pl.DataFrame, **overrides: object) -> dict[str, object]:
+    """Build an O1/O1 front-matter over five days, with overridable inputs."""
+    arguments: dict[str, object] = {
+        "study_id": "O1",
+        "slug": "hip3",
+        "title": "t",
+        "hypothesis": "h",
+        "implementation_cost": "M",
+        "days": 5,
+        "coverage_pct": 0.99,
+        "capital_runs": {25_000.0: episodes},
+        "max_notional": {25_000.0: 10_000.0},
+        "all_dates": [day(i) for i in range(5)],
+        "latencies_ms": (100, 250),
+    }
+    arguments.update(overrides)
+    return build_front_matter(**arguments)  # type: ignore[arg-type]
+
+
+def test_provenance_derived_from_source_column() -> None:
+    recorder = synthetic_episodes([0, 1, 2, 3, 4]).with_columns(
+        pl.lit("recorder").alias("source")
+    )
+    assert build(recorder)["data_source"] == "forward"
+
+    backfill = synthetic_episodes([0, 1, 2, 3, 4]).with_columns(
+        pl.lit("tardis").alias("source")
+    )
+    front_matter = build(backfill)
+    assert front_matter["data_source"] == "backfill"
+    assert front_matter["backfill_sources"] == ["tardis"]
+
+    # No source column means provenance cannot be proven forward.
+    assert build(synthetic_episodes([0, 1, 2, 3, 4]))["data_source"] == "unknown"
+
+
+def test_digest_is_stable_and_content_sensitive() -> None:
+    episodes = synthetic_episodes([0, 1, 2])
+    digest = episode_digest({25_000.0: episodes})
+    assert digest == episode_digest({25_000.0: episodes.clone()})
+    assert canonical_digest(episodes.select(sorted(episodes.columns))) == canonical_digest(
+        episodes
+    )
+    assert episode_digest({25_000.0: synthetic_episodes([0, 1, 2, 3])}) != digest
+    assert build(episodes)["episode_digest"] == digest
+
+
+def test_max_notional_is_required_and_asserted() -> None:
+    episodes = synthetic_episodes([0, 1, 2, 3, 4])
+    with pytest.raises(ReportError, match="max_notional"):
+        build(episodes, max_notional={})
+    with pytest.raises(ReportError, match="max_notional"):
+        build(episodes, max_notional={25_000.0: 500.0})
+
+
+def test_missing_date_column_raises() -> None:
+    episodes = synthetic_episodes([0, 1, 2, 3, 4]).drop("date")
+    with pytest.raises(ReportError, match="date"):
+        build(episodes)

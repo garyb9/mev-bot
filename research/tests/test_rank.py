@@ -10,12 +10,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import polars as pl
 import pytest
 
 from hlr.rank import build_ranking, main, scan_reports
 from hlr.report import (
     HIST_PRELIM,
     INCONCLUSIVE,
+    ReportError,
+    canonical_episodes,
+    episode_digest,
     grade_study,
     rank_studies,
     render_front_matter,
@@ -73,6 +77,8 @@ def metric_row(
     ci_lo: float,
     usd: float = 100.0,
     epd: float = 20.0,
+    concentration: float | None = 0.20,
+    robust: float | None = 80.0,
 ) -> dict[str, Any]:
     return {
         "latency_ms": latency,
@@ -81,6 +87,7 @@ def metric_row(
         "apr_ci90_lo": ci_lo,
         "apr_ci90_hi": apr + 0.05,
         "usd_per_day": usd,
+        "usd_per_day_robust": robust,
         "usd_per_day_ci90_lo": usd * 0.5,
         "usd_per_day_ci90_hi": usd * 1.5,
         "episodes": int(epd * 20),
@@ -95,6 +102,7 @@ def metric_row(
         "markout_1s_median": 0.0,
         "markout_10s_median": -1.0,
         "competition_hint": "mixed",
+        "concentration": concentration,
     }
 
 
@@ -105,12 +113,14 @@ def make_fm(
     ci_lo: float = 0.30,
     usd: float = 100.0,
     epd: float = 20.0,
-    concentration: float = 0.20,
+    concentration: float | None = 0.20,
+    robust: float | None = 80.0,
     coverage: float = 0.99,
     days: int = 20,
     preliminary: bool = False,
     data_source: str = "forward",
-    robustness_ok: bool = True,
+    backfill_sources: list[str] | None = None,
+    fidelity_class: str | None = None,
     implementation_cost: str = "M",
     latency: int = 250,
     latencies: tuple[int, ...] | None = None,
@@ -129,12 +139,33 @@ def make_fm(
             row_apr = apr if headline else naive_apr
             row_ci = ci_lo if headline else naive_apr
             usd_value = usd if headline else usd * 0.5
+            row_robust = robust if headline else None
             oos.append(
-                metric_row(lat, variant, apr=row_apr, ci_lo=row_ci, usd=usd_value, epd=epd)
+                metric_row(
+                    lat,
+                    variant,
+                    apr=row_apr,
+                    ci_lo=row_ci,
+                    usd=usd_value,
+                    epd=epd,
+                    concentration=concentration,
+                    robust=row_robust,
+                )
             )
             in_sample.append(
-                metric_row(lat, variant, apr=row_apr, ci_lo=row_ci, usd=usd_value, epd=epd)
+                metric_row(
+                    lat,
+                    variant,
+                    apr=row_apr,
+                    ci_lo=row_ci,
+                    usd=usd_value,
+                    epd=epd,
+                    concentration=concentration,
+                    robust=row_robust,
+                )
             )
+    in_days = max(0, days - max(1, days - int(days * 0.6)))
+    date_strings = [f"2024-01-{index + 1:02d}" for index in range(days)]
     return {
         "spec": "SPEC-0008",
         "study_id": study_id,
@@ -148,22 +179,25 @@ def make_fm(
         "cells_K": 1,
         "preliminary": preliminary,
         "data_source": data_source,
-        "backfill_sources": ["tardis"] if data_source == "backfill" else [],
-        "fidelity_class": "H1" if data_source == "backfill" else None,
-        "robustness_ok": robustness_ok,
+        "backfill_sources": list(backfill_sources)
+        if backfill_sources is not None
+        else (["tardis"] if data_source == "backfill" else []),
+        "fidelity_class": fidelity_class
+        if fidelity_class is not None
+        else ("H1" if data_source == "backfill" else None),
         "headline_latency_ms": latency,
         "headline_variant": headline_variant,
         "headline_capital_usd": capital,
         "latency_grid_ms": list(grid),
         "capture_variants": list(variants),
-        "in_sample_dates": [],
-        "oos_dates": [],
+        "in_sample_dates": date_strings[:in_days],
+        "oos_dates": date_strings[in_days:],
         "capital": [
             {
                 "capital_usd": capital,
+                "max_notional": 10_000.0,
                 "in_sample": in_sample,
                 "oos": oos,
-                "concentration": concentration,
             }
         ],
         "sections": {},
@@ -205,7 +239,7 @@ def test_grading_boundaries(tmp_path: Path, apr: float, ci_lo: float, expected: 
         {"epd": 5.0},  # episodes/day below the gate
         {"concentration": 0.5},  # concentration above the gate
         {"coverage": 0.5},  # coverage below the gate
-        {"robustness_ok": False},  # robustness check failed
+        {"concentration": None},  # concentration could not be computed
     ],
 )
 def test_quality_failure_is_fail(tmp_path: Path, overrides: dict[str, Any]) -> None:
@@ -220,11 +254,21 @@ def test_too_few_days_is_inconclusive(tmp_path: Path) -> None:
     assert result.verdict == INCONCLUSIVE
 
 
-def test_preliminary_three_days_is_gradeable(tmp_path: Path) -> None:
+def test_preliminary_cannot_pass(tmp_path: Path) -> None:
     result = grade_study(
         make_fm(days=3, preliminary=True, apr=0.5, ci_lo=0.5), thresholds=thresholds(tmp_path)
     )
-    assert result.verdict == PASS
+    assert result.verdict == MARGINAL
+    assert any("preliminary" in reason for reason in result.reasons)
+
+
+@pytest.mark.parametrize("robust", [None, 0.0, -1.0])
+def test_non_robust_cannot_pass(tmp_path: Path, robust: float | None) -> None:
+    result = grade_study(
+        make_fm(apr=0.5, ci_lo=0.5, robust=robust), thresholds=thresholds(tmp_path)
+    )
+    assert result.verdict == MARGINAL
+    assert any("robustness" in reason for reason in result.reasons)
 
 
 # --------------------------------------------------------------------------
@@ -248,14 +292,13 @@ def test_grades_headline_variant_not_naive(tmp_path: Path) -> None:
     assert failing.naive_apr == pytest.approx(0.50)
 
 
-def test_naive_only_falls_back(tmp_path: Path) -> None:
+def test_missing_headline_variant_is_inconclusive(tmp_path: Path) -> None:
     result = grade_study(
-        make_fm(variants=("naive",), headline_variant="naive", apr=0.30, ci_lo=0.30),
+        make_fm(variants=("naive",), headline_variant="naive", apr=0.90, ci_lo=0.90),
         thresholds=thresholds(tmp_path),
     )
-    assert result.verdict == PASS
-    assert result.headline_variant == "naive"
-    assert any("unavailable" in reason for reason in result.reasons)
+    assert result.verdict == INCONCLUSIVE
+    assert any("adj_jitter" in reason for reason in result.reasons)
 
 
 def test_hist_prelim_cannot_pass(tmp_path: Path) -> None:
@@ -267,6 +310,23 @@ def test_hist_prelim_cannot_pass(tmp_path: Path) -> None:
     assert result.qualifier is not None
     assert result.qualifier.startswith(HIST_PRELIM)
     assert any("HIST-PRELIM" in reason for reason in result.reasons)
+
+
+def test_forward_fields_with_any_backfill_marker_is_hist(tmp_path: Path) -> None:
+    th = thresholds(tmp_path)
+    assert grade_study(make_fm(apr=0.6, ci_lo=0.6), thresholds=th).verdict == PASS
+    assert (
+        grade_study(make_fm(apr=0.6, ci_lo=0.6, backfill_sources=["tardis"]), thresholds=th).verdict
+        == MARGINAL
+    )
+    assert (
+        grade_study(make_fm(apr=0.6, ci_lo=0.6, fidelity_class="H1"), thresholds=th).verdict
+        == MARGINAL
+    )
+    assert (
+        grade_study(make_fm(apr=0.6, ci_lo=0.6, data_source="unknown"), thresholds=th).verdict
+        == MARGINAL
+    )
 
 
 def test_hist_prelim_can_still_fail(tmp_path: Path) -> None:
@@ -326,10 +386,32 @@ def test_zero_episode_study_scores_fail_not_missing(tmp_path: Path) -> None:
     assert "FAIL" in text
 
 
-def test_latency_nearest_and_tie_to_lower(tmp_path: Path) -> None:
+def test_headline_latency_rounds_up_to_grid(tmp_path: Path) -> None:
     th = thresholds(tmp_path, headline_ms=250)
     result = grade_study(make_fm(latencies=(100, 500)), thresholds=th)
-    assert result.headline_latency_ms == 100
+    assert result.headline_latency_ms == 500
+
+
+def test_headline_latency_above_grid_is_inconclusive(tmp_path: Path) -> None:
+    th = thresholds(tmp_path, headline_ms=2_000)
+    result = grade_study(make_fm(latencies=(100, 500)), thresholds=th)
+    assert result.verdict == INCONCLUSIVE
+    assert any("grid latency" in reason for reason in result.reasons)
+
+
+def test_headline_capital_must_be_exact(tmp_path: Path) -> None:
+    th = thresholds(tmp_path, headline_usd=30_000)
+    result = grade_study(make_fm(capital=25_000.0), thresholds=th)
+    assert result.verdict == INCONCLUSIVE
+    assert result.headline_capital_usd is None
+    assert any("headline capital" in reason for reason in result.reasons)
+
+
+def test_days_must_equal_sample_dates(tmp_path: Path) -> None:
+    front_matter = make_fm(days=20)
+    front_matter["oos_dates"] = front_matter["oos_dates"][:-1]
+    with pytest.raises(ReportError, match="in_sample_dates"):
+        grade_study(front_matter, thresholds=thresholds(tmp_path))
 
 
 # --------------------------------------------------------------------------
@@ -366,6 +448,27 @@ def test_regrade_after_headline_latency_change(tmp_path: Path) -> None:
     assert fast.verdict == PASS
     assert slow.headline_latency_ms == 500
     assert slow.verdict == FAIL
+
+
+def test_rank_digest_mismatch_is_inconclusive(tmp_path: Path) -> None:
+    runs = {25_000.0: pl.DataFrame({"t_start": [1, 2], "size_usd_at_start": [1.0, 1.0]})}
+    reports = tmp_path / "reports"
+    front_matter = make_fm("O1", apr=0.5, ci_lo=0.5)
+    front_matter["episode_digest"] = episode_digest(runs)
+    front_matter["episode_parquet"] = "O1-episodes.parquet"
+    write_reports(reports, front_matter)
+
+    # A parquet that does not match the digest flips the study to INCONCLUSIVE.
+    pl.DataFrame({"t_start": [99], "size_usd_at_start": [1.0]}).write_parquet(
+        reports / "O1-episodes.parquet"
+    )
+    scanned = scan_reports(reports)
+    assert scanned[0]["_digest_mismatch"] is True
+    assert grade_study(scanned[0], thresholds=thresholds(tmp_path)).verdict == INCONCLUSIVE
+
+    # The matching parquet leaves grading unchanged.
+    canonical_episodes(runs).write_parquet(reports / "O1-episodes.parquet")
+    assert scan_reports(reports)[0]["_digest_mismatch"] is False
 
 
 def test_scan_ignores_non_study_files(tmp_path: Path) -> None:
