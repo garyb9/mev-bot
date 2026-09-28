@@ -140,6 +140,21 @@ impl AgentSigner {
         })
     }
 
+    /// Generate an ephemeral random signer from the OS CSPRNG.
+    ///
+    /// Used for `simulate` runs that have no configured key (SPEC-0002 H-8):
+    /// the key is never persisted, logged, or written to metrics, and its
+    /// address holds no funds. `mainnet` selects the EIP-712 `source` prefix
+    /// exactly like [`Self::from_hex`], so signatures verify against the same
+    /// domain regardless of where the key came from.
+    pub fn ephemeral(mainnet: bool) -> Self {
+        use k256::elliptic_curve::rand_core::OsRng;
+        Self {
+            key: SigningKey::random(&mut OsRng),
+            source: if mainnet { "a" } else { "b" },
+        }
+    }
+
     /// The agent wallet address.
     pub fn address(&self) -> Address {
         address_of(self.key.verifying_key())
@@ -315,5 +330,15 @@ mod tests {
     fn rejects_malformed_key() {
         assert!(AgentSigner::from_hex("0xdeadbeef", true).is_err());
         assert!(AgentSigner::from_hex("not-hex", true).is_err());
+    }
+
+    #[test]
+    fn ephemeral_signers_are_random_and_sign() {
+        let a = AgentSigner::ephemeral(true);
+        let b = AgentSigner::ephemeral(true);
+        assert_ne!(a.address(), b.address());
+        // An ephemeral key signs normally, so the simulate path can exercise
+        // the full build + sign flow.
+        assert!(a.sign_l1(&simple_action(), 42, None, None).is_ok());
     }
 }

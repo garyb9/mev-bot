@@ -203,7 +203,7 @@ Found in the post-M2 review (2026-09-26). **H-1, H-2, H-4, and H-9 are T0 fix-fi
 | H-5 | Apply `bbo` to `MarketState` | T1 | S | — | ☐ |
 | H-6 | Nonce persistence off the hot path | T1 | S | H-9 | ☐ |
 | H-7 | Latency instrumentation + sign/submit benchmarks | T1 | M | H-1 | ☐ |
-| H-8 | `simulate` without keys (ephemeral signer) | T1 | S | — | ☐ |
+| H-8 | `simulate` without keys (ephemeral signer) | T1 | S | — | ✅ |
 | H-9 | Verify the HL nonce and `scheduleCancel` rules | **T0** | S | — | ✅ |
 | H-10 | Testnet round-trip (the open §15 item) | T1 | S | **all T0 fixes** (GOAL §2.2), owner-provided testnet key | ☐ |
 
