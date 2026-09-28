@@ -13,8 +13,10 @@ use crate::types::{AccountUpdate, AssetCtxLite, BookSnapshot, CoinId, Level, Px,
 /// Per-coin market state, indexed by `CoinId`.
 #[derive(Debug, Clone, Default)]
 pub struct MarketSlot {
-    /// Best bid/offer with its receive stamp.
-    pub bbo: Option<(Level, Level, Stamp)>,
+    /// Best bid/offer with its receive stamp. A side is `None` when the venue
+    /// reports that side of the book empty; that is a real quote state, not a
+    /// zero price.
+    pub bbo: Option<(Option<Level>, Option<Level>, Stamp)>,
     /// Latest book snapshot with its receive stamp.
     pub book: Option<(BookSnapshot, Stamp)>,
     /// Latest asset context with its receive stamp.
@@ -25,17 +27,20 @@ pub struct MarketSlot {
 
 impl MarketSlot {
     /// The freshest best bid (prefers the later of `bbo` and the book top).
+    ///
+    /// Whichever source is fresher wins outright: an empty bid side in the
+    /// fresher source returns `None` rather than falling back to the older
+    /// source's level, because an empty fresh side is information.
     pub fn best_bid(&self) -> Option<Level> {
         match (&self.bbo, &self.book) {
             (Some((bid, _, bstamp)), Some((book, kstamp))) => {
-                let book_bid = book.best_bid();
                 if bstamp.mono_ns >= kstamp.mono_ns {
-                    Some(*bid)
+                    *bid
                 } else {
-                    book_bid.or(Some(*bid))
+                    book.best_bid()
                 }
             }
-            (Some((bid, _, _)), None) => Some(*bid),
+            (Some((bid, _, _)), None) => *bid,
             (None, Some((book, _))) => book.best_bid(),
             (None, None) => None,
         }
@@ -66,17 +71,20 @@ impl MarketSlot {
     }
 
     /// The freshest best ask (prefers the later of `bbo` and the book top).
+    ///
+    /// Whichever source is fresher wins outright: an empty ask side in the
+    /// fresher source returns `None` rather than falling back to the older
+    /// source's level, because an empty fresh side is information.
     pub fn best_ask(&self) -> Option<Level> {
         match (&self.bbo, &self.book) {
             (Some((_, ask, bstamp)), Some((book, kstamp))) => {
-                let book_ask = book.best_ask();
                 if bstamp.mono_ns >= kstamp.mono_ns {
-                    Some(*ask)
+                    *ask
                 } else {
-                    book_ask.or(Some(*ask))
+                    book.best_ask()
                 }
             }
-            (Some((_, ask, _)), None) => Some(*ask),
+            (Some((_, ask, _)), None) => *ask,
             (None, Some((book, _))) => book.best_ask(),
             (None, None) => None,
         }
@@ -332,7 +340,7 @@ mod tests {
         };
         // bbo is older than the book: the book top wins.
         let mut slot = MarketSlot {
-            bbo: Some((level(100), level(101), stamp(10))),
+            bbo: Some((Some(level(100)), Some(level(101)), stamp(10))),
             book: Some((book, stamp(20))),
             ..Default::default()
         };
@@ -340,9 +348,76 @@ mod tests {
         assert_eq!(slot.best_ask().unwrap().px, Decimal::from(103));
 
         // bbo is newer: it wins.
-        slot.bbo = Some((level(200), level(201), stamp(30)));
+        slot.bbo = Some((Some(level(200)), Some(level(201)), stamp(30)));
         assert_eq!(slot.best_bid().unwrap().px, Decimal::from(200));
         assert_eq!(slot.best_ask().unwrap().px, Decimal::from(201));
+    }
+
+    fn book_with(bid: Option<i64>, ask: Option<i64>) -> BookSnapshot {
+        let mut bids = [Level::default(); crate::types::BOOK_DEPTH];
+        let mut asks = [Level::default(); crate::types::BOOK_DEPTH];
+        let mut n_bids = 0;
+        if let Some(px) = bid {
+            bids[0] = level(px);
+            n_bids = 1;
+        }
+        let mut n_asks = 0;
+        if let Some(px) = ask {
+            asks[0] = level(px);
+            n_asks = 1;
+        }
+        BookSnapshot {
+            bids,
+            asks,
+            n_bids,
+            n_asks,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_fresher_bbo_side_is_none_and_does_not_fall_back() {
+        // Fresh bbo has an empty bid side while the (older) book still has a
+        // top: the empty fresh side is information and must not surface the
+        // stale book top or a zero price.
+        let mut slot = MarketSlot {
+            bbo: Some((None, Some(level(101)), stamp(20))),
+            book: Some((book_with(Some(100), Some(101)), stamp(10))),
+            ..Default::default()
+        };
+        assert_eq!(slot.best_bid(), None);
+        assert_eq!(slot.best_ask().unwrap().px, Decimal::from(101));
+
+        // The ask side may be the empty one.
+        slot.bbo = Some((Some(level(100)), None, stamp(20)));
+        assert_eq!(slot.best_ask(), None);
+        assert_eq!(slot.best_bid().unwrap().px, Decimal::from(100));
+    }
+
+    #[test]
+    fn empty_fresher_book_side_does_not_fall_back_to_older_bbo() {
+        // The book is fresher and its bid side is empty: the older bbo bid is
+        // stale and must not be returned.
+        let slot = MarketSlot {
+            bbo: Some((Some(level(99)), Some(level(102)), stamp(10))),
+            book: Some((book_with(None, Some(101)), stamp(20))),
+            ..Default::default()
+        };
+        assert_eq!(slot.best_bid(), None);
+        assert_eq!(slot.best_ask().unwrap().px, Decimal::from(101));
+    }
+
+    #[test]
+    fn older_empty_bbo_side_falls_back_to_the_fresher_book() {
+        // The book is fresher, so its top is used even though the older bbo
+        // reported an empty bid side.
+        let slot = MarketSlot {
+            bbo: Some((None, Some(level(99)), stamp(10))),
+            book: Some((book_with(Some(100), Some(101)), stamp(20))),
+            ..Default::default()
+        };
+        assert_eq!(slot.best_bid().unwrap().px, Decimal::from(100));
+        assert_eq!(slot.best_ask().unwrap().px, Decimal::from(101));
     }
 
     #[test]

@@ -338,10 +338,10 @@ pub enum MarketUpdate {
         coin: CoinId,
         /// Receive stamp.
         stamp: Stamp,
-        /// Best bid.
-        bid: Level,
-        /// Best ask.
-        ask: Level,
+        /// Best bid; `None` when the venue reports that side empty.
+        bid: Option<Level>,
+        /// Best ask; `None` when the venue reports that side empty.
+        ask: Option<Level>,
     },
     /// Fixed-size book snapshot.
     Book {
@@ -693,8 +693,8 @@ mod tests {
             MarketUpdate::Bbo {
                 coin: CoinId(0),
                 stamp,
-                bid: Level::default(),
-                ask: Level::default(),
+                bid: Some(Level::default()),
+                ask: Some(Level::default()),
             },
             MarketUpdate::Book {
                 coin: CoinId(0),

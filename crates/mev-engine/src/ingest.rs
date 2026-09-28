@@ -153,13 +153,12 @@ fn decode_bbo(text: &str, coins: &IngestCoins, stamp: Stamp) -> Result<Option<Ma
     let Some(coin) = coins.id(bbo.coin) else {
         return Ok(None);
     };
-    let to_level = |level: &Option<WireLevel>| match level {
-        Some(level) => Level {
+    let to_level = |level: &Option<WireLevel>| {
+        level.as_ref().map(|level| Level {
             px: level.px,
             sz: level.sz,
             n: level.n,
-        },
-        None => Level::default(),
+        })
     };
     let mut stamp = stamp;
     stamp.ts_exch_ms = bbo.time;
@@ -598,6 +597,38 @@ mod tests {
                 assert!(bid.px > Decimal::ZERO);
                 assert!(ask.px > bid.px, "ask {} <= bid {}", ask.px, bid.px);
                 assert!(book.time_ms > 0);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_bbo_empty_side_as_none_not_zero() {
+        let null_bid = r#"{"channel":"bbo","data":{"coin":"BTC","time":1,"bbo":[null,{"px":"101","sz":"2","n":3}]}}"#;
+        match ingester()
+            .decode(null_bid, Stamp::default())
+            .unwrap()
+            .unwrap()
+        {
+            MarketUpdate::Bbo { bid, ask, .. } => {
+                assert_eq!(bid, None, "an empty bid side must decode to None");
+                let ask = ask.expect("ask side present");
+                assert_eq!(ask.px, ds("101"));
+                assert_eq!(ask.sz, ds("2"));
+                assert_eq!(ask.n, 3);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let null_ask = r#"{"channel":"bbo","data":{"coin":"BTC","time":1,"bbo":[{"px":"100","sz":"2","n":3},null]}}"#;
+        match ingester()
+            .decode(null_ask, Stamp::default())
+            .unwrap()
+            .unwrap()
+        {
+            MarketUpdate::Bbo { bid, ask, .. } => {
+                assert_eq!(ask, None, "an empty ask side must decode to None");
+                assert_eq!(bid.expect("bid side present").px, ds("100"));
             }
             other => panic!("unexpected {other:?}"),
         }

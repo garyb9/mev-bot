@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn ctx_reads_best_prices_and_funding() {
         let slot = MarketSlot {
-            bbo: Some((level(100), level(101), Stamp::default())),
+            bbo: Some((Some(level(100)), Some(level(101)), Stamp::default())),
             ctx: Some((
                 crate::types::AssetCtxLite {
                     funding: Decimal::from(7),
@@ -378,6 +378,25 @@ mod tests {
         assert_eq!(ctx.coin_name(CoinId(9)), "");
         assert!(!ctx.is_stale(CoinId(0)));
         assert!(ctx.is_stale(CoinId(9)));
+    }
+
+    #[test]
+    fn ctx_mid_is_none_when_a_touch_side_is_empty() {
+        let markets = vec![MarketSlot {
+            bbo: Some((None, Some(level(101)), Stamp::default())),
+            ..Default::default()
+        }];
+        let account = AccountState::default();
+        let registry = registry();
+        let ctx = Ctx {
+            now: Stamp::default(),
+            markets: &markets,
+            account: &account,
+            registry: &registry,
+        };
+        assert_eq!(ctx.best_bid(CoinId(0)), None);
+        assert_eq!(ctx.best_ask(CoinId(0)), Some(Decimal::from(101)));
+        assert_eq!(ctx.mid(CoinId(0)), None);
     }
 
     #[test]

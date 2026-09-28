@@ -118,8 +118,8 @@ fn bbo_update(coin: CoinId) -> MarketUpdate {
             mono_ns: 2,
             ts_exch_ms: 0,
         },
-        bid: level(100, 10),
-        ask: level(101, 10),
+        bid: Some(level(100, 10)),
+        ask: Some(level(101, 10)),
     }
 }
 

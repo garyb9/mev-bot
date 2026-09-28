@@ -394,16 +394,16 @@ fn to_slots(registry: &CoinRegistry, market: &MarketView) -> Vec<MarketSlot> {
                 (book.best_bid(), book.best_ask())
             {
                 slot.bbo = Some((
-                    Level {
+                    Some(Level {
                         px: bid_px,
                         sz: bid_sz,
                         n: 1,
-                    },
-                    Level {
+                    }),
+                    Some(Level {
                         px: ask_px,
                         sz: ask_sz,
                         n: 1,
-                    },
+                    }),
                     Stamp::default(),
                 ));
             }

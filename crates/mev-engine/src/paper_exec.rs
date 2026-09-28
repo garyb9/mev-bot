@@ -613,8 +613,8 @@ fn book_for(coin: CoinId, markets: &[MarketSlot]) -> Option<BookView> {
     }
     let (bid, ask, _) = slot.bbo.as_ref()?;
     Some(BookView::from_levels(
-        [(bid.px, bid.sz)],
-        [(ask.px, ask.sz)],
+        bid.iter().map(|level| (level.px, level.sz)),
+        ask.iter().map(|level| (level.px, level.sz)),
         0,
         0,
     ))

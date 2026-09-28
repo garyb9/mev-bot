@@ -501,8 +501,8 @@ mod tests {
                 mono_ns,
                 ..Default::default()
             },
-            bid: Level::default(),
-            ask: Level::default(),
+            bid: Some(Level::default()),
+            ask: Some(Level::default()),
         }
     }
 
@@ -713,8 +713,8 @@ mod tests {
                 mono_ns: 456,
                 ts_exch_ms: 0,
             },
-            bid: Level::default(),
-            ask: Level::default(),
+            bid: Some(Level::default()),
+            ask: Some(Level::default()),
         });
         // The iteration's own time is deliberately different from the event's.
         engine.iterate(9_999);

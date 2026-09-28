@@ -94,16 +94,16 @@ fn bbo_update() -> MarketUpdate {
             mono_ns: 2,
             ts_exch_ms: 0,
         },
-        bid: Level {
+        bid: Some(Level {
             px: rust_decimal::Decimal::from(100),
             sz: rust_decimal::Decimal::ONE,
             n: 1,
-        },
-        ask: Level {
+        }),
+        ask: Some(Level {
             px: rust_decimal::Decimal::from(101),
             sz: rust_decimal::Decimal::ONE,
             n: 1,
-        },
+        }),
     }
 }
 

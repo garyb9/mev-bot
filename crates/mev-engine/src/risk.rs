@@ -663,7 +663,7 @@ mod tests {
 
     fn slot() -> MarketSlot {
         MarketSlot {
-            bbo: Some((level(99), level(101), Stamp::default())),
+            bbo: Some((Some(level(99)), Some(level(101)), Stamp::default())),
             ..Default::default()
         }
     }

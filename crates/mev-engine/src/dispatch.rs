@@ -1339,8 +1339,8 @@ mod tests {
         let mut state = EngineState::new(2);
         let slot = state.slot_mut(CoinId(0)).unwrap();
         slot.bbo = Some((
-            level(bid),
-            level(ask),
+            Some(level(bid)),
+            Some(level(ask)),
             Stamp {
                 mono_ns: 1_000,
                 ..Default::default()
