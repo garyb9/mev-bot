@@ -4,11 +4,14 @@ A *study* maps its markets into one aligned, as-of joined polars frame on ``t_ns
 (``join_asof`` backward, so a row only ever holds data that was already
 available) and supplies three things:
 
-* a ``net_bps`` column/expression — the §13.3 edge in basis points, already net
-  of fees, the safety buffer and slippage at that row's size;
-* a ``size_usd`` column/expression — the §13.3 capturable notional, already
-  capped at the study's ``max_notional`` (or pass ``max_notional`` to
-  :func:`detect_episodes` to cap it here);
+* a ``net_bps`` column/expression — the §13.3 edge in basis points. **The study
+  must apply every cost itself**: both legs' taker fees via
+  ``hlr.costs.fee_bps`` (``fee_bps(venue, market_kind)``), the safety buffer and
+  ``hlr.costs.slippage_bps`` walked at the capped size. The detector applies no
+  fees, funding or slippage;
+* a ``size_usd`` column/expression — the §13.3 capturable notional before the
+  ``max_notional`` cap (pass ``max_notional`` to :func:`detect_episodes`, or cap
+  it in the study and pass ``max_notional=None``);
 * a ``valid`` mask — whether every input feed is fresh and gap-free (§13.3),
   built with :func:`feed_validity` from a ``stale_ms`` and the ``gaps`` table.
 
@@ -17,31 +20,37 @@ where ``net_bps > 0`` and the feeds are valid, merges episodes separated by less
 than ``merge_ms``, and captures the edge at each latency ``L`` in the §13.4 grid
 by re-reading the as-of state at ``t_start + L`` (never a later row, so there is
 no lookahead). :func:`episode_metrics` rolls the episodes up into the per-latency
-part of the §13.5 table.
+part of the §13.5 table, one row per capture variant, so P-5 can grade on the
+§13.10 headline (competition-adjusted, jittered).
 
 Conservative readings (the spec is silent or terse in these places; see the P-4
 report):
 
+* **Capture size is the order we could have placed at ``t_start``.** The fill is
+  the best of the two states' books, so ``size = min(size_usd(t_start),
+  size_usd(t_start + L))``; a book that grows *after* the decision does not
+  enlarge the order.
+* **The cap is applied after competition.** Naive size is ``min(max_notional,
+  displayed)``; competition-adjusted size is ``min(max_notional, max(0,
+  displayed − competed))``.
 * **Capture is USD.** §13.3 writes ``captured_L = net_bps(...) × size_usd(...)``,
   but §13.5 makes ``Σ captured_L / days`` a USD/day figure, so the bps value is
   applied as a fraction: ``captured_L = net_bps / 1e4 × size_usd``.
-* **``t_end`` is the first event time at which the condition no longer holds**
-  (the interval is half open, so an episode is *not* open at exactly ``t_end``).
-  At the end of the observed data ``t_end`` is the last event time.
+* **``t_end`` is the first event time at which the condition no longer holds**,
+  capped at ``stale_ms`` after the last observed state (so a sparse book cannot
+  inflate ``duration_ms``); the interval is half open, so an episode is *not*
+  open at exactly ``t_end``.
 * **Merging never crosses invalid data.** A short ``<= merge_ms`` separation is
   merged only when the separating rows are valid; a gap or a stale feed is not
   papered over.
-* **Gaps are half open** ``[start_ns, end_ns)``: a feed is valid again at
-  ``end_ns``.
-* **The probe edge is clamped at >= 0.** A merged episode can contain a sub-
-  ``merge_ms`` stretch where the edge briefly vanished; that stretch never counts
-  as a negative capture.
+* **Gaps are half open** ``[start_ns, end_ns)`` and are unioned before the
+  membership test, so nested/overlapping gaps cannot leak a "valid" row.
+* **An open probe needs ``net_bps > 0`` as well as a fresh state**, so a merged
+  sub-``merge_ms`` dip neither counts as capture nor inflates ``capture_rate``.
 * **A capture needs a fresh probe.** Besides the episode still being open, the
   last state observed at or before ``t_start + L`` must be no older than
   ``stale_ms``; a probe onto a held-but-stale quote is counted as missed rather
   than assumed still actionable.
-* **``size_usd`` is capped at ``max_notional``** when that is set, before any
-  capture arithmetic.
 * **``date`` is the UTC day of ``t_start``**, so an episode that crosses midnight
   stays one episode attributed to the day it began (the §13.5 per-day counts).
 * **A null ``net_bps`` or ``size_usd`` is not an episode.**
@@ -50,8 +59,9 @@ Rigor hooks for §13.10 live here so P-5/studies do not re-implement them:
 :func:`day_block_bootstrap_ci` (uncertainty), :func:`jittered_latency_ms` (latency
 jitter), the ``compete_usd`` argument of :func:`detect_episodes` (fill
 competition), the optional ``mid``/``direction`` markout columns (adverse
-selection), and the ``date`` column plus :func:`daily_capture` (OOS split and
-per-day aggregation). The verdict itself (APR, CI gating, capital grid) is P-5.
+selection), :func:`oos_split` (the 60/40 chronological split) and
+:func:`daily_capture` (per-day aggregation). The verdict itself (APR, CI gating,
+capital grid) is P-5.
 
 This is research code. It is never imported by, or deployed with, the bot; it
 reads no keys and no network.
@@ -70,10 +80,10 @@ import polars as pl
 __all__ = [
     "BPS_SCALE",
     "DAY_NS",
-    "DEFAULT_HEADLINE_LATENCY_MS",
     "DEFAULT_LATENCIES_MS",
     "DEFAULT_MERGE_MS",
     "DEFAULT_STALE_MS",
+    "HEADLINE_VARIANT",
     "MS_NS",
     "EpisodeConfig",
     "EpisodeError",
@@ -84,6 +94,7 @@ __all__ = [
     "episode_metrics",
     "feed_validity",
     "jittered_latency_ms",
+    "oos_split",
 ]
 
 #: Nanoseconds per millisecond.
@@ -95,12 +106,22 @@ BPS_SCALE = 1e-4
 
 #: The §13.4 latency grid, in milliseconds.
 DEFAULT_LATENCIES_MS: tuple[int, ...] = (10, 50, 100, 250, 500, 1000)
-#: The headline latency until V-4/H-7 replace it (§13.4).
-DEFAULT_HEADLINE_LATENCY_MS = 250
 #: The §13.3 feed-staleness default.
 DEFAULT_STALE_MS = 2000
 #: The §13.3 episode-merge default.
 DEFAULT_MERGE_MS = 50
+
+#: The capture variant the §13.10 verdict uses (competition-adjusted, jittered).
+HEADLINE_VARIANT = "adj_jitter"
+
+#: ``(name, captured-format, open-format)`` for every capture variant, in report
+#: order. The formats take one ``lat`` (the latency in ms) keyword.
+_VARIANTS: tuple[tuple[str, str, str], ...] = (
+    ("naive", "captured_{lat}", "open_{lat}"),
+    ("adj", "captured_adj_{lat}", "open_{lat}"),
+    ("jitter", "captured_jitter_{lat}", "open_jitter_{lat}"),
+    ("adj_jitter", "captured_adj_jitter_{lat}", "open_jitter_{lat}"),
+)
 
 #: z-score of the 99th percentile of a standard normal, for the §13.10 lognormal
 #: latency jitter (p99 = 3 × median).
@@ -136,7 +157,6 @@ class EpisodeConfig:
     latencies_ms: tuple[int, ...] = DEFAULT_LATENCIES_MS
     jitter: bool = False
     jitter_seed: int = 0
-    markout_latency_ms: int = DEFAULT_HEADLINE_LATENCY_MS
     markout_horizons_s: tuple[int, ...] = (1, 10)
 
     def __post_init__(self) -> None:
@@ -148,8 +168,8 @@ class EpisodeConfig:
             raise EpisodeError(f"max_notional must be >= 0, got {self.max_notional}")
         if not self.latencies_ms or any(lat < 0 for lat in self.latencies_ms):
             raise EpisodeError("latencies_ms must be a non-empty list of >= 0 values")
-        if self.markout_latency_ms < 0:
-            raise EpisodeError("markout_latency_ms must be >= 0")
+        if any(horizon <= 0 for horizon in self.markout_horizons_s):
+            raise EpisodeError("markout_horizons_s must be positive")
 
 
 #: Shared immutable default so the signature avoids a call in the default.
@@ -168,9 +188,10 @@ def feed_validity(
 
     A feed is valid at ``t`` when its ``last_ns`` column is not null, ``t`` is no
     more than ``stale_ms`` newer than it, and ``t`` is not inside one of the
-    feed's ``gaps`` (matching ``src`` and, when given, ``conn``). The returned
-    frame carries ``{feed.name}_valid`` columns plus a combined ``valid`` column;
-    the original columns and row order are preserved.
+    feed's ``gaps`` (matching ``src`` and, when given, ``conn``). Overlapping and
+    nested gaps are unioned before the test. The returned frame carries
+    ``{feed.name}_valid`` columns plus a combined ``valid`` column; the original
+    columns and row order are preserved.
     """
     _require_columns(frame, [time_col, *(feed.last_ns for feed in feeds)])
     stale_ns = _positive_ms(stale_ms, "stale_ms")
@@ -207,16 +228,17 @@ def detect_episodes(
 
     ``frame`` is the study's aligned, as-of joined frame. ``net_bps`` and
     ``size_usd`` are column names or polars expressions evaluated row-wise;
-    ``valid`` defaults to "all rows valid". ``compete_usd`` (fill competition,
-    §13.10) is an optional per-row notional that someone else traded at the
-    episode price; ``mid``/``direction`` (a signed +1 buy / -1 sell expression)
-    add per-episode markout columns at ``config.markout_latency_ms``.
+    ``net_bps`` must already be net of both legs' fees and slippage (see the
+    module docstring). ``valid`` defaults to "all rows valid". ``compete_usd``
+    (fill competition, §13.10) is an optional per-row notional that someone else
+    traded at the episode price; ``mid``/``direction`` (a signed +1 buy / -1 sell
+    expression) add per-latency markout columns.
 
     Returns one row per episode with the §13.3 fields (``t_start``, ``t_end``,
     ``duration_ms``, ``peak_net_bps``, ``start_net_bps``, ``size_usd_at_start``),
-    a UTC ``date``, and ``captured_{L}``/``open_{L}`` per grid latency (plus
-    ``competed_{L}``/``captured_adj_{L}``, ``*_jitter_{L}`` and
-    ``markout_{h}s`` when the matching hook is enabled). Sorted by ``t_start``.
+    a UTC ``date``, and ``captured*_{L}``/``open*_{L}`` per grid latency (plus
+    ``competed*_{L}``, per-latency ``markout_{L}_{h}s`` and the jitter variants).
+    Sorted by ``t_start``.
     """
     source = frame.collect() if isinstance(frame, pl.LazyFrame) else frame
     _require_columns(source, [time_col])
@@ -236,15 +258,12 @@ def detect_episodes(
     work = work.with_columns(
         [
             _as_expr(net_bps).cast(pl.Float64, strict=False).alias("net_bps"),
-            _as_expr(size_usd).cast(pl.Float64, strict=False).alias("size_usd"),
+            _as_expr(size_usd)
+            .cast(pl.Float64, strict=False)
+            .clip(lower_bound=0.0)
+            .alias("size_usd"),
         ]
     )
-    if config.max_notional is not None:
-        work = work.with_columns(
-            pl.min_horizontal(pl.col("size_usd"), pl.lit(float(config.max_notional))).alias(
-                "size_usd"
-            )
-        )
     valid_expr = pl.lit(True) if valid is None else _as_expr(valid)
     work = work.with_columns(valid_expr.fill_null(False).cast(pl.Boolean).alias("valid"))
     if compete_usd is not None:
@@ -275,7 +294,7 @@ def detect_episodes(
         pl.col(time_col).shift(-1).fill_null(pl.col(time_col)).alias("_row_end")
     )
 
-    episodes = _merge_runs(final, config.merge_ms, time_col)
+    episodes = _merge_runs(final, config.merge_ms, config.stale_ms * MS_NS, time_col)
     if episodes.height == 0:
         return _empty_episodes(
             config, compete_usd is not None, mid is not None and direction is not None
@@ -296,98 +315,125 @@ def episode_metrics(
     episodes: pl.DataFrame,
     *,
     days: int,
-    latencies_ms: Sequence[int] | None = None,
     all_dates: Sequence[_dt.date] | None = None,
+    latencies_ms: Sequence[int] | None = None,
+    capture_variants: Sequence[str] | None = None,
     capital_usd: float | None = None,
     bootstrap_draws: int = 2000,
     bootstrap_seed: int = 0,
 ) -> pl.DataFrame:
-    """Roll an episode table up into the per-latency §13.5 metrics (§13.4 grid).
+    """Roll episodes into the per-latency §13.5 metrics (§13.4 grid).
 
-    One row per latency ``L``: episode counts, duration/peak percentiles,
-    ``capture_rate_L``, naive and (when present) competition-adjusted capture and
-    ``usd_per_day_L``, the day-block-bootstrap 90% CI, markout medians and the
-    ``competition_hint``. ``days`` is the number of valid days used (§13.5) and
-    should match ``len(all_dates)`` when that is given, so the bootstrap's
-    per-day mean equals ``usd_per_day_L``; ``all_dates`` (optional) adds
-    zero-episode days to the per-day stats. ``capital_usd`` (optional) adds
-    ``apr_L`` and its 90% CI.
+    One row per ``(latency_ms, capture_variant)``. ``all_dates`` is **required**:
+    the full list of valid days (length ``days``, no duplicates, every episode's
+    ``date`` present) so the day-block bootstrap and ``usd_per_day`` count
+    zero-episode days instead of silently dropping them. ``capture_variants``
+    selects a subset of ``naive``/``adj``/``jitter``/``adj_jitter`` (default: all
+    available); the §13.10 headline is ``adj_jitter`` when both hooks are on.
+    ``capital_usd`` adds ``apr`` and its 90% CI. An empty episode table yields
+    zero-valued rows rather than vanishing.
     """
-    if days <= 0:
-        raise EpisodeError(f"days must be > 0, got {days}")
+    date_values = _validated_days(episodes, days, all_dates)
     latencies = tuple(latencies_ms) if latencies_ms is not None else DEFAULT_LATENCIES_MS
-    if episodes.height == 0:
-        return pl.DataFrame()
-
-    date_values = _date_values(episodes, all_dates)
-    duration = episodes["duration_ms"]
-    peak = episodes["peak_net_bps"]
     per_day_counts = _per_day_counts(episodes, date_values)
+    duration = episodes["duration_ms"].to_list() if "duration_ms" in episodes.columns else []
+    peak = episodes["peak_net_bps"].to_list() if "peak_net_bps" in episodes.columns else []
     rows: list[dict[str, object]] = []
     for lat in latencies:
-        captured_col = f"captured_{lat}"
-        open_col = f"open_{lat}"
-        if captured_col not in episodes.columns or open_col not in episodes.columns:
-            raise EpisodeError(f"episodes has no `{captured_col}`/`{open_col}` column")
-        captured = episodes[captured_col].fill_null(0.0)
-        n = episodes.height
-        n_open = int(episodes[open_col].fill_null(False).sum())
-        daily = _daily_totals(episodes, captured, date_values)
-        lo, hi = day_block_bootstrap_ci(
-            daily, draws=bootstrap_draws, level=0.90, seed=bootstrap_seed
-        )
-        row: dict[str, object] = {
-            "latency_ms": lat,
-            "days": days,
-            "episodes": n,
-            "episodes_per_day": n / days,
-            "episodes_per_day_p50": _quantile(sorted(per_day_counts), 0.5),
-            "episodes_per_day_p90": _quantile(sorted(per_day_counts), 0.9),
-            "duration_ms_p50": _quantile(sorted(duration.to_list()), 0.5),
-            "duration_ms_p90": _quantile(sorted(duration.to_list()), 0.9),
-            "peak_net_bps_p50": _quantile(sorted(peak.to_list()), 0.5),
-            "peak_net_bps_p90": _quantile(sorted(peak.to_list()), 0.9),
-            "capture_rate": (n_open / n) if n else 0.0,
-            "capture_naive_usd": float(captured.sum()),
-            "usd_per_day": float(captured.sum()) / days,
-            "usd_per_day_ci90_lo": lo,
-            "usd_per_day_ci90_hi": hi,
-            "competition_hint": _competition_hint(_quantile(sorted(duration.to_list()), 0.5)),
-        }
-        adj_col = f"captured_adj_{lat}"
-        if adj_col in episodes.columns:
-            adj = episodes[adj_col].fill_null(0.0)
-            row["capture_adj_usd"] = float(adj.sum())
-            row["usd_per_day_adj"] = float(adj.sum()) / days
-        row["markout_1s_median"] = _median_over(captured > 0, episodes, "markout_1s")
-        row["markout_10s_median"] = _median_over(captured > 0, episodes, "markout_10s")
-        if capital_usd is not None:
-            scale = 365.0 / capital_usd
-            row["apr"] = row["usd_per_day"] * scale
-            row["apr_ci90_lo"] = lo * scale
-            row["apr_ci90_hi"] = hi * scale
-        rows.append(row)
+        variants = _select_variants(episodes, lat, capture_variants)
+        for name, captured_col, open_col in variants:
+            captured = episodes[captured_col].fill_null(0.0)
+            n = episodes.height
+            n_open = int(episodes[open_col].fill_null(False).sum())
+            daily = _daily_totals(episodes, captured, date_values)
+            lo, hi = day_block_bootstrap_ci(
+                daily, draws=bootstrap_draws, level=0.90, seed=bootstrap_seed
+            )
+            row: dict[str, object] = {
+                "latency_ms": lat,
+                "capture_variant": name,
+                "days": days,
+                "episodes": n,
+                "episodes_per_day": n / days,
+                "episodes_per_day_p50": _quantile(sorted(per_day_counts), 0.5),
+                "episodes_per_day_p90": _quantile(sorted(per_day_counts), 0.9),
+                "duration_ms_p50": _quantile(sorted(duration), 0.5),
+                "duration_ms_p90": _quantile(sorted(duration), 0.9),
+                "peak_net_bps_p50": _quantile(sorted(peak), 0.5),
+                "peak_net_bps_p90": _quantile(sorted(peak), 0.9),
+                "capture_rate": (n_open / n) if n else 0.0,
+                "capture_usd": float(captured.sum()),
+                "usd_per_day": float(captured.sum()) / days,
+                "usd_per_day_ci90_lo": lo,
+                "usd_per_day_ci90_hi": hi,
+                "competition_hint": _competition_hint(_quantile(sorted(duration), 0.5)),
+            }
+            row["markout_1s_median"] = _median_over_episodes(
+                episodes, open_col, f"markout_{lat}_1s"
+            )
+            row["markout_10s_median"] = _median_over_episodes(
+                episodes, open_col, f"markout_{lat}_10s"
+            )
+            if capital_usd is not None:
+                scale = 365.0 / capital_usd
+                row["apr"] = row["usd_per_day"] * scale
+                row["apr_ci90_lo"] = lo * scale
+                row["apr_ci90_hi"] = hi * scale
+            rows.append(row)
     return pl.DataFrame(rows)
 
 
-def daily_capture(episodes: pl.DataFrame, latency_ms: int) -> pl.DataFrame:
+def daily_capture(
+    episodes: pl.DataFrame,
+    latency_ms: int,
+    *,
+    all_dates: Sequence[_dt.date] | None = None,
+    variant: str = "naive",
+) -> pl.DataFrame:
     """Per-UTC-day episode count and captured USD at one latency (§13.5).
 
-    An episode is attributed to the day of its ``t_start``. Days with no episode
-    are absent; add them with ``all_dates`` before a bootstrap if the study needs
-    them counted.
+    Every date in ``all_dates`` (required) gets a row, including days with no
+    episode (zero count and zero capture). An episode is attributed to the UTC
+    day of its ``t_start``. ``variant`` is one of ``naive``/``adj``/``jitter``/
+    ``adj_jitter``.
     """
-    captured_col = f"captured_{latency_ms}"
-    if "date" not in episodes.columns or captured_col not in episodes.columns:
-        raise EpisodeError(f"episodes needs `date` and `{captured_col}` for daily_capture")
-    return (
-        episodes.group_by("date")
-        .agg(
-            episodes=pl.len(),
-            captured_usd=pl.col(captured_col).fill_null(0.0).sum(),
-        )
-        .sort("date")
+    dates = _required_dates(all_dates)
+    captured_col, open_col = _variant_columns(latency_ms, variant)
+    for column in (captured_col, open_col, "date"):
+        if column not in episodes.columns:
+            raise EpisodeError(f"episodes has no `{column}` column for daily_capture")
+    counts = _per_day_counts(episodes, dates)
+    totals = _daily_totals(episodes, episodes[captured_col].fill_null(0.0), dates)
+    return pl.DataFrame(
+        {
+            "date": dates,
+            "episodes": counts,
+            "captured_usd": totals,
+        }
     )
+
+
+def oos_split(
+    dates: Sequence[_dt.date],
+    *,
+    frac: float = 0.6,
+) -> tuple[list[_dt.date], list[_dt.date]]:
+    """Chronological 60/40 day split (SPEC-0008 §13.10).
+
+    Returns ``(in_sample, out_of_sample)``: the sorted unique dates, with the
+    first ``frac`` share in-sample. Parameters are chosen on ``in_sample`` and
+    the headline is ``out_of_sample``. A single day is in-sample with an empty
+    out-of-sample set.
+    """
+    if not 0.0 < frac < 1.0:
+        raise EpisodeError(f"frac must be in (0, 1), got {frac}")
+    ordered = sorted(set(dates))
+    if not ordered:
+        return ([], [])
+    if len(ordered) == 1:
+        return (ordered, [])
+    n_in = max(1, min(int(len(ordered) * frac), len(ordered) - 1))
+    return (ordered[:n_in], ordered[n_in:])
 
 
 def day_block_bootstrap_ci(
@@ -443,8 +489,19 @@ def jittered_latency_ms(
 # --------------------------------------------------------------------------
 
 
-def _merge_runs(frame: pl.DataFrame, merge_ms: int, time_col: str) -> pl.DataFrame:
-    """Turn the per-row ``core`` flag into merged episode rows."""
+def _merge_runs(
+    frame: pl.DataFrame, merge_ms: int, stale_ns: int, time_col: str
+) -> pl.DataFrame:
+    """Turn the per-row ``core`` flag into merged episode rows.
+
+    Each row's actionable window ends at ``min(next event, row_t + stale_ns)`` so
+    a sparse book cannot stretch ``duration_ms``.
+    """
+    frame = frame.with_columns(
+        pl.min_horizontal(
+            pl.col("_row_end"), pl.col(time_col) + stale_ns
+        ).alias("_row_valid_end")
+    )
     runs = (
         frame.with_columns(pl.col("core").rle_id().alias("_rid"))
         .group_by("_rid")
@@ -452,7 +509,6 @@ def _merge_runs(frame: pl.DataFrame, merge_ms: int, time_col: str) -> pl.DataFra
             core=pl.col("core").first(),
             valid_all=pl.col("valid").all(),
             run_start=pl.col(time_col).first(),
-            row_end=pl.col("_row_end").max(),
         )
         .sort("_rid")
     )
@@ -480,7 +536,7 @@ def _merge_runs(frame: pl.DataFrame, merge_ms: int, time_col: str) -> pl.DataFra
         .group_by("_gid")
         .agg(
             t_start=pl.col(time_col).first(),
-            t_end=pl.col("_row_end").max(),
+            t_end=pl.col("_row_valid_end").max(),
             peak_net_bps=pl.col("net_bps").max(),
             start_net_bps=pl.col("net_bps").first(),
             size_usd_at_start=pl.col("size_usd").first(),
@@ -504,18 +560,17 @@ def _capture_grid(
     markout: bool,
     time_col: str,
 ) -> pl.DataFrame:
-    """Add ``captured_{L}``/``open_{L}`` (and hooks) for every grid latency."""
+    """Add ``captured*_{L}``/``open*_{L}`` (and hooks) for every grid latency."""
     episodes = episodes.with_columns(
         ((pl.col("t_end") - pl.col("t_start")) // MS_NS).cast(pl.Int64).alias("duration_ms"),
         pl.col("t_start").cast(pl.Datetime("ns")).dt.date().alias("date"),
     )
     look_cols = ["net_bps", "size_usd"]
     stale_ns = config.stale_ms * MS_NS
+    cap = config.max_notional
     if compete:
         states = states.with_columns(
-            [
-                pl.col("compete_usd").cum_sum().alias("_compete_le"),
-            ]
+            pl.col("compete_usd").cum_sum().alias("_compete_le")
         )
     for lat in config.latencies_ms:
         offset = pl.lit(lat * MS_NS, dtype=pl.Int64)
@@ -529,6 +584,7 @@ def _capture_grid(
             jitter=False,
             time_col=time_col,
             stale_ns=stale_ns,
+            cap=cap,
         )
         if config.jitter:
             draws = jittered_latency_ms(lat, episodes.height, seed=config.jitter_seed + lat)
@@ -543,9 +599,18 @@ def _capture_grid(
                 jitter=True,
                 time_col=time_col,
                 stale_ns=stale_ns,
+                cap=cap,
             )
     if markout:
-        episodes = _add_markouts(episodes, states, config, time_col=time_col)
+        episodes = _add_markouts(
+            episodes, states, config, time_col=time_col, stale_ns=stale_ns
+        )
+    if cap is not None:
+        episodes = episodes.with_columns(
+            pl.min_horizontal(pl.col("size_usd_at_start"), pl.lit(float(cap))).alias(
+                "size_usd_at_start"
+            )
+        )
     return episodes.drop("direction")
 
 
@@ -560,13 +625,16 @@ def _add_capture(
     jitter: bool,
     time_col: str,
     stale_ns: int,
+    cap: float | None,
 ) -> pl.DataFrame:
     """Add the open/captured columns for one latency ``lat``.
 
-    The probe at ``t_start + L`` is open only while the episode has not ended
-    *and* the last state observed at or before the probe is no older than
-    ``stale_ms`` — a conservative guard against capturing a held-but-stale
-    quote between two sparse events (§13.3 validity, read at the probe).
+    The order is sized at ``t_start``: ``displayed = min(size_usd(t_start),
+    size_usd(t_start + L))``. The naive size is ``min(cap, displayed)`` and the
+    competition-adjusted size is ``min(cap, max(0, displayed - competed))`` (cap
+    after the subtraction). The probe is open only while the episode has not
+    ended, the last state is no older than ``stale_ms``, and the edge is still
+    positive.
     """
     suffix = "_jitter" if jitter else ""
     probe_key = pl.col("t_start") + offset
@@ -574,18 +642,24 @@ def _add_capture(
     episodes = episodes.with_columns(
         probe_key.alias("_probe_ns"),
         lookup["_state_ns"].alias("_state_ns"),
-        lookup["net_bps"].fill_null(0.0).clip(lower_bound=0.0).alias("_net"),
-        lookup["size_usd"].fill_null(0.0).clip(lower_bound=0.0).alias("_size"),
+        lookup["net_bps"].fill_null(0.0).alias("_net_raw"),
+        lookup["size_usd"].fill_null(0.0).clip(lower_bound=0.0).alias("_size_probe"),
     )
-    temp = ["_probe_ns", "_state_ns", "_net", "_size"]
-    open_ = (pl.col("_probe_ns") < pl.col("t_end")) & (
-        (pl.col("_probe_ns") - pl.col("_state_ns")) <= stale_ns
+    temp = ["_probe_ns", "_state_ns", "_net_raw", "_size_probe"]
+    net = pl.col("_net_raw").clip(lower_bound=0.0)
+    displayed = pl.min_horizontal(pl.col("size_usd_at_start"), pl.col("_size_probe"))
+    open_ = (
+        (pl.col("_probe_ns") < pl.col("t_end"))
+        & ((pl.col("_probe_ns") - pl.col("_state_ns")) <= stale_ns)
+        & (pl.col("_net_raw") > 0.0)
     )
+    naive_size = displayed if cap is None else pl.min_horizontal(displayed, pl.lit(float(cap)))
     new_cols = [
         open_.alias(f"open{suffix}_{lat}"),
-        pl.when(open_).then(pl.col("_net") * pl.col("_size") * BPS_SCALE).otherwise(0.0).alias(
-            f"captured{suffix}_{lat}"
-        ),
+        pl.when(open_)
+        .then(net * naive_size * BPS_SCALE)
+        .otherwise(0.0)
+        .alias(f"captured{suffix}_{lat}"),
     ]
     if compete:
         before = _asof_lookup(
@@ -603,12 +677,13 @@ def _add_capture(
             (at_probe - before).clip(lower_bound=0.0).alias("_competed")
         )
         temp.append("_competed")
-        adjusted = (pl.col("_size") - pl.col("_competed")).clip(lower_bound=0.0)
+        adjusted = (displayed - pl.col("_competed")).clip(lower_bound=0.0)
+        adj_size = adjusted if cap is None else pl.min_horizontal(adjusted, pl.lit(float(cap)))
         new_cols.extend(
             [
                 pl.col("_competed").alias(f"competed{suffix}_{lat}"),
                 pl.when(open_)
-                .then(pl.col("_net") * adjusted * BPS_SCALE)
+                .then(net * adj_size * BPS_SCALE)
                 .otherwise(0.0)
                 .alias(f"captured_adj{suffix}_{lat}"),
             ]
@@ -622,30 +697,61 @@ def _add_markouts(
     config: EpisodeConfig,
     *,
     time_col: str,
+    stale_ns: int,
 ) -> pl.DataFrame:
-    """Add signed mid-move (bps) markout columns after the hypothetical fill."""
+    """Add per-latency signed mid-move (bps) markout columns.
+
+    For every grid latency ``L`` and horizon ``h`` the column is
+    ``markout_{L}_{h}s``; it is null when either the fill or the horizon state
+    is in a gap (as-of ``valid`` false) or older than ``stale_ms``.
+    """
     if not config.markout_horizons_s:
         return episodes
-    offset = pl.lit(config.markout_latency_ms * MS_NS, dtype=pl.Int64)
-    probe_key = pl.col("t_start") + offset
-    mid_fill = _asof_lookup(episodes, states, probe_key, ["mid"], time_col=time_col)["mid"]
-    episodes = episodes.with_columns(mid_fill.alias("_mid_fill"))
-    for horizon in config.markout_horizons_s:
-        after_key = probe_key + pl.lit(horizon * 1_000 * MS_NS, dtype=pl.Int64)
-        mid_after = _asof_lookup(episodes, states, after_key, ["mid"], time_col=time_col)["mid"]
-        episodes = episodes.with_columns(mid_after.alias("_mid_after"))
+    for lat in config.latencies_ms:
+        probe_key = pl.col("t_start") + pl.lit(lat * MS_NS, dtype=pl.Int64)
+        fill = _asof_lookup(episodes, states, probe_key, ["mid", "valid"], time_col=time_col)
         episodes = episodes.with_columns(
-            pl.when((pl.col("_mid_fill") > 0) & pl.col("_mid_after").is_not_null())
-            .then(
-                pl.col("direction")
-                * (pl.col("_mid_after") - pl.col("_mid_fill"))
-                / pl.col("_mid_fill")
-                / BPS_SCALE
+            probe_key.alias("_fill_ns"),
+            fill["_state_ns"].alias("_fill_state"),
+            fill["mid"].alias("_mid_fill"),
+            fill["valid"].fill_null(False).alias("_valid_fill"),
+        )
+        for horizon in config.markout_horizons_s:
+            horizon_ns = pl.lit(horizon * 1_000 * MS_NS, dtype=pl.Int64)
+            after_key = probe_key + horizon_ns
+            after = _asof_lookup(
+                episodes, states, after_key, ["mid", "valid"], time_col=time_col
             )
-            .otherwise(None)
-            .alias(f"markout_{horizon}s")
-        ).drop("_mid_after")
-    return episodes.drop("_mid_fill")
+            episodes = episodes.with_columns(
+                after["_state_ns"].alias("_after_state"),
+                after["mid"].alias("_mid_after"),
+                after["valid"].fill_null(False).alias("_valid_after"),
+            )
+            fresh = (
+                (pl.col("_fill_ns") - pl.col("_fill_state")) <= stale_ns
+            ) & ((pl.col("_fill_ns") + horizon_ns - pl.col("_after_state")) <= stale_ns)
+            move = (
+                pl.when(
+                    (pl.col("_mid_fill") > 0)
+                    & pl.col("_mid_after").is_not_null()
+                    & pl.col("_valid_fill")
+                    & pl.col("_valid_after")
+                    & fresh
+                )
+                .then(
+                    pl.col("direction")
+                    * (pl.col("_mid_after") - pl.col("_mid_fill"))
+                    / pl.col("_mid_fill")
+                    / BPS_SCALE
+                )
+                .otherwise(None)
+                .alias(f"markout_{lat}_{horizon}s")
+            )
+            episodes = episodes.with_columns(move).drop(
+                "_after_state", "_mid_after", "_valid_after"
+            )
+        episodes = episodes.drop("_fill_ns", "_fill_state", "_mid_fill", "_valid_fill")
+    return episodes
 
 
 def _asof_lookup(
@@ -708,8 +814,9 @@ def _empty_episodes(
                 schema[f"competed_jitter_{lat}"] = pl.Float64
                 schema[f"captured_adj_jitter_{lat}"] = pl.Float64
     if markout:
-        for horizon in config.markout_horizons_s:
-            schema[f"markout_{horizon}s"] = pl.Float64
+        for lat in config.latencies_ms:
+            for horizon in config.markout_horizons_s:
+                schema[f"markout_{lat}_{horizon}s"] = pl.Float64
     return pl.DataFrame(schema=schema)
 
 
@@ -719,7 +826,7 @@ def _gap_mask(
     gaps: pl.DataFrame | None,
     time_col: str,
 ) -> pl.Series | None:
-    """Boolean series: is ``t`` inside one of the feed's gaps?"""
+    """Boolean series: is ``t`` inside one of the feed's (unioned) gaps?"""
     if gaps is None or (feed.src is None and feed.conn is None):
         return None
     _require_columns(gaps, ["start_ns", "end_ns"])
@@ -728,13 +835,105 @@ def _gap_mask(
         subset = subset.filter(pl.col("src") == feed.src)
     if feed.conn is not None:
         subset = subset.filter(pl.col("conn") == feed.conn)
-    subset = subset.select("start_ns", "end_ns").sort("start_ns")
     if subset.height == 0:
         return pl.Series([False] * frame.height)
+    unioned = _union_intervals(subset.select("start_ns", "end_ns"))
     probes = frame.select(time_col).join_asof(
-        subset, left_on=time_col, right_on="start_ns", strategy="backward"
+        unioned, left_on=time_col, right_on="start_ns", strategy="backward"
     )
     return probes["start_ns"].is_not_null() & (probes[time_col] < probes["end_ns"])
+
+
+def _union_intervals(intervals: pl.DataFrame) -> pl.DataFrame:
+    """Merge overlapping/nested ``[start_ns, end_ns)`` intervals.
+
+    Sorts by start, then starts a new group whenever a start is past the running
+    maximum end; each group is collapsed to ``(min start, max end)``. Rows are
+    clipped to a non-negative width because the frames use closed gaps.
+    """
+    ordered = intervals.sort("start_ns")
+    new_group = pl.col("start_ns") > pl.col("end_ns").cum_max().shift(1).fill_null(True)
+    return (
+        ordered.with_columns(new_group.cast(pl.Int64).cum_sum().alias("_g"))
+        .group_by("_g")
+        .agg(
+            start_ns=pl.col("start_ns").min(),
+            end_ns=pl.col("end_ns").max(),
+        )
+        .sort("start_ns")
+    )
+
+
+def _variant_columns(lat: int, variant: str) -> tuple[str, str]:
+    """Return ``(captured, open)`` column names for one capture variant."""
+    for name, captured_format, open_format in _VARIANTS:
+        if name == variant:
+            return captured_format.format(lat=lat), open_format.format(lat=lat)
+    known = ", ".join(name for name, _, _ in _VARIANTS)
+    raise EpisodeError(f"unknown capture variant `{variant}` (known: {known})")
+
+
+def _select_variants(
+    episodes: pl.DataFrame,
+    lat: int,
+    requested: Sequence[str] | None,
+) -> list[tuple[str, str, str]]:
+    """Available ``(name, captured, open)`` variants, filtered by ``requested``."""
+    available = [
+        (name, *_variant_columns(lat, name))
+        for name, _, _ in _VARIANTS
+        if _variant_columns(lat, name)[0] in episodes.columns
+        and _variant_columns(lat, name)[1] in episodes.columns
+    ]
+    if requested is None:
+        return available
+    names = {name for name, _, _ in available}
+    for name in requested:
+        if name not in names:
+            raise EpisodeError(f"capture variant `{name}` is not available at latency {lat}")
+    wanted = set(requested)
+    return [variant for variant in available if variant[0] in wanted]
+
+
+def _validated_days(
+    episodes: pl.DataFrame,
+    days: int,
+    all_dates: Sequence[_dt.date] | None,
+) -> list[_dt.date]:
+    """Validate and return the required, complete list of valid days."""
+    dates = _required_dates(all_dates)
+    if days <= 0:
+        raise EpisodeError(f"days must be > 0, got {days}")
+    if len(dates) != days:
+        raise EpisodeError(
+            f"all_dates has {len(dates)} days but days = {days}; every valid day "
+            "must be listed so zero-episode days are counted"
+        )
+    if "date" in episodes.columns and episodes.height:
+        allowed = set(dates)
+        unknown = sorted(
+            {day for day in episodes["date"].to_list() if day not in allowed}
+        )
+        if unknown:
+            raise EpisodeError(
+                f"episode date(s) {unknown} are not in all_dates"
+            )
+    return dates
+
+
+def _required_dates(all_dates: Sequence[_dt.date] | None) -> list[_dt.date]:
+    """Return ``all_dates`` as a duplicate-free list or raise."""
+    if all_dates is None:
+        raise EpisodeError(
+            "all_dates is required so zero-episode days are counted in "
+            "usd_per_day and the bootstrap CI"
+        )
+    dates = list(all_dates)
+    if not dates:
+        raise EpisodeError("all_dates must not be empty")
+    if len(set(dates)) != len(dates):
+        raise EpisodeError("all_dates must not contain duplicates")
+    return dates
 
 
 def _as_expr(value: str | pl.Expr) -> pl.Expr:
@@ -764,17 +963,9 @@ def _positive_ms(value: int, name: str) -> int:
     return value * MS_NS
 
 
-def _date_values(episodes: pl.DataFrame, all_dates: Sequence[_dt.date] | None) -> list[_dt.date]:
-    if all_dates is not None:
-        dates = list(all_dates)
-    else:
-        dates = sorted(set(episodes["date"].to_list()))
-    if not dates:
-        raise EpisodeError("episodes has no dates to score")
-    return dates
-
-
 def _per_day_counts(episodes: pl.DataFrame, dates: Sequence[_dt.date]) -> list[int]:
+    if episodes.height == 0 or "date" not in episodes.columns:
+        return [0] * len(dates)
     counts = episodes.group_by("date").agg(pl.len().alias("n"))
     present = {row["date"]: row["n"] for row in counts.iter_rows(named=True)}
     return [present.get(day, 0) for day in dates]
@@ -785,16 +976,21 @@ def _daily_totals(
     captured: pl.Series,
     dates: Sequence[_dt.date],
 ) -> list[float]:
+    if episodes.height == 0 or "date" not in episodes.columns:
+        return [0.0] * len(dates)
     frame = episodes.select("date").with_columns(captured.alias("_captured"))
     totals = frame.group_by("date").agg(pl.col("_captured").sum())
     present = {row["date"]: row["_captured"] for row in totals.iter_rows(named=True)}
     return [float(present.get(day, 0.0)) for day in dates]
 
 
-def _median_over(mask: pl.Series, episodes: pl.DataFrame, column: str) -> float | None:
-    if column not in episodes.columns:
+def _median_over_episodes(
+    episodes: pl.DataFrame, open_col: str, column: str
+) -> float | None:
+    """Median of ``column`` over episodes open at that latency."""
+    if column not in episodes.columns or open_col not in episodes.columns:
         return None
-    values = episodes.filter(mask)[column].drop_nulls()
+    values = episodes.filter(episodes[open_col].fill_null(False))[column].drop_nulls()
     if values.is_empty():
         return None
     return float(values.median())

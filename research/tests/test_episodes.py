@@ -23,6 +23,7 @@ from hlr.episodes import (
     episode_metrics,
     feed_validity,
     jittered_latency_ms,
+    oos_split,
 )
 
 MS = 1_000_000
@@ -267,7 +268,9 @@ def test_probe_past_the_stale_window_is_not_captured() -> None:
         config=EpisodeConfig(merge_ms=0, latencies_ms=(1000, 3000), stale_ms=2000),
     )
     (row,) = episode_rows(ep)
-    assert row["t_end"] == ms(5000)
+    # t_end is capped at the last state (1 ms) + stale_ms (2000 ms).
+    assert row["t_end"] == ms(2001)
+    assert row["duration_ms"] == 2001
     assert row["open_1000"] is True
     assert row["captured_1000"] == MC(5.0 * 100.0 * BPS_SCALE)
     assert row["open_3000"] is False
@@ -456,14 +459,39 @@ def test_markout_reports_signed_mid_move() -> None:
         config=EpisodeConfig(
             merge_ms=0,
             latencies_ms=(1,),
-            markout_latency_ms=1,
             markout_horizons_s=(1,),
         ),
         mid="mid",
         direction="dir",
     )
     (row,) = episode_rows(ep)
-    assert row["markout_1s"] == MC(100.0)
+    assert row["markout_1_1s"] == MC(100.0)
+
+
+def test_markout_is_null_when_the_horizon_state_is_stale() -> None:
+    # The 1 s horizon is 100 ms stale (stale_ms=100), so the markout is null.
+    f = frame(
+        [ms(0), ms(1), ms(50)],
+        [0.0, 5.0, 5.0],
+        [1.0] * 3,
+        mid=[100.0, 100.0, 101.0],
+        dir=[1.0] * 3,
+    )
+    ep = detect_episodes(
+        f,
+        net_bps="net_bps",
+        size_usd="size_usd",
+        config=EpisodeConfig(
+            merge_ms=0,
+            stale_ms=100,
+            latencies_ms=(1,),
+            markout_horizons_s=(1,),
+        ),
+        mid="mid",
+        direction="dir",
+    )
+    (row,) = episode_rows(ep)
+    assert row["markout_1_1s"] is None
 
 
 def test_markout_is_signed_by_direction() -> None:
@@ -479,13 +507,13 @@ def test_markout_is_signed_by_direction() -> None:
         net_bps="net_bps",
         size_usd="size_usd",
         config=EpisodeConfig(
-            merge_ms=0, latencies_ms=(1,), markout_latency_ms=1, markout_horizons_s=(1,)
+            merge_ms=0, latencies_ms=(1,), markout_horizons_s=(1,)
         ),
         mid="mid",
         direction="dir",
     )
     (row,) = episode_rows(ep)
-    assert row["markout_1s"] == MC(-100.0)
+    assert row["markout_1_1s"] == MC(-100.0)
 
 
 # --------------------------------------------------------------------------
@@ -532,9 +560,10 @@ def test_episode_metrics_roll_up_per_latency() -> None:
     assert table.height == 2
     first = table.row(0, named=True)
     assert first["latency_ms"] == 1
+    assert first["capture_variant"] == "naive"
     assert first["episodes"] == 2
     assert first["capture_rate"] == MC(0.5)  # probe +5 ms lands past the first t_end
-    assert first["usd_per_day"] == MC(first["capture_naive_usd"])
+    assert first["usd_per_day"] == MC(first["capture_usd"])
     assert first["usd_per_day_ci90_lo"] <= first["usd_per_day"] <= first["usd_per_day_ci90_hi"]
     assert first["apr"] == MC(first["usd_per_day"] * 365.0 / 10_000.0)
 
@@ -563,9 +592,10 @@ def test_daily_capture_groups_by_start_day() -> None:
         size_usd="size_usd",
         config=EpisodeConfig(merge_ms=0, latencies_ms=(1,)),
     )
-    daily = daily_capture(ep, 1)
-    assert daily["date"].to_list() == [DAY1]
-    assert daily["episodes"].to_list() == [1]
+    daily = daily_capture(ep, 1, all_dates=[DAY1, DAY2])
+    assert daily["date"].to_list() == [DAY1, DAY2]
+    assert daily["episodes"].to_list() == [1, 0]
+    assert daily["captured_usd"].to_list()[1] == MC(0.0)
 
 
 def test_bootstrap_ci_is_deterministic_and_contains_mean() -> None:
@@ -584,6 +614,178 @@ def test_empty_episode_table_has_typed_columns() -> None:
     assert ep.height == 0
     assert ep.schema["open_10"] == pl.Boolean
     assert ep.schema["captured_jitter_250"] == pl.Float64
+
+
+def test_capture_is_sized_at_start_when_the_book_grows() -> None:
+    # The book is 100 USD at t_start and 300 USD at t_start+1 ms; the order we
+    # could have placed at t_start caps the capture at 100.
+    f = frame(
+        [ms(0), ms(1), ms(2), ms(3)],
+        [0.0, 5.0, 5.0, -1.0],
+        [0.0, 100.0, 300.0, 300.0],
+    )
+    ep = detect_episodes(
+        f,
+        net_bps="net_bps",
+        size_usd="size_usd",
+        config=EpisodeConfig(merge_ms=0, latencies_ms=(1,)),
+    )
+    (row,) = episode_rows(ep)
+    assert row["size_usd_at_start"] == MC(100.0)
+    assert row["captured_1"] == MC(5.0 * 100.0 * BPS_SCALE)
+
+
+def test_cap_is_applied_after_competition() -> None:
+    # displayed 100k, cap 10k, competed 20k -> adjusted size 10k (not 0).
+    f = frame(
+        [ms(0), ms(1), ms(2)],
+        [0.0, 5.0, -1.0],
+        [0.0, 100_000.0, 100_000.0],
+        compete=[0.0, 20_000.0, 0.0],
+    )
+    ep = detect_episodes(
+        f,
+        net_bps="net_bps",
+        size_usd="size_usd",
+        config=EpisodeConfig(merge_ms=0, latencies_ms=(0,), max_notional=10_000.0),
+        compete_usd="compete",
+    )
+    (row,) = episode_rows(ep)
+    assert row["size_usd_at_start"] == MC(10_000.0)
+    assert row["captured_0"] == MC(5.0 * 10_000.0 * BPS_SCALE)
+    assert row["captured_adj_0"] == MC(5.0 * 10_000.0 * BPS_SCALE)
+
+
+def test_open_excludes_a_merged_dip() -> None:
+    # The runs merge (sep 1 ms) but the merged interval holds net_bps == 0 at the
+    # +2 ms probe, so it is not an open (capturable) probe.
+    f = frame([ms(0), ms(1), ms(2), ms(3), ms(4), ms(5)], [5.0, 5.0, 0.0, 5.0, 5.0, -1.0])
+    ep = detect_episodes(
+        f,
+        net_bps="net_bps",
+        size_usd="size_usd",
+        config=EpisodeConfig(merge_ms=5, latencies_ms=(2,)),
+    )
+    (row,) = episode_rows(ep)
+    assert row["t_start"] == ms(0)
+    assert row["t_end"] == ms(5)
+    assert row["open_2"] is False
+    assert row["captured_2"] == MC(0.0)
+
+
+def test_metrics_exposes_every_capture_variant() -> None:
+    f = frame(
+        [ms(0), ms(1), ms(2), ms(3)],
+        [0.0, 5.0, 5.0, -1.0],
+        [100.0] * 4,
+        compete=[0.0, 10.0, 0.0, 0.0],
+        mid=[100.0, 100.0, 100.0, 101.0],
+        dir=[1.0] * 4,
+    )
+    ep = detect_episodes(
+        f,
+        net_bps="net_bps",
+        size_usd="size_usd",
+        config=EpisodeConfig(merge_ms=0, latencies_ms=(1,), jitter=True),
+        compete_usd="compete",
+        mid="mid",
+        direction="dir",
+    )
+    table = episode_metrics(ep, days=1, all_dates=[DAY1], latencies_ms=(1,))
+    assert set(table["capture_variant"].to_list()) == {"naive", "adj", "jitter", "adj_jitter"}
+    headline = table.filter(pl.col("capture_variant") == "adj_jitter").row(0, named=True)
+    assert headline["usd_per_day"] == MC(
+        float(ep["captured_adj_jitter_1"].sum()) / 1.0
+    )
+
+
+def test_zero_episodes_metrics_are_zero_not_absent() -> None:
+    ep = detect_episodes(
+        frame([ms(0), ms(1), ms(2)], [-1.0, -2.0, -3.0]),
+        net_bps="net_bps",
+        size_usd="size_usd",
+        config=EpisodeConfig(merge_ms=0, latencies_ms=(1,)),
+    )
+    table = episode_metrics(ep, days=1, all_dates=[DAY1], capital_usd=10_000.0, latencies_ms=(1,))
+    assert table.height == 1
+    row = table.row(0, named=True)
+    assert row["episodes"] == 0
+    assert row["capture_rate"] == MC(0.0)
+    assert row["usd_per_day"] == MC(0.0)
+    assert row["apr"] == MC(0.0)
+    assert row["usd_per_day_ci90_lo"] == MC(0.0)
+    assert row["usd_per_day_ci90_hi"] == MC(0.0)
+
+
+def test_all_dates_is_required_for_metrics_and_daily_capture() -> None:
+    ep = detect_episodes(
+        frame([ms(0), ms(1), ms(2)], [0.0, 5.0, -1.0]),
+        net_bps="net_bps",
+        size_usd="size_usd",
+        config=EpisodeConfig(merge_ms=0, latencies_ms=(1,)),
+    )
+    with pytest.raises(EpisodeError, match="all_dates"):
+        episode_metrics(ep, days=1)
+    with pytest.raises(EpisodeError, match="all_dates"):
+        daily_capture(ep, 1)
+
+
+def test_all_dates_length_must_match_days() -> None:
+    ep = detect_episodes(
+        frame([ms(0), ms(1), ms(2)], [0.0, 5.0, -1.0]),
+        net_bps="net_bps",
+        size_usd="size_usd",
+        config=EpisodeConfig(merge_ms=0, latencies_ms=(1,)),
+    )
+    with pytest.raises(EpisodeError, match="all_dates"):
+        episode_metrics(ep, days=2, all_dates=[DAY1])
+
+
+def test_episode_dates_must_be_in_all_dates() -> None:
+    ep = detect_episodes(
+        frame([ms(0), ms(1), ms(2)], [0.0, 5.0, -1.0]),
+        net_bps="net_bps",
+        size_usd="size_usd",
+        config=EpisodeConfig(merge_ms=0, latencies_ms=(1,)),
+    )
+    with pytest.raises(EpisodeError, match="not in all_dates"):
+        episode_metrics(ep, days=1, all_dates=[DAY2])
+
+
+@pytest.mark.parametrize(
+    "gaps",
+    [
+        [(0, 1000), (100, 200)],  # nested
+        [(0, 1000), (400, 600)],  # the later gap ends before the earlier one
+    ],
+)
+def test_overlapping_gaps_are_unioned(gaps: list[tuple[int, int]]) -> None:
+    f = pl.DataFrame({"t_ns": [ms(700)], "last_a": [ms(700)]})
+    gap_frame = pl.DataFrame(
+        {
+            "src": ["hl-ws"] * len(gaps),
+            "conn": ["bbo"] * len(gaps),
+            "start_ns": [ms(start) for start, _ in gaps],
+            "end_ns": [ms(end) for _, end in gaps],
+        }
+    )
+    out = feed_validity(
+        f,
+        [Feed("a", "last_a", "hl-ws", "bbo")],
+        stale_ms=5000,
+        gaps=gap_frame,
+    )
+    assert out["valid"].to_list() == [False]
+
+
+def test_oos_split_is_chronological() -> None:
+    dates = [_dt.date(2026, 1, day) for day in range(1, 11)]
+    in_sample, oos = oos_split(list(reversed(dates)))
+    assert in_sample == dates[:6]
+    assert oos == dates[6:]
+    assert oos_split([dates[0]]) == ([dates[0]], [])
+    with pytest.raises(EpisodeError, match="frac"):
+        oos_split(dates, frac=1.0)
 
 
 # --------------------------------------------------------------------------
