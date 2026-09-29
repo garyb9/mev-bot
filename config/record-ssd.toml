@@ -1,0 +1,60 @@
+# Recorder profile for the external-SSD measurement run (SPEC-0008 V-4 / V-7,
+# task R-14b). This is a copy of config/record.toml's `default` profile with the
+# output moved to the external SSD and a mount guard turned on.
+#
+# It is loaded by `deploy/recorder/run-ssd.sh`, which runs `hl record` from a
+# small state-dir working copy whose `config/record.toml` is a symlink to this
+# file (the current `hl record` CLI always loads `config/record.toml`). Never
+# point `out_dir` at `/mnt/e` itself: the run may only ever write under
+# `/mnt/e/mev-rec`, and only while `/mnt/e` is a real mount.
+#
+# `require_mount = "/mnt/e"` is the R-14 mount guard: when set, the recorder
+# refuses to start (and stops all writers mid-run) unless `/mnt/e` is a real
+# mount point on a device other than `/` and `out_dir` is inside it. This makes
+# it impossible to leak data onto the root disk if the drive disconnects and
+# `/mnt/e` becomes an ordinary empty directory.
+#
+# The recorder never loads keys and never places orders (SPEC-0008 §3).
+
+[profile.default]
+network = "mainnet"
+out_dir = "/mnt/e/mev-rec"
+require_mount = "/mnt/e"          # R-14: refuse to write unless /mnt/e is a real mount
+zstd_level = 3
+min_free_gb = 100
+retain_days = 30
+meta_refresh_secs = 300          # re-resolve universes, pick up new listings
+# Port for `/healthz`, `/readyz`, `/metrics` (SPEC-0008 §12.2). Kept separate
+# from the bot's 9090 so both can run on one host.
+http_port = 9091
+
+[profile.default.hl]
+bbo              = ["perps:all", "hip3:all", "spot:top:40", "spot:quotes"]
+trades           = ["perps:top:40", "hip3:all", "spot:top:20"]
+active_asset_ctx = ["perps:all", "hip3:all"]
+all_mids         = true          # main dex + every HIP-3 dex
+l2book           = ["BTC", "ETH", "SOL", "HYPE", "hip3:all"]
+max_subs         = 900           # keep 100 of the 1000 as headroom
+subs_per_conn    = 150
+connections      = 8             # of 10; leaves 2 for ad-hoc tools / the bot
+allow_truncate   = false         # refuse to drop priority-1 subscriptions
+
+[profile.default.rest]
+enabled = true
+# see SPEC-0008 §8 for the request list and cadences
+weight_per_min = 300             # a quarter of the 1200/IP budget
+
+[profile.default.deribit]
+enabled    = false               # R-12; public Deribit options summaries (no keys)
+currencies = ["BTC", "ETH"]
+base_url   = "https://www.deribit.com/api/v2"  # public JSON-RPC host
+
+[profile.default.cex]
+binance_usdm = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT"]
+binance_spot = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+bybit_linear = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT"]
+
+[profile.default.hyperevm]
+enabled = false                  # R-9; needs a non-public RPC (see SPEC-0008 §10)
+rpc_ws  = "env:HL_EVM_WS_URL"
+pools   = "config/hyperevm-pools.toml"
