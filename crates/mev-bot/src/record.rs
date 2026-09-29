@@ -492,7 +492,21 @@ pub async fn run(
         .map(|conn| (conn.id.clone(), ConnState::new()))
         .collect();
     states.sort_by(|a, b| a.0.cmp(&b.0));
-    let recorder_health = RecorderHealth::new(states.clone());
+
+    // Non-gating reference streams (R-8). Created up front so their liveness is
+    // registered with the readiness monitor before any source is spawned.
+    let cex_states: Vec<(String, Arc<ConnState>)> = cex_venues(&profile)
+        .into_iter()
+        .filter(|(_, symbols)| !symbols.is_empty())
+        .map(|(kind, _)| {
+            let state = ConnState::new();
+            // Seed freshness so a source that is still dialing at startup is
+            // not reported stale for the first watchdog window.
+            state.touch(&*clock);
+            (kind.src().to_string(), state)
+        })
+        .collect();
+    let recorder_health = RecorderHealth::new(states.clone(), cex_states.clone());
 
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
@@ -590,6 +604,11 @@ pub async fn run(
             continue;
         }
         let src = kind.src();
+        let state = cex_states
+            .iter()
+            .find(|(name, _)| name == src)
+            .map(|(_, state)| state.clone())
+            .context("cex connection state missing")?;
         let writer = Arc::new(
             SegmentWriter::spawn(segment_config(
                 &profile,
@@ -606,9 +625,9 @@ pub async fn run(
         let sink = Arc::new(CountingSink {
             writer: writer.clone(),
             clock: clock.clone(),
-            health: RecorderHealth::new(Vec::new()),
+            health: recorder_health.clone(),
             metrics: ConnMetrics::new(src, src),
-            state: ConnState::new(),
+            state: state.clone(),
             account_hl_rest: false,
         });
         let source = CexSource::new(CexConfig::new(kind, symbols.clone()), sink, clock.clone());
@@ -913,14 +932,21 @@ impl ConnState {
 
 /// Process-wide readiness input.
 struct RecorderHealth {
+    /// Gating connections: `/readyz` is not ready if any of these is down.
     conns: Vec<(String, Arc<ConnState>)>,
+    /// Non-gating reference streams (R-8 CEX). A dead one is reported (a
+    /// rate-limited WARN and the `hl_ws_connected{src}` gauge) but does not
+    /// turn `/readyz` red, so a flaky reference feed cannot take the recorder
+    /// out of rotation.
+    cex: Vec<(String, Arc<ConnState>)>,
     rest_last_ns: AtomicU64,
 }
 
 impl RecorderHealth {
-    fn new(conns: Vec<(String, Arc<ConnState>)>) -> Arc<Self> {
+    fn new(conns: Vec<(String, Arc<ConnState>)>, cex: Vec<(String, Arc<ConnState>)>) -> Arc<Self> {
         Arc::new(Self {
             conns,
+            cex,
             rest_last_ns: AtomicU64::new(0),
         })
     }
@@ -943,6 +969,19 @@ impl RecorderHealth {
             }
             let last = state.last_ns.load(Ordering::Relaxed);
             last != 0 && now_ns.saturating_sub(last) <= watchdog_ns
+        })
+    }
+
+    /// The first CEX stream that has not produced data within the watchdog
+    /// (or never has), for reporting. Non-gating: never affects `ready`.
+    fn cex_down(&self, now_ns: u64, watchdog_ns: u64) -> Option<&str> {
+        self.cex.iter().find_map(|(name, state)| {
+            let last = state.last_ns.load(Ordering::Relaxed);
+            if last != 0 && now_ns.saturating_sub(last) <= watchdog_ns {
+                None
+            } else {
+                Some(name.as_str())
+            }
         })
     }
 }
@@ -1132,7 +1171,11 @@ async fn run_ws_conn(
                         record_gap_seconds(src, conn_id.as_str(), &gap_reason, gap_ms);
                     }
                 }
-                Ok(RawEvent::Gap { reason, detail }) => {
+                Ok(RawEvent::Gap {
+                    reason,
+                    detail,
+                    disconnect_ns: _,
+                }) => {
                     state.set_connected(false);
                     seq = emit_gap_start(&metrics, &writer, &state, &*clock, &conn_id, &reason, &detail, seq);
                     gap_reason = reason;
@@ -1364,6 +1407,10 @@ async fn disk_monitor(out_dir: PathBuf, mut shutdown: watch::Receiver<bool>) {
 ///
 /// A tripped [`MountGuard`] forces not-ready even while the sockets are still
 /// healthy, so `/readyz` reflects that the recorder can no longer write.
+///
+/// Non-gating CEX streams are reported here (a transition WARN; the
+/// `hl_ws_connected{src}` gauge is maintained by `RawWsConn`) but never affect
+/// `/readyz`, so a dead reference feed cannot take the recorder out of rotation.
 async fn readiness_monitor(
     recorder: Arc<RecorderHealth>,
     health: Health,
@@ -1372,15 +1419,28 @@ async fn readiness_monitor(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut tick = tokio::time::interval(READY_SAMPLE_INTERVAL);
+    let mut cex_degraded = false;
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                let now_ns = clock.mono_ns();
                 let ready = !mount_guard.is_tripped() && recorder.ready(
-                    clock.mono_ns(),
+                    now_ns,
                     READY_WATCHDOG.as_nanos() as u64,
                     REST_READY_STALE.as_nanos() as u64,
                 );
                 health.set_ready(ready);
+                match recorder.cex_down(now_ns, READY_WATCHDOG.as_nanos() as u64) {
+                    Some(src) if !cex_degraded => {
+                        warn!(src, "cex reference stream is stale (non-gating)");
+                        cex_degraded = true;
+                    }
+                    None if cex_degraded => {
+                        info!("cex reference streams recovered");
+                        cex_degraded = false;
+                    }
+                    _ => {}
+                }
             }
             _ = shutdown.changed() => break,
         }
@@ -1963,7 +2023,7 @@ mod tests {
         guard.trip();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(readiness_monitor(
-            RecorderHealth::new(Vec::new()),
+            RecorderHealth::new(Vec::new(), Vec::new()),
             health.clone(),
             clock,
             guard,
@@ -1980,6 +2040,34 @@ mod tests {
         assert!(
             !health.is_ready(),
             "a tripped mount must make /readyz not ready"
+        );
+    }
+
+    /// CEX reference streams are reported but never gate readiness: a dead CEX
+    /// stream is `cex_down` while `ready` stays true when the gating streams are
+    /// healthy (R-8 fix1).
+    #[test]
+    fn dead_cex_stream_is_reported_but_does_not_gate_readiness() {
+        let clock = mev_recorder::FixedEnvelopeClock::new(1, 0);
+        let hl = ConnState::new();
+        hl.set_connected(true);
+        let cex = ConnState::new();
+        let watchdog_ns = READY_WATCHDOG.as_nanos() as u64;
+        let now = watchdog_ns * 100;
+        // The CEX stream last produced data well beyond the watchdog window.
+        clock.set_mono_ns(now - watchdog_ns * 10);
+        cex.touch(&clock);
+        // The gating HL stream is fresh.
+        clock.set_mono_ns(now - watchdog_ns / 2);
+        hl.touch(&clock);
+        let health = RecorderHealth::new(
+            vec![("hl-ws-01".to_string(), hl)],
+            vec![("bybit-linear".to_string(), cex)],
+        );
+        assert_eq!(health.cex_down(now, watchdog_ns), Some("bybit-linear"));
+        assert!(
+            health.ready(now, watchdog_ns, REST_READY_STALE.as_nanos() as u64),
+            "a dead CEX stream must not gate readiness"
         );
     }
 
@@ -2265,7 +2353,7 @@ mod tests {
             ))
             .unwrap(),
         );
-        let health = RecorderHealth::new(Vec::new());
+        let health = RecorderHealth::new(Vec::new(), Vec::new());
         let shutdown = Arc::new(Notify::new());
         let task = tokio::spawn(run_deribit(
             deribit_config(&profile),
@@ -2395,7 +2483,7 @@ mod tests {
         let sink = Arc::new(CountingSink {
             writer: writer.clone(),
             clock: clock.clone(),
-            health: RecorderHealth::new(Vec::new()),
+            health: RecorderHealth::new(Vec::new(), Vec::new()),
             metrics: ConnMetrics::new("bybit-linear", "bybit-linear"),
             state: ConnState::new(),
             account_hl_rest: false,
@@ -2490,7 +2578,8 @@ mod tests {
         let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let rest_shutdown = Arc::new(Notify::new());
-        let health = RecorderHealth::new(vec![("hl-ws-01".to_string(), ConnState::new())]);
+        let health =
+            RecorderHealth::new(vec![("hl-ws-01".to_string(), ConnState::new())], Vec::new());
 
         // WS connection task.
         let conn = Connection {

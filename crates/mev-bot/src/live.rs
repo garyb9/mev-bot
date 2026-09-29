@@ -300,7 +300,7 @@ pub(crate) async fn account_stream_conn(
                     }
                 }
             }
-            Ok(RawEvent::Gap { reason, detail }) => {
+            Ok(RawEvent::Gap { reason, detail, .. }) => {
                 tracing::warn!(reason, detail, "account feed gap");
                 if reason == "shutdown" {
                     return true;

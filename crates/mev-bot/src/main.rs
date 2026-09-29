@@ -937,7 +937,7 @@ async fn ingest(
                                 metrics::counter!(mev_metrics::names::SIDECAR_DROPS).increment(1);
                             }
                         }
-                        Ok(RawEvent::Gap { reason, detail }) => {
+                        Ok(RawEvent::Gap { reason, detail, .. }) => {
                             tracing::warn!(reason, detail, "market feed gap");
                             if reason == "shutdown" {
                                 return;

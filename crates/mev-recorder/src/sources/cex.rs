@@ -267,6 +267,10 @@ pub struct CexSource {
     seq: u64,
     src: &'static str,
     conn: &'static str,
+    /// Envelopes dropped since the last rate-limited warning.
+    dropped_since_warn: u64,
+    /// When the dropped-envelope warning was last emitted.
+    last_drop_warn: Instant,
 }
 
 impl CexSource {
@@ -314,6 +318,8 @@ impl CexSource {
             seq: 0,
             src,
             conn: src,
+            dropped_since_warn: 0,
+            last_drop_warn: Instant::now(),
         }
     }
 
@@ -347,10 +353,16 @@ impl CexSource {
     ///
     /// One connection is dialed; after that [`RawWsConn`] transparently
     /// reconnects on gaps. A failed initial dial is retried every
-    /// [`CEX_CONNECT_RETRY`], emitting a `gap_start` each time.
+    /// [`CEX_CONNECT_RETRY`], emitting a single `gap_start` until the first
+    /// successful open (a matching `gap_end` closes it).
     pub async fn run(mut self, shutdown: Arc<Notify>) {
         let url = self.url();
-        let mut gap_started: Option<Instant> = None;
+        // Process-monotonic ns at the start of the current outage. Set when the
+        // drop is detected (initial-dial failure or `RawEvent::Gap`), cleared by
+        // `gap_end`. The `Gap` event only arrives after the reconnect, so the
+        // timestamp is taken before it, keeping `gap_ms` equal to the real
+        // downtime.
+        let mut gap_started: Option<u64> = None;
 
         let mut raw = loop {
             match RawWsConn::connect_with(
@@ -368,8 +380,10 @@ impl CexSource {
                         error = %err,
                         "cex websocket connect failed; retrying"
                     );
-                    self.emit_gap_start("error", &err.to_string());
-                    gap_started = Some(Instant::now());
+                    if gap_started.is_none() {
+                        self.emit_gap_start("error", &err.to_string());
+                        gap_started = Some(raw_ws::mono_ns());
+                    }
                     tokio::select! {
                         _ = tokio::time::sleep(CEX_CONNECT_RETRY) => {}
                         _ = shutdown.notified() => {
@@ -416,11 +430,16 @@ impl CexSource {
                             self.emit_gap_end(started);
                         }
                     }
-                    Ok(RawEvent::Gap { reason, detail }) => {
+                    Ok(RawEvent::Gap { reason, detail, disconnect_ns }) => {
                         self.emit_gap_start(&reason, &detail);
-                        gap_started = Some(Instant::now());
+                        // `disconnect_ns` is the detection time, before the
+                        // reconnect, so `gap_ms` measures the real outage.
+                        gap_started = Some(disconnect_ns);
                     }
                     Err(err) => {
+                        // `RawWsConn` only returns `Err` on shutdown; a broken
+                        // connection is retried internally.
+                        warn!(src = self.src, error = %err, "cex source stopped");
                         self.emit_gap_start("error", &err.to_string());
                         break;
                     }
@@ -430,10 +449,22 @@ impl CexSource {
         debug!(src = self.src, "cex source stopped");
     }
 
-    /// Send one envelope through the sink; log a dropped one.
-    fn emit(&self, env: Envelope) {
-        if !self.sink.send(env) {
-            warn!(src = self.src, conn = self.conn, "cex envelope dropped");
+    /// Send one envelope through the sink, rate-limiting dropped-envelope
+    /// warnings to at most one per 10 s per stream with a suppressed count.
+    fn emit(&mut self, env: Envelope) {
+        if self.sink.send(env) {
+            return;
+        }
+        self.dropped_since_warn += 1;
+        if self.last_drop_warn.elapsed() >= Duration::from_secs(10) {
+            warn!(
+                src = self.src,
+                conn = self.conn,
+                dropped = self.dropped_since_warn,
+                "cex envelopes dropped (suppressing further warnings for 10 s)"
+            );
+            self.dropped_since_warn = 0;
+            self.last_drop_warn = Instant::now();
         }
     }
 
@@ -461,8 +492,9 @@ impl CexSource {
         self.seq += 1;
     }
 
-    fn emit_gap_end(&mut self, started: Instant) {
-        let gap_ms = started.elapsed().as_millis() as u64;
+    fn emit_gap_end(&mut self, started_ns: u64) {
+        let now = raw_ws::mono_ns();
+        let gap_ms = now.saturating_sub(started_ns) / 1_000_000;
         let env = Envelope::gap_end(&*self.clock, self.src, self.conn, self.seq, gap_ms);
         self.emit(env);
         self.seq += 1;
@@ -780,6 +812,175 @@ mod tests {
         handle.await.unwrap();
     }
 
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(&[0, 1, 2, 3]), "AAECAw==");
+    }
+
+    /// A binary frame is recorded as a `frame_bin` envelope with base64 `raw`.
+    #[tokio::test]
+    async fn binary_frames_are_recorded_as_base64() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let _ = ws.next().await; // subscribe frame
+            ws.send(Message::Binary(vec![0, 1, 2, 3].into())).await.ok();
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+
+        let (source, mut rx) = source(config(
+            CexKind::BybitLinear,
+            format!("ws://{addr}"),
+            &["BTCUSDT"],
+        ));
+        let shutdown = Arc::new(Notify::new());
+        let handle = tokio::spawn(source.run(shutdown.clone()));
+
+        let env = recv_until(&mut rx, Kind::FrameBin).await;
+        assert_eq!(env.src, "bybit-linear");
+        assert_eq!(env.raw.as_deref(), Some("AAECAw=="));
+
+        shutdown.notify_one();
+        handle.await.unwrap();
+    }
+
+    /// Every venue records its `sub` envelope under its own `src`.
+    #[tokio::test]
+    async fn sub_src_for_each_venue() {
+        let cases = [
+            (CexKind::BinanceUsdm, false),
+            (CexKind::BinanceSpot, false),
+            (CexKind::BybitLinear, true),
+        ];
+        for (kind, expect_subscribe) in cases {
+            let server = spawn_mock(expect_subscribe, r#"{"x":1}"#, 1).await;
+            let (source, mut rx) =
+                source(config(kind, format!("ws://{}", server.addr), &["BTCUSDT"]));
+            let shutdown = Arc::new(Notify::new());
+            let handle = tokio::spawn(source.run(shutdown.clone()));
+
+            let sub = recv_until(&mut rx, Kind::Sub).await;
+            assert_eq!(sub.src, kind.src(), "sub src for {kind:?}");
+            assert_eq!(sub.conn, kind.src(), "sub conn for {kind:?}");
+
+            shutdown.notify_one();
+            handle.await.unwrap();
+        }
+    }
+
+    /// A busy feed must not starve the Bybit 20 s heartbeat.
+    #[tokio::test(start_paused = true)]
+    async fn busy_feed_still_pings_every_20_seconds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let _ = ws.next().await; // subscribe frame
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let frame = r#"{"topic":"orderbook.1.BTCUSDT"}"#;
+                        if ws.send(Message::Text(frame.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    msg = ws.next() => match msg {
+                        Some(Ok(Message::Text(text))) if text.contains("\"op\":\"ping\"") => {
+                            let _ = ping_tx.send(tokio::time::Instant::now());
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => break,
+                    },
+                }
+            }
+        });
+
+        let mut config = config(CexKind::BybitLinear, format!("ws://{addr}"), &["BTCUSDT"]);
+        config.watchdog = Duration::from_secs(3600);
+        let (source, _rx) = source(config);
+        let shutdown = Arc::new(Notify::new());
+        let handle = tokio::spawn(source.run(shutdown.clone()));
+
+        // Advance ~62 s in 100 ms steps so the feed stays busy throughout.
+        for _ in 0..620 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let mut pings = 0;
+        let mut times = Vec::new();
+        while let Ok(time) = ping_rx.try_recv() {
+            pings += 1;
+            times.push(time);
+        }
+        assert!(
+            pings >= 3,
+            "expected >= 3 pings on a busy bybit feed, got {pings}"
+        );
+        for pair in times.windows(2) {
+            let delta = pair[1].duration_since(pair[0]);
+            assert!(
+                delta >= Duration::from_secs(19) && delta <= Duration::from_secs(21),
+                "busy-feed ping cadence {delta:?} outside 20s ± 1s"
+            );
+        }
+
+        shutdown.notify_one();
+        let _ = handle.await;
+    }
+
+    /// `gap_ms` covers the real outage, not just the post-reconnect slice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gap_ms_covers_the_real_downtime() {
+        const DOWNTIME: Duration = Duration::from_millis(400);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Round 0: send a frame and close.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let _ = ws.next().await;
+            ws.send(Message::Text(r#"{"topic":"orderbook.1.BTCUSDT"}"#.into()))
+                .await
+                .ok();
+            ws.close(None).await.ok();
+            drop(ws);
+            // Stay down for a while before the next connection.
+            tokio::time::sleep(DOWNTIME).await;
+            // Round 1: accept and hold.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+
+        let mut config = config(CexKind::BybitLinear, format!("ws://{addr}"), &["BTCUSDT"]);
+        config.watchdog = Duration::from_secs(3600);
+        let (source, mut rx) = source(config);
+        let shutdown = Arc::new(Notify::new());
+        let handle = tokio::spawn(source.run(shutdown.clone()));
+
+        let _ = recv_until(&mut rx, Kind::GapStart).await;
+        let ended = recv_until(&mut rx, Kind::GapEnd).await;
+        let gap_ms = ended.meta.unwrap()["gap_ms"].as_u64().unwrap();
+        assert!(
+            gap_ms >= DOWNTIME.as_millis() as u64 * 3 / 4,
+            "gap_ms {gap_ms} does not cover the {DOWNTIME:?} downtime"
+        );
+
+        shutdown.notify_one();
+        let _ = handle.await;
+    }
+
     /// Bybit sends `{"op":"ping"}` every 20 s (SPEC-0008 §9, V-2).
     #[tokio::test(start_paused = true)]
     async fn bybit_pings_every_20_seconds() {
@@ -891,9 +1092,10 @@ mod tests {
         handle.await.unwrap();
     }
 
-    /// A failed initial dial emits `gap_start{error}` and keeps retrying.
-    #[tokio::test]
-    async fn initial_connect_failure_emits_a_gap_start() {
+    /// A failed initial dial emits a single `gap_start{error}` and keeps
+    /// retrying (no second `gap_start` until a successful open).
+    #[tokio::test(start_paused = true)]
+    async fn initial_connect_failure_emits_one_gap_start() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -909,6 +1111,20 @@ mod tests {
         let gap = recv_until(&mut rx, Kind::GapStart).await;
         assert_eq!(gap.meta.unwrap()["reason"], "error");
         assert_eq!(gap.src, "binance-usdm");
+
+        // Advance past several 3 s retries; repeated failures must not add
+        // another `gap_start` while the first is still open.
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        while let Ok(env) = rx.try_recv() {
+            assert_ne!(
+                env.kind,
+                Kind::GapStart,
+                "a second gap_start was emitted before gap_end"
+            );
+        }
 
         shutdown.notify_one();
         let _ = handle.await;

@@ -167,7 +167,7 @@ impl MarketStream for WsMarketStream {
                 RawEvent::Opened { .. } => {
                     metrics::gauge!(names::WS_CONNECTED).set(1.0);
                 }
-                RawEvent::Gap { reason, detail } => {
+                RawEvent::Gap { reason, detail, .. } => {
                     metrics::gauge!(names::WS_CONNECTED).set(0.0);
                     if reason == "shutdown" {
                         return Err(Error::Http(format!("websocket {reason}: {detail}")));

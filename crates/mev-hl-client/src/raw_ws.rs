@@ -32,6 +32,9 @@ pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// Maximum backoff before jitter.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Minimum backoff after jitter, so a host that accepts then immediately closes
+/// cannot be retried in a busy loop (full jitter alone can roll ~0 ms).
+pub const BACKOFF_MIN: Duration = Duration::from_millis(100);
 /// A connection is considered healthy after this long, resetting backoff.
 pub const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 
@@ -113,6 +116,12 @@ pub enum RawEvent {
         reason: String,
         /// Human-readable detail.
         detail: String,
+        /// Process-monotonic nanoseconds ([`mono_ns`]) when the drop was
+        /// **detected**, before the reconnect. Callers use it to bracket the
+        /// real outage (the `Gap` is returned only after the reconnect has
+        /// completed, so `mono_ns()` at return would understate the downtime).
+        /// `0` when the gap is a clean shutdown.
+        disconnect_ns: u64,
     },
 }
 
@@ -126,6 +135,11 @@ pub struct RawWsConn {
     shutdown: Arc<Notify>,
     last_data: Instant,
     opened_at: Instant,
+    /// Deadline of the next application keepalive, created once per connection
+    /// and advanced only when a keepalive is actually sent. Keeping it on the
+    /// connection (not rebuilt per `next()`) means a busy feed still gets its
+    /// heartbeats instead of resetting the timer on every frame.
+    next_ping: Instant,
     attempt: u32,
     metrics_src: &'static str,
     /// Set after a reconnect so the next `next()` yields `Opened`.
@@ -153,6 +167,7 @@ impl RawWsConn {
     ) -> Result<Self> {
         let socket = dial(&protocol.url()).await?;
         let src = protocol.name();
+        let now = Instant::now();
         let mut conn = Self {
             protocol,
             socket,
@@ -160,14 +175,16 @@ impl RawWsConn {
             watchdog,
             ping_interval,
             shutdown: Arc::new(Notify::new()),
-            last_data: Instant::now(),
-            opened_at: Instant::now(),
+            last_data: now,
+            opened_at: now,
+            next_ping: now + ping_interval,
             attempt: 1,
             metrics_src: src,
             pending_opened: false,
         };
         conn.resubscribe().await?;
         metrics::counter!(names::WS_RECONNECTS, "src" => src, "reason" => "open").increment(1);
+        metrics::gauge!(names::WS_CONNECTED, "src" => src).set(1.0);
         Ok(conn)
     }
 
@@ -195,6 +212,11 @@ impl RawWsConn {
 
     /// Dial with full-jitter backoff until a connection opens or shutdown is
     /// requested. Returns `Ok(())` on reconnect and `Err` on shutdown.
+    ///
+    /// The attempt counter is reset only after a **healthy** connection: at
+    /// entry, if the previous connection had been up for [`HEALTHY_AFTER`],
+    /// backoff restarts at the minimum. Otherwise it keeps growing, so a host
+    /// that accepts and immediately drops cannot pin the backoff low.
     async fn reconnect(&mut self) -> Result<()> {
         metrics::gauge!(names::WS_CONNECTED, "src" => self.metrics_src).set(0.0);
         // Reset the attempt counter after a healthy run.
@@ -211,26 +233,38 @@ impl RawWsConn {
                 _ = tokio::time::sleep(backoff) => {}
             }
 
-            match dial(&self.protocol.url()).await {
-                Ok(socket) => {
-                    self.socket = socket;
-                    self.last_data = Instant::now();
-                    self.opened_at = Instant::now();
-                    self.resubscribe().await?;
-                    metrics::counter!(
-                        names::WS_RECONNECTS,
-                        "src" => self.metrics_src,
-                        "reason" => "reconnect",
-                    )
-                    .increment(1);
-                    tracing::debug!(attempt = self.attempt, "websocket reconnected");
-                    self.attempt = 1;
-                    return Ok(());
-                }
+            let socket = match dial(&self.protocol.url()).await {
+                Ok(socket) => socket,
                 Err(err) => {
                     tracing::warn!(attempt = self.attempt, error = %err, "websocket reconnect failed");
+                    continue;
                 }
+            };
+            self.socket = socket;
+            let now = Instant::now();
+            self.last_data = now;
+            self.opened_at = now;
+            // A resubscribe send failure means this connection is unusable:
+            // treat it as another failed attempt and keep backing off, instead
+            // of terminating the stream.
+            if let Err(err) = self.resubscribe().await {
+                tracing::warn!(
+                    attempt = self.attempt,
+                    error = %err,
+                    "websocket resubscribe after reconnect failed"
+                );
+                continue;
             }
+            self.next_ping = now + self.ping_interval;
+            metrics::counter!(
+                names::WS_RECONNECTS,
+                "src" => self.metrics_src,
+                "reason" => "reconnect",
+            )
+            .increment(1);
+            metrics::gauge!(names::WS_CONNECTED, "src" => self.metrics_src).set(1.0);
+            tracing::debug!(attempt = self.attempt, "websocket reconnected");
+            return Ok(());
         }
     }
 
@@ -245,17 +279,20 @@ impl RawWsConn {
                 attempt: self.attempt,
             });
         }
-        let mut ping =
-            tokio::time::interval_at(Instant::now() + self.ping_interval, self.ping_interval);
         loop {
             tokio::select! {
                 _ = self.shutdown.notified() => {
                     return Ok(RawEvent::Gap {
                         reason: "shutdown".into(),
                         detail: "cancellation requested".into(),
+                        disconnect_ns: 0,
                     });
                 }
-                _ = ping.tick() => {
+                _ = tokio::time::sleep_until(self.next_ping) => {
+                    // Advance the deadline only when the ping is actually sent
+                    // (or skipped by a protocol without keepalive), so frames
+                    // flowing in between do not reset the heartbeat.
+                    self.next_ping = Instant::now() + self.ping_interval;
                     if let Some(frame) = self.protocol.keepalive_frame()
                         && self.socket.send(Message::Text(frame.into())).await.is_err()
                     {
@@ -326,6 +363,10 @@ impl RawWsConn {
     /// Emit a `Gap`, reconnect, and arrange for the next `next()` to yield
     /// `Opened`. On shutdown (cancellation during backoff) the gap is still
     /// returned and the caller sees the shutdown on its next call.
+    ///
+    /// The `Gap` carries the [`mono_ns`] timestamp taken when the drop was
+    /// detected, **before** the (possibly long) reconnect, so callers can
+    /// bracket the real outage.
     async fn handle_gap(&mut self, reason: &str, detail: &str) -> Result<Option<RawEvent>> {
         metrics::counter!(
             names::WS_RECONNECTS,
@@ -333,9 +374,11 @@ impl RawWsConn {
             "reason" => reason.to_string(),
         )
         .increment(1);
+        let disconnect_ns = mono_ns();
         let event = RawEvent::Gap {
             reason: reason.to_string(),
             detail: detail.to_string(),
+            disconnect_ns,
         };
         self.reconnect().await?;
         self.pending_opened = true;
@@ -345,16 +388,21 @@ impl RawWsConn {
 }
 
 /// Full-jitter exponential backoff for `attempt` (1-based): a uniform sleep in
-/// `[0, min(base * 2^(attempt-1), max)]`.
+/// `[BACKOFF_MIN, min(base * 2^(attempt-1), max)]`.
+///
+/// The lower bound stops a host that accepts then immediately closes from being
+/// retried in a tight loop (full jitter alone can roll ~0 ns).
 fn jittered_backoff(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(6);
     let ceiling = BACKOFF_BASE.saturating_mul(1 << shift).min(BACKOFF_MAX);
-    let width = ceiling.as_nanos().min(u64::MAX as u128) as u64;
-    if width == 0 {
-        return Duration::ZERO;
+    let floor = BACKOFF_MIN.min(ceiling);
+    let span = ceiling.saturating_sub(floor);
+    if span.is_zero() {
+        return floor;
     }
+    let width = span.as_nanos().min(u64::MAX as u128) as u64;
     let roll = pseudo_random();
-    Duration::from_nanos(roll % (width + 1))
+    floor + Duration::from_nanos(roll % (width + 1))
 }
 
 /// A cheap, non-cryptographic random source for jitter. Randomness here only
@@ -410,10 +458,11 @@ mod tests {
     use tokio_tungstenite::accept_async;
 
     #[test]
-    fn backoff_is_capped_and_jittered() {
+    fn backoff_is_capped_jittered_and_floored() {
         for attempt in 1..20 {
             let d = jittered_backoff(attempt);
             assert!(d <= BACKOFF_MAX, "attempt {attempt}: {d:?}");
+            assert!(d >= BACKOFF_MIN, "attempt {attempt}: {d:?}");
         }
         // Many samples should not all be identical (jitter present).
         let samples: std::collections::BTreeSet<u64> = (0..50)
@@ -590,6 +639,207 @@ mod tests {
         assert!(
             matches!(event, RawEvent::Gap { ref reason, .. } if reason == "shutdown"),
             "expected shutdown gap, got {event:?}"
+        );
+    }
+
+    /// A protocol with an application keepalive frame (`"ping"`).
+    struct KeepaliveProtocol {
+        url: String,
+    }
+
+    impl Protocol for KeepaliveProtocol {
+        fn name(&self) -> &'static str {
+            "keepalive-test"
+        }
+        fn url(&self) -> String {
+            self.url.clone()
+        }
+        fn subscribe_frame(&self, sub: &str) -> String {
+            sub.to_string()
+        }
+        fn keepalive_frame(&self) -> Option<String> {
+            Some("ping".to_string())
+        }
+    }
+
+    /// The heartbeat must keep its cadence while data flows: a frame every
+    /// 100 ms must not reset the 20 s ping (the old per-`next()` interval did).
+    #[tokio::test(start_paused = true)]
+    async fn pings_are_not_starved_by_a_busy_feed() {
+        use tokio::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        if ws.send(Message::Text("frame".into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    msg = ws.next() => match msg {
+                        Some(Ok(Message::Text(text))) if text == "ping" => {
+                            let _ = ping_tx.send(tokio::time::Instant::now());
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => break,
+                    },
+                }
+            }
+        });
+
+        let conn = RawWsConn::connect_with(
+            Box::new(KeepaliveProtocol {
+                url: format!("ws://{addr}"),
+            }),
+            vec![],
+            // Far-future watchdog isolates the ping cadence from idle logic.
+            Duration::from_secs(3_600),
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+
+        // Drain frames for ~62 s of paused time without ever going idle.
+        let mut conn = conn;
+        let client = tokio::spawn(async move { while conn.next().await.is_ok() {} });
+        for _ in 0..620 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        client.abort();
+
+        let mut times = Vec::new();
+        while let Ok(time) = ping_rx.try_recv() {
+            times.push(time);
+        }
+        assert!(
+            times.len() >= 3,
+            "expected >= 3 pings on a busy feed, got {}",
+            times.len()
+        );
+        for pair in times.windows(2) {
+            let delta = pair[1].duration_since(pair[0]);
+            assert!(
+                delta >= Duration::from_secs(19) && delta <= Duration::from_secs(21),
+                "ping cadence {delta:?} outside 20s ± 1s"
+            );
+        }
+    }
+
+    /// `Gap` carries the detection time, so the measured outage covers the
+    /// reconnect even though the event is returned afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn gap_carries_the_disconnect_time() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // First connection: send a frame, close. Second: hold open.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            ws.send(Message::Text("hello".into())).await.unwrap();
+            ws.close(None).await.unwrap();
+            drop(ws);
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        let mut conn = RawWsConn::connect_with(
+            protocol(format!("ws://{addr}")),
+            vec![],
+            Duration::from_secs(3_600),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        // Consume the hello, then the gap.
+        let _ = conn.next().await.unwrap();
+        let before = mono_ns();
+        let event = conn.next().await.unwrap();
+        let after = mono_ns();
+        match event {
+            RawEvent::Gap {
+                reason,
+                disconnect_ns,
+                ..
+            } => {
+                assert_eq!(reason, "closed");
+                assert!(
+                    disconnect_ns >= before && disconnect_ns <= after,
+                    "disconnect_ns {disconnect_ns} not in [{before}, {after}]"
+                );
+            }
+            other => panic!("expected a gap, got {other:?}"),
+        }
+    }
+
+    /// A host that accepts then resets every connection must not terminate the
+    /// stream: the resubscribe failure is retried like any other failure.
+    #[tokio::test(start_paused = true)]
+    async fn resubscribe_failure_on_reconnect_retries_instead_of_dying() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connections_task = connections.clone();
+        tokio::spawn(async move {
+            let mut round = 0usize;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                connections_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if round == 0 {
+                    // Healthy first connection: complete the handshake, read the
+                    // subscribe, then let the client see a clean close.
+                    let mut ws = accept_async(stream).await.unwrap();
+                    let _ = ws.next().await;
+                    ws.close(None).await.ok();
+                    drop(ws);
+                } else if round == 1 {
+                    // Reset the connection before the client's resubscribe send
+                    // can succeed, forcing a send error.
+                    let ws = accept_async(stream).await.unwrap();
+                    #[allow(deprecated)]
+                    ws.get_ref().set_linger(Some(Duration::ZERO)).ok();
+                    // Drop immediately to emit an RST.
+                } else {
+                    // Finally accept and hold a working connection.
+                    let mut ws = accept_async(stream).await.unwrap();
+                    while let Some(Ok(_)) = ws.next().await {}
+                }
+                round += 1;
+            }
+        });
+
+        let mut conn = RawWsConn::connect_with(
+            protocol(format!("ws://{addr}")),
+            vec!["sub1".to_string()],
+            Duration::from_secs(3_600),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        // Drive until we see Opened after the gap; Err would mean death.
+        let mut saw_opened = false;
+        for _ in 0..10 {
+            match conn.next().await {
+                Ok(RawEvent::Opened { .. }) => {
+                    saw_opened = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => panic!("stream ended instead of retrying: {err}"),
+            }
+        }
+        assert!(saw_opened, "did not recover after resubscribe failures");
+        assert!(
+            connections.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "expected the client to keep dialing"
         );
     }
 }
