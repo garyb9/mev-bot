@@ -713,9 +713,17 @@ struct CoverageAcc {
     /// later show as an outage. A segment that lacks `segment_close` (a crash)
     /// simply ends its interval at its last record.
     segments: Vec<(i64, i64)>,
-    /// Paired `gap_start`/`gap_end` intervals, across segment files.
+    /// Closed gap intervals, across segment files.
     gaps: Vec<(i64, i64)>,
-    /// A `gap_start` still awaiting its `gap_end`.
+    /// A `gap_start` still awaiting its end.
+    ///
+    /// An open gap is closed at the next data envelope (`frame`, `frame_bin`,
+    /// `rest`) or `gap_end` on the same stream, matching the Python
+    /// `_GapTracker` (SPEC-0008 §5.3). This matters when a run ends with an
+    /// unpaired `shutdown` gap and a later run restarts on the same stream:
+    /// the downtime stays a gap and the new run's frames are covered. Segments
+    /// are visited in manifest/file order and the state is per `(src, conn)`,
+    /// so a later run's first frame closes the previous run's gap.
     open_gap: Option<i64>,
     /// Bounds of the records in the segment file currently being read.
     seg_min: Option<i64>,
@@ -727,6 +735,10 @@ struct CoverageAcc {
 
 impl CoverageAcc {
     /// Begin observing a new segment file.
+    ///
+    /// Only the interval bounds reset. The open-gap state deliberately carries
+    /// across segment files and runs (state is per `(src, conn)`), so a gap
+    /// opened at the end of one run is closed by the first frame of the next.
     fn start_segment(&mut self) {
         self.seg_min = None;
         self.seg_max = None;
@@ -749,17 +761,30 @@ impl CoverageAcc {
                 // new start before opening it, matching the Python
                 // `_GapTracker._open`. Overwriting the start instead would
                 // count `[disconnect, shutdown)` as covered.
-                if let Some(start) = self.open_gap {
-                    self.gaps.push((start, env.t_ns.max(start)));
-                }
+                self.close_gap(env.t_ns);
                 self.open_gap = Some(env.t_ns);
             }
             Kind::GapEnd => {
-                if let Some(start) = self.open_gap.take() {
-                    self.gaps.push((start, env.t_ns));
-                }
+                self.close_gap(env.t_ns);
+            }
+            Kind::Frame | Kind::FrameBin | Kind::Rest => {
+                // Data resumed: an unpaired gap (`drop`/`shutdown`/`crash`) ends
+                // here, at the first data envelope that follows it in stream
+                // order. This keeps a restart's downtime a gap (never counted as
+                // coverage) while covering every frame of the new run. Matching
+                // the Python `_GapTracker.observe`, a `gap_end` envelope also
+                // ends the gap even though it is not itself data.
+                self.close_gap(env.t_ns);
             }
             _ => {}
+        }
+    }
+
+    /// Close an open gap at `end_ns`, never before its start (Python
+    /// `_GapTracker._close`).
+    fn close_gap(&mut self, end_ns: i64) {
+        if let Some(start) = self.open_gap.take() {
+            self.gaps.push((start, end_ns.max(start)));
         }
     }
 
@@ -771,14 +796,12 @@ impl CoverageAcc {
     }
 
     fn covered_ms(&mut self, day_start: i64, day_end: i64) -> u64 {
-        // An unpaired `gap_start` is closed conservatively at the last record
-        // seen on the stream. How a `drop` gap ends has no specified rule yet
-        // (SPEC-0008 §17 open question); until then, marking the remainder
-        // missing is the safe reading.
-        if let Some(start) = self.open_gap.take()
-            && let Some(max) = self.max_t_ns
-        {
-            self.gaps.push((start, max));
+        // A `gap_start` that is still open at the end of the data is closed
+        // conservatively at the last record seen on the stream. How a `drop`
+        // gap ends has no specified rule yet (SPEC-0008 §17 open question);
+        // until then, marking the remainder missing is the safe reading.
+        if let Some(max) = self.max_t_ns {
+            self.close_gap(max);
         }
         let spans = clip(std::mem::take(&mut self.segments), day_start, day_end);
         let gaps = clip(std::mem::take(&mut self.gaps), day_start, day_end);
@@ -1319,6 +1342,223 @@ mod tests {
             report.coverage[0].covered_ms, 20_000,
             "the [disconnect, shutdown) window was counted as covered"
         );
+    }
+
+    /// A run that ends with an unpaired `shutdown` gap leaves an open gap that
+    /// must be closed at the first frame of the next run (Python
+    /// `_GapTracker.observe`), not at the end of the day. The whole downtime is
+    /// a gap, but every frame of the restarted run is covered.
+    #[test]
+    fn restart_after_shutdown_counts_only_the_downtime_as_a_gap() {
+        let tmp = temp_dir("coverage-restart");
+        let dir = tmp.path();
+        let base = 1_767_227_400_000_000_000i64; // 2026-01-01T00:30:00Z
+        let frame_at = |t_ns: i64, seq: u64| {
+            Envelope::new_at(
+                "hl-ws",
+                "hl-ws-01",
+                seq,
+                Kind::Frame,
+                t_ns,
+                0,
+                Some("data".into()),
+                None,
+            )
+        };
+        let run1 = vec![
+            frame_at(base, 0),
+            Envelope::gap_start_at(
+                "hl-ws",
+                "hl-ws-01",
+                1,
+                base + 10_000_000_000,
+                0,
+                "shutdown",
+                "shutdown requested",
+            ),
+        ];
+        let run2 = vec![
+            frame_at(base + 20_000_000_000, 0),
+            frame_at(base + 30_000_000_000, 1),
+        ];
+        write_segment(dir, "hl-ws", "hl-ws-01", "2026-01-01", base, &run1, false);
+        write_segment(
+            dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            base + 20_000_000_000,
+            &run2,
+            false,
+        );
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert_eq!(report.coverage.len(), 1);
+        // 10 s from run 1 + the full 10 s of run 2; only (T1, T2) is a gap.
+        assert_eq!(
+            report.coverage[0].covered_ms, 20_000,
+            "run 2 was counted as a gap after a shutdown restart"
+        );
+    }
+
+    /// The real outage in the second run is still a gap; the unpaired shutdown
+    /// gap from the first run is closed at the restart and does not swallow the
+    /// second run.
+    #[test]
+    fn restart_after_shutdown_keeps_later_outages_as_gaps() {
+        let tmp = temp_dir("coverage-restart-outage");
+        let dir = tmp.path();
+        let base = 1_767_227_400_000_000_000i64; // 2026-01-01T00:30:00Z
+        let frame_at = |t_ns: i64, seq: u64| {
+            Envelope::new_at(
+                "hl-ws",
+                "hl-ws-01",
+                seq,
+                Kind::Frame,
+                t_ns,
+                0,
+                Some("data".into()),
+                None,
+            )
+        };
+        let run1 = vec![
+            frame_at(base, 0),
+            Envelope::gap_start_at(
+                "hl-ws",
+                "hl-ws-01",
+                1,
+                base + 10_000_000_000,
+                0,
+                "shutdown",
+                "shutdown requested",
+            ),
+        ];
+        let run2 = vec![
+            frame_at(base + 20_000_000_000, 0),
+            frame_at(base + 30_000_000_000, 1),
+            Envelope::gap_start_at(
+                "hl-ws",
+                "hl-ws-01",
+                2,
+                base + 40_000_000_000,
+                0,
+                "close",
+                "server closed",
+            ),
+            Envelope::gap_end_at("hl-ws", "hl-ws-01", 3, base + 50_000_000_000, 0, 10_000),
+            frame_at(base + 60_000_000_000, 4),
+        ];
+        write_segment(dir, "hl-ws", "hl-ws-01", "2026-01-01", base, &run1, false);
+        write_segment(
+            dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            base + 20_000_000_000,
+            &run2,
+            false,
+        );
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert_eq!(report.coverage.len(), 1);
+        // 10 s (run 1) + 20 s before the outage + 10 s after it.
+        assert_eq!(report.coverage[0].covered_ms, 40_000);
+    }
+
+    /// An unpaired gap at the very end of the data, with no later frame to
+    /// close it, is still closed at the last record (`max_t_ns`), the SPEC-0008
+    /// §17 conservative reading. The frames before it stay covered.
+    #[test]
+    fn final_unpaired_shutdown_gap_closes_at_last_record() {
+        let tmp = temp_dir("coverage-restart-final");
+        let dir = tmp.path();
+        let base = 1_767_227_400_000_000_000i64; // 2026-01-01T00:30:00Z
+        let frame_at = |t_ns: i64, seq: u64| {
+            Envelope::new_at(
+                "hl-ws",
+                "hl-ws-01",
+                seq,
+                Kind::Frame,
+                t_ns,
+                0,
+                Some("data".into()),
+                None,
+            )
+        };
+        let run1 = vec![
+            frame_at(base, 0),
+            Envelope::gap_start_at(
+                "hl-ws",
+                "hl-ws-01",
+                1,
+                base + 10_000_000_000,
+                0,
+                "shutdown",
+                "shutdown requested",
+            ),
+        ];
+        let run2 = vec![
+            frame_at(base + 20_000_000_000, 0),
+            frame_at(base + 40_000_000_000, 1),
+            Envelope::gap_start_at(
+                "hl-ws",
+                "hl-ws-01",
+                2,
+                base + 50_000_000_000,
+                0,
+                "shutdown",
+                "shutdown requested",
+            ),
+        ];
+        write_segment(dir, "hl-ws", "hl-ws-01", "2026-01-01", base, &run1, false);
+        write_segment(
+            dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            base + 20_000_000_000,
+            &run2,
+            false,
+        );
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert_eq!(report.coverage.len(), 1);
+        // 10 s (run 1) + 30 s of run 2; the final gap is zero-length at the last
+        // record, so it removes nothing.
+        assert_eq!(report.coverage[0].covered_ms, 40_000);
+    }
+
+    /// A `gap_end` with no open gap is ignored, matching the Python
+    /// `_GapTracker._close` (which returns early when nothing is open).
+    #[test]
+    fn gap_end_without_gap_start_is_ignored() {
+        let mut acc = CoverageAcc::default();
+        acc.start_segment();
+        acc.observe(&Envelope::gap_end_at(
+            "hl-ws",
+            "hl-ws-01",
+            0,
+            5_000_000_000,
+            0,
+            0,
+        ));
+        acc.end_segment();
+        assert!(acc.gaps.is_empty());
     }
 
     #[test]
