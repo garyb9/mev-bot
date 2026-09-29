@@ -37,8 +37,11 @@ bbo              = ["perps:all", "hip3:all", "spot:top:40", "spot:quotes"]
 trades           = ["perps:top:40", "hip3:all", "spot:top:20"]
 active_asset_ctx = ["perps:all", "hip3:all"]
 all_mids         = true          # main dex + every HIP-3 dex
-l2book           = ["BTC", "ETH", "SOL", "HYPE", "hip3:all"]
-max_subs         = 900           # keep 100 of the 1000 as headroom
+# V-7b: `hip3:all` was dropped from l2book. With it the profile asked for ~1085
+# subscriptions against max_subs, so the planner dropped every priority-3 sub
+# (all l2Book incl. BTC/ETH/SOL/HYPE, and allMids). Named majors only now.
+l2book           = ["BTC", "ETH", "SOL", "HYPE"]
+max_subs         = 950           # ~934 requested; 50 of the 1000/IP limit as headroom
 subs_per_conn    = 150
 connections      = 8             # of 10; leaves 2 for ad-hoc tools / the bot
 allow_truncate   = false         # refuse to drop priority-1 subscriptions
