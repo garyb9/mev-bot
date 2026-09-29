@@ -43,6 +43,26 @@
 | [Hydromancer Reservoir](https://hydromancer.xyz/hyperliquid-historical-data) · [Reservoir docs](https://docs.hydromancer.xyz/reservoir) | Requester-pays S3 with 1 s bars, fills (liquidation/ADL flags), and 1-min L2. | SPEC-0008 §13.11 |
 | [Alpaca market data](https://docs.alpaca.markets/us/docs/market-data-faq) · [Massive](https://massive.com/stocks) | US equity quotes/bars for the HIP-3 stock-perp studies. | SPEC-0008 §13.11, V-11, O10 |
 
+## Vendor pricing and terms
+
+| Link | Why it matters | Used in |
+|---|---|---|
+| [EODHD pricing](https://eodhd.com/pricing) · [EODHD US Options API](https://eodhd.com/lp/us-stock-options-api) | Cheapest licensed route to stock bars and ≥ 2-year daily US options positioning history; personal-use licence, storage/automation clause unread. | SPEC-0008 §9.1, V-11/V-13, §17 #6/#31 |
+| [Massive pricing](https://massive.com/pricing) · [Massive Individuals ToS](https://massive.com/legal/individuals-terms-of-service) | Paid real-time equity candidate (V-11) and the personal/non-business licence to read before relying on it. | SPEC-0008 V-11, §17 #27 |
+| [Alpaca market data](https://alpaca.markets/data) | Free IEX-only real-time WS (30 symbols) for the O10 Part A pre-check; paid tier 99 USD/mo. | SPEC-0008 V-11, O10 Part A |
+| [Tardis pricing](https://tardis.dev/#pricing) · [Tardis ToS](https://docs.tardis.dev/legal/terms-of-service) | 350–3,000 USD/mo and the ML-training clause relevant to the classifier studies and data licences. | SPEC-0008 §17 #27, M-1…M-5 |
+| [HistoricalData.net options](https://historicaldata.net/options.html) · [ThetaData pricing](https://www.thetadata.net/pricing) | Longer options history (199–590 USD one-off; 40 USD/mo for 6 years). | SPEC-0008 V-13, §17 #6 |
+| [Cboe delayed quotes](https://www.cboe.com/delayed_quotes/) | Stated prohibition on automated download (secondary) — why we don't build on it. | SPEC-0008 §17 #31 |
+
+## News and alternative data
+
+| Link | Why it matters | Used in |
+|---|---|---|
+| [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) | Free, official filings with second-resolution acceptance timestamps; the cleanest sub-minute source. | SPEC-0008 §9.2, O10 B/E, O6 |
+| [GDELT data](https://www.gdeltproject.org/data.html) | Free 15-minute macro/attention series; ingest-side timestamps (`DATEADDED`), so hours-scale only. | SPEC-0008 §9.2, O10 B/E |
+| [FinBERT (Hugging Face)](https://huggingface.co/ProsusAI/finbert) | Offline headline-sentiment scoring under our own control. | SPEC-0008 §9.2, M-4 |
+| [NewsAPI pricing](https://newsapi.org/pricing) · [CryptoPanic plans](https://cryptopanic.com/developers/api/plans) | Cost/ToS reasons they are skipped in the minimal stack. | SPEC-0008 §9.2 |
+
 ## Libraries — Rust workspace (`Cargo.toml`)
 
 | Link | Why it matters | Used in |
@@ -80,6 +100,17 @@
 
 ## Papers and articles
 
-None cited in the repository yet. Research reports must not invent external
-citations; when a study relies on a paper, add it here with its source and the
-study that uses it (SPEC-0008 §13.7 requires the citation in the report too).
+Research reports must not invent external citations; when a study relies on a
+paper, add it here with its source and the study that uses it (SPEC-0008 §13.7
+requires the citation in the report too).
+
+| Link | Why it matters | Used in |
+|---|---|---|
+| [DeepLOB (Zhang, Zohren, Roberts 2019)](https://arxiv.org/abs/1808.03668) | Deep LOB model on LSE data; a baseline for the deep-LOB family. | SPEC-0008 M-1…M-5 (literature) |
+| [LOBCAST](https://arxiv.org/html/2308.01915) | Benchmark showing deep LOB models drop on unseen LOBSTER data; FI-2010 is too easy. | SPEC-0008 M-1…M-5 |
+| [Cont, Kukanov, Stoikov (2014)](https://arxiv.org/abs/1011.6402) | Linear relation between best-level OFI and price change; the baseline every ML model must beat. | SPEC-0008 M-2 |
+| [FinBERT (Araci 2019)](https://arxiv.org/abs/1908.10063) | Offline news/headline sentiment classifier used as a feature, not an edge. | SPEC-0008 §9.2, M-4 |
+| [Lopez-Lira & Tang](https://arxiv.org/abs/2304.07619) | LLM news scores predict next-day returns, but the edge shrinks with costs and adoption. | SPEC-0008 M-4 |
+| [Deflated Sharpe Ratio (Bailey & Lopez de Prado)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551) | Pass/fail input that counts the true trial count. | SPEC-0008 §13 M-1…M-5 |
+| [Probability of Backtest Overfitting (Bailey & Lopez de Prado)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2326253) | Overfitting control for the multiple-testing haircut. | SPEC-0008 §13 M-1…M-5 |
+| [Does Meta-Labeling Add to Signal Efficacy? (Hudson & Thames)](https://hudsonthames.org/does-meta-labeling-add-to-signal-efficacy-triple-barrier-method/) | Meta-labelling improves an existing rule but is a filter, not an edge creator. | SPEC-0008 M-1 |
