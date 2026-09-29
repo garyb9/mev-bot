@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, select};
@@ -259,6 +259,19 @@ impl<D: Dispatcher> EngineLoop<D> {
             n += 1;
         }
 
+        // 2b. Lossless feed-control signals (gap opens). Drained after the
+        // market updates so a pre-gap snapshot still queued cannot restore a
+        // coin, and so any order dispatched later this iteration is gated by
+        // the stale flag. `control_failed` is the fail-closed fallback a
+        // producer sets when it could not enqueue the signal.
+        let mut gap = self.inputs.control_failed.swap(false, Ordering::AcqRel);
+        while self.inputs.control.try_recv().is_ok() {
+            gap = true;
+        }
+        if gap {
+            self.state.mark_all_stale(now_mono_ns);
+        }
+
         // 3. Timers. The wall-clock half of the stamp comes from the clock, so
         // replay sees the recorded event time, not the host clock.
         let now_stamp = Stamp {
@@ -311,25 +324,30 @@ impl<D: Dispatcher> EngineLoop<D> {
                 if let Some(slot) = self.state.slot_mut(*coin) {
                     slot.bbo = Some((*bid, *ask, stamp));
                 }
-                // Fresh data proves the feed for this coin is live again.
-                self.state.mark_fresh(*coin);
+                // A bbo is a full snapshot of the top of book, but it is not a
+                // full l2 book: it does not clear staleness (see
+                // `EngineState::mark_fresh`). The strategies price off the l2
+                // book, which would otherwise stay pre-gap.
             }
             MarketUpdate::Book { coin, book, .. } => {
                 if let Some(slot) = self.state.slot_mut(*coin) {
                     slot.book = Some((*book, stamp));
                 }
-                self.state.mark_fresh(*coin);
+                // The only update that clears a coin's staleness (SPEC-0010 §16).
+                self.state.mark_fresh(*coin, stamp.mono_ns);
             }
-            MarketUpdate::Trades { coin, .. } => self.state.mark_fresh(*coin),
+            // Trades and asset context are not book snapshots: they must not
+            // clear staleness, or a coin whose l2 book is still pre-gap would
+            // pass the risk gate (SPEC-0010 §16).
+            MarketUpdate::Trades { .. } => {}
             MarketUpdate::Ctx { coin, ctx, .. } => {
                 if let Some(slot) = self.state.slot_mut(*coin) {
                     slot.ctx = Some((*ctx, stamp));
                 }
-                self.state.mark_fresh(*coin);
             }
             // A gap on a shared connection cannot be attributed to one coin, so
-            // mark every coin stale until fresh data arrives (SPEC-0010 §16).
-            MarketUpdate::Gap { open: true, .. } => self.state.mark_all_stale(),
+            // mark every coin stale until a fresh book arrives (SPEC-0010 §16).
+            MarketUpdate::Gap { open: true, .. } => self.state.mark_all_stale(stamp.mono_ns),
             MarketUpdate::Gap { open: false, .. } => {}
         }
         self.dispatcher.on_market(update);
@@ -348,7 +366,10 @@ impl<D: Dispatcher> EngineLoop<D> {
             if self.stopped() {
                 return StopReason::Requested;
             }
-            if !self.inputs.account.is_empty() || !self.inputs.market.is_empty() {
+            if !self.inputs.account.is_empty()
+                || !self.inputs.market.is_empty()
+                || !self.inputs.control.is_empty()
+            {
                 return StopReason::Requested; // something to do; caller loops
             }
             std::hint::spin_loop();
@@ -374,6 +395,7 @@ impl<D: Dispatcher> EngineLoop<D> {
         select! {
             recv(self.inputs.account) -> _ => {}
             recv(self.inputs.market) -> _ => {}
+            recv(self.inputs.control) -> _ => {}
             default(timeout) => {}
         }
         StopReason::Requested
@@ -506,6 +528,50 @@ mod tests {
         }
     }
 
+    fn book_update(coin: u16, mono_ns: u64) -> MarketUpdate {
+        MarketUpdate::Book {
+            coin: CoinId(coin),
+            stamp: Stamp {
+                mono_ns,
+                ..Default::default()
+            },
+            book: crate::types::BookSnapshot::default(),
+        }
+    }
+
+    fn trades_update(coin: u16, mono_ns: u64) -> MarketUpdate {
+        MarketUpdate::Trades {
+            coin: CoinId(coin),
+            stamp: Stamp {
+                mono_ns,
+                ..Default::default()
+            },
+            trades: smallvec::SmallVec::new(),
+        }
+    }
+
+    fn ctx_update(coin: u16, mono_ns: u64) -> MarketUpdate {
+        MarketUpdate::Ctx {
+            coin: CoinId(coin),
+            stamp: Stamp {
+                mono_ns,
+                ..Default::default()
+            },
+            ctx: crate::types::AssetCtxLite::default(),
+        }
+    }
+
+    fn gap_update(conn: u16, mono_ns: u64) -> MarketUpdate {
+        MarketUpdate::Gap {
+            conn: ConnId(conn),
+            stamp: Stamp {
+                mono_ns,
+                ..Default::default()
+            },
+            open: true,
+        }
+    }
+
     type TestLoop = (
         EngineLoop<Recorder>,
         InputHandles,
@@ -551,24 +617,122 @@ mod tests {
     }
 
     #[test]
-    fn gap_marks_coins_stale_until_fresh_data_arrives() {
+    fn gap_stays_stale_until_a_book_snapshot_and_only_a_book_clears_it() {
         let record = Arc::new(Mutex::new(Record::default()));
         let (mut engine, handles, _stop) = loop_with(record, 2, 0);
 
-        handles.send_market(MarketUpdate::Gap {
-            conn: ConnId(0),
-            stamp: Stamp::default(),
-            open: true,
-        });
+        // A gap via the lossless control signal marks every coin stale.
+        handles.signal_gap();
         engine.iterate(1_000);
         assert!(engine.state().slot(CoinId(0)).unwrap().stale);
         assert!(engine.state().slot(CoinId(1)).unwrap().stale);
 
-        // Fresh data for coin 1 clears only coin 1.
-        handles.send_market(bbo(1, 1));
-        engine.iterate(2_000);
+        // Trades, asset context and bbo are not l2 book snapshots and must not
+        // clear staleness (a bbo would leave the l2 book pre-gap).
+        handles.send_market(trades_update(1, 1_100));
+        engine.iterate(1_100);
+        assert!(engine.state().slot(CoinId(1)).unwrap().stale);
+        handles.send_market(ctx_update(1, 1_200));
+        engine.iterate(1_200);
+        assert!(engine.state().slot(CoinId(1)).unwrap().stale);
+        handles.send_market(bbo(1, 1_300));
+        engine.iterate(1_300);
+        assert!(engine.state().slot(CoinId(1)).unwrap().stale);
+
+        // A book snapshot received after the gap clears only coin 1.
+        handles.send_market(book_update(1, 1_400));
+        engine.iterate(1_400);
         assert!(engine.state().slot(CoinId(0)).unwrap().stale);
         assert!(!engine.state().slot(CoinId(1)).unwrap().stale);
+    }
+
+    #[test]
+    fn a_book_stamped_before_the_gap_cannot_clear_staleness() {
+        let record = Arc::new(Mutex::new(Record::default()));
+        let (mut engine, handles, _stop) = loop_with(record, 1, 0);
+
+        // The gap is observed first, then a book that was received *before* the
+        // gap drains late (the receive stamp, 500, predates the gap at 1000).
+        // It must not clear the flag: its data is pre-gap.
+        handles.signal_gap();
+        engine.iterate(1_000);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+
+        handles.send_market(book_update(0, 500));
+        engine.iterate(1_001);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+
+        // A book received after the gap does clear it.
+        handles.send_market(book_update(0, 1_001));
+        engine.iterate(1_002);
+        assert!(!engine.state().slot(CoinId(0)).unwrap().stale);
+    }
+
+    #[test]
+    fn a_market_channel_gap_marks_stale_and_a_book_clears_it() {
+        // The replay path delivers gaps on the market channel; it must keep
+        // working. The replay producer is synchronous, so the gap is ordered
+        // before the post-gap book.
+        let record = Arc::new(Mutex::new(Record::default()));
+        let (mut engine, handles, _stop) = loop_with(record, 1, 0);
+
+        handles.send_market(gap_update(0, 500));
+        engine.iterate(500);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+
+        handles.send_market(book_update(0, 501));
+        engine.iterate(501);
+        assert!(!engine.state().slot(CoinId(0)).unwrap().stale);
+    }
+
+    #[test]
+    fn a_gap_marks_stale_even_when_the_market_channel_is_full() {
+        use crate::channels::{MarketSend, inputs};
+
+        let record = Arc::new(Mutex::new(Record::default()));
+        let (handles, inputs) = inputs(1, 4);
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let dispatcher = Recorder {
+            record,
+            interests: vec![Interests::coins([CoinId(0)])],
+        };
+        let mut engine = EngineLoop::new(
+            inputs,
+            dispatcher,
+            LoopConfig {
+                spin_us: 0,
+                coin_count: 1,
+            },
+            stop_rx,
+        );
+
+        // Saturate the tiny market queue so a real producer's next send drops.
+        assert_eq!(handles.send_market(bbo(0, 1)), MarketSend::Queued);
+        assert_eq!(handles.send_market(bbo(0, 2)), MarketSend::Dropped);
+        // The gap still reaches the engine on the independent control channel.
+        assert_eq!(handles.signal_gap(), crate::channels::GapSignal::Queued);
+        engine.iterate(1_000);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+    }
+
+    #[test]
+    fn an_undeliverable_gap_signal_fails_closed() {
+        let record = Arc::new(Mutex::new(Record::default()));
+        let (mut engine, handles, _stop) = loop_with(record, 2, 0);
+
+        // Simulate a producer that could not enqueue the control signal (the
+        // control queue was full / the engine was unreachable): it set the
+        // shared latch, so the engine must treat every coin stale, not assume
+        // the feed is fine.
+        handles.force_control_failure();
+        engine.iterate(1_000);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+        assert!(engine.state().slot(CoinId(1)).unwrap().stale);
+
+        // Fail-closed is not permanent: a post-gap book snapshot still clears.
+        handles.send_market(book_update(0, 1_001));
+        engine.iterate(1_001);
+        assert!(!engine.state().slot(CoinId(0)).unwrap().stale);
     }
 
     #[test]

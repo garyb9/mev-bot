@@ -1565,6 +1565,27 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_coin_is_rejected_by_risk_until_a_book_refreshes_it() {
+        let strategy = Recording::new("test", CoinId(0))
+            .with_script(vec![Action::Place(intent("BTC", Side::Buy))]);
+        let mut h = harness(vec![Box::new(strategy)], false);
+        let mut state = state_with("100", "101");
+        state.slot_mut(CoinId(0)).unwrap().stale = true;
+
+        // Feed gap: the risk gate fails closed on the non-reduce-only place.
+        h.dispatcher.on_coin_state(CoinId(0), stamp(10), &state);
+        assert!(
+            h.posts.lock().unwrap().is_empty(),
+            "a stale coin must not place"
+        );
+
+        // A fresh book snapshot clears staleness and orders pass again.
+        state.slot_mut(CoinId(0)).unwrap().stale = false;
+        h.dispatcher.on_coin_state(CoinId(0), stamp(20), &state);
+        assert_eq!(h.posts.lock().unwrap().len(), 1, "fresh coin places again");
+    }
+
+    #[test]
     fn places_build_one_bulk_order_and_cancel_first() {
         let resting = cloid(9);
         let strategy = Recording::new("test", CoinId(0)).with_script(vec![

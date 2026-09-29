@@ -30,7 +30,7 @@ use mev_core::{
     db::{Db, writer::DbWriter},
 };
 use mev_engine::{
-    AccountUpdate, CoinRegistry, Control, MarketUpdate, Stamp, StrategyDispatcher,
+    AccountUpdate, CoinRegistry, Control, Stamp, StrategyDispatcher,
     builder::AssetTable,
     channels::{
         ACCOUNT_CHANNEL_CAP, InputHandles, MARKET_CHANNEL_CAP, MarketSend, inputs, outbound,
@@ -891,13 +891,9 @@ async fn ingest(
         match RawWsConn::connect(Box::new(HlProtocol::new(network)), planned.clone()).await {
             Ok(mut conn) => {
                 info!(subscriptions = planned.len(), "market stream connected");
-                // A fresh connection closes any prior feed gap so the engine can
-                // clear stale coins once data flows again (SPEC-0010 §16).
-                let _ = handles.send_market(MarketUpdate::Gap {
-                    conn: ConnId(0),
-                    stamp: Stamp::default(),
-                    open: false,
-                });
+                // A reconnect does not itself clear staleness: the engine clears
+                // a coin only when a fresh l2 book snapshot arrives (SPEC-0010
+                // §16), so no gap-close signal is needed.
                 loop {
                     match conn.next().await {
                         Ok(RawEvent::Text {
@@ -942,32 +938,21 @@ async fn ingest(
                             if reason == "shutdown" {
                                 return;
                             }
-                            // Mark coins stale until fresh data arrives. With the
-                            // R-8 fix2 `RawWsConn`, this arrives the moment the
-                            // drop is detected, before the reconnect.
-                            let _ = handles.send_market(MarketUpdate::Gap {
-                                conn: ConnId(0),
-                                stamp: Stamp::default(),
-                                open: true,
-                            });
+                            // Mark coins stale until a fresh book arrives. With
+                            // the R-8 fix2 `RawWsConn`, this arrives the moment
+                            // the drop is detected, before the reconnect. The
+                            // signal uses the lossless control channel so a
+                            // saturated market queue cannot swallow it.
+                            let _ = handles.signal_gap();
                         }
                         Ok(RawEvent::Opened { .. }) => {
-                            // The reconnect succeeded; close the gap so the engine
-                            // can clear stale coins once data flows again.
-                            let _ = handles.send_market(MarketUpdate::Gap {
-                                conn: ConnId(0),
-                                stamp: Stamp::default(),
-                                open: false,
-                            });
+                            // The reconnect succeeded; the engine clears each
+                            // coin as its l2 book snapshot arrives.
                         }
                         Ok(_) => {}
                         Err(err) => {
                             tracing::warn!(error = %err, "market stream ended");
-                            let _ = handles.send_market(MarketUpdate::Gap {
-                                conn: ConnId(0),
-                                stamp: Stamp::default(),
-                                open: true,
-                            });
+                            let _ = handles.signal_gap();
                             return;
                         }
                     }

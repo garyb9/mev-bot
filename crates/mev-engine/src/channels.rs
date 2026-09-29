@@ -4,6 +4,9 @@
 //! conflatable market input; it writes records and exec payloads over bounded
 //! outbound channels, failing closed (never blocking) when they are full.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use crate::types::{AccountUpdate, MarketUpdate};
@@ -12,6 +15,33 @@ use crate::types::{AccountUpdate, MarketUpdate};
 pub const MARKET_CHANNEL_CAP: usize = 65_536;
 /// Default capacity of the lossless account/control input channel.
 pub const ACCOUNT_CHANNEL_CAP: usize = 16_384;
+/// Capacity of the market feed-control channel (gap signals).
+///
+/// Small on purpose: gap opens coalesce (a pending gap already means stale), and
+/// a full queue means the engine is not draining. In that case the producer
+/// sets the shared fail-closed latch instead of dropping the signal silently.
+pub const CONTROL_CHANNEL_CAP: usize = 8;
+
+/// A market-feed control signal delivered on its own channel.
+///
+/// Unlike [`MarketUpdate`]s, control signals must not be lost to a full market
+/// queue: a dropped gap would leave a feed that we know is broken looking fresh
+/// exactly when the system is most loaded (SPEC-0010 §16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketControl {
+    /// A feed gap opened: every coin is stale until a fresh book snapshot.
+    GapOpen,
+}
+
+/// Outcome of [`InputHandles::signal_gap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapSignal {
+    /// The gap was queued on the control channel.
+    Queued,
+    /// The control channel was full or disconnected, so the shared fail-closed
+    /// latch was set: the engine still treats every coin stale.
+    FailClosed,
+}
 
 /// The engine's inbound channels (owned by the engine thread).
 #[derive(Debug)]
@@ -20,6 +50,11 @@ pub struct Inputs {
     pub account: Receiver<AccountUpdate>,
     /// Lossy, conflatable market updates.
     pub market: Receiver<MarketUpdate>,
+    /// Market feed-control signals (gap opens), drained after the market queue.
+    pub control: Receiver<MarketControl>,
+    /// Set when a producer could not enqueue a control signal. The engine must
+    /// treat every coin stale while it is set (fail closed).
+    pub control_failed: Arc<AtomicBool>,
 }
 
 /// Producer handles for the engine's inbound channels.
@@ -29,18 +64,31 @@ pub struct InputHandles {
     pub account: Sender<AccountUpdate>,
     /// Lossy market updates.
     pub market: Sender<MarketUpdate>,
+    /// Market feed-control signals (gap opens); never silently dropped.
+    control: Sender<MarketControl>,
+    /// Shared fail-closed latch, mirrored into [`Inputs`].
+    control_failed: Arc<AtomicBool>,
 }
 
 /// Build a matched pair of input handles and readers.
 pub fn inputs(market_cap: usize, account_cap: usize) -> (InputHandles, Inputs) {
     let (market_tx, market) = bounded(market_cap);
     let (account_tx, account) = bounded(account_cap);
+    let (control_tx, control) = bounded(CONTROL_CHANNEL_CAP);
+    let control_failed = Arc::new(AtomicBool::new(false));
     (
         InputHandles {
             account: account_tx,
             market: market_tx,
+            control: control_tx,
+            control_failed: control_failed.clone(),
         },
-        Inputs { account, market },
+        Inputs {
+            account,
+            market,
+            control,
+            control_failed,
+        },
     )
 }
 
@@ -72,6 +120,28 @@ impl InputHandles {
     /// fatal shutdown condition rather than dropping updates silently.
     pub fn send_account(&self, update: AccountUpdate) -> bool {
         self.account.send(update).is_ok()
+    }
+
+    /// Signal that a market feed gap opened. Never silent.
+    ///
+    /// The signal goes on the dedicated control channel. If that queue is full
+    /// (the engine is behind) or the engine is gone, the shared fail-closed
+    /// latch is set instead, so the engine still treats every coin stale. The
+    /// caller must not treat [`GapSignal::FailClosed`] as "nothing to do".
+    pub fn signal_gap(&self) -> GapSignal {
+        match self.control.try_send(MarketControl::GapOpen) {
+            Ok(()) => GapSignal::Queued,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.control_failed.store(true, Ordering::Release);
+                GapSignal::FailClosed
+            }
+        }
+    }
+
+    /// Test seam: set the fail-closed latch as an undeliverable producer would.
+    #[cfg(test)]
+    pub(crate) fn force_control_failure(&self) {
+        self.control_failed.store(true, Ordering::Release);
     }
 }
 
@@ -135,5 +205,29 @@ mod tests {
         assert!(!out.try_send(2));
         drop(rx);
         assert!(!out.try_send(3));
+    }
+
+    #[test]
+    fn gap_signal_is_not_dropped_when_the_market_channel_is_full() {
+        // A gap is independent of the market queue: even with the market
+        // channel saturated, the control signal reaches the engine.
+        let (handles, inputs) = inputs(1, 1);
+        assert_eq!(handles.send_market(bbo()), MarketSend::Queued);
+        assert_eq!(handles.send_market(bbo()), MarketSend::Dropped);
+        assert_eq!(handles.signal_gap(), GapSignal::Queued);
+        assert_eq!(inputs.control.try_recv(), Ok(MarketControl::GapOpen));
+        assert!(!inputs.control_failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_full_control_channel_sets_the_fail_closed_latch() {
+        let (handles, inputs) = inputs(1, 1);
+        for _ in 0..CONTROL_CHANNEL_CAP {
+            assert_eq!(handles.signal_gap(), GapSignal::Queued);
+        }
+        // The next signal cannot be queued: the latch makes the engine treat
+        // every coin stale instead of pretending the feed is fine.
+        assert_eq!(handles.signal_gap(), GapSignal::FailClosed);
+        assert!(inputs.control_failed.load(Ordering::Acquire));
     }
 }

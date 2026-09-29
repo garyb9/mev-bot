@@ -99,6 +99,11 @@ pub struct EngineState {
     slots: Vec<MarketSlot>,
     dirty: Vec<bool>,
     dirty_any: bool,
+    /// Monotonic time of the most recent market-feed gap (0 before the first).
+    /// A book snapshot is only allowed to clear staleness if it is newer than
+    /// this, so a pre-gap snapshot that is still queued when the gap is noticed
+    /// cannot resurrect a coin with old data.
+    gap_mono_ns: u64,
 }
 
 impl EngineState {
@@ -108,6 +113,7 @@ impl EngineState {
             slots: vec![MarketSlot::default(); coin_count],
             dirty: vec![false; coin_count],
             dirty_any: false,
+            gap_mono_ns: 0,
         }
     }
 
@@ -141,16 +147,36 @@ impl EngineState {
         self.dirty_any
     }
 
-    /// Mark every coin stale (a market-feed gap opened on a shared connection,
-    /// so we cannot attribute the gap to a single coin — SPEC-0010 §16).
-    pub fn mark_all_stale(&mut self) {
+    /// Mark every coin stale at monotonic time `mono_ns` (a market-feed gap
+    /// opened on a shared connection, so we cannot attribute it to one coin —
+    /// SPEC-0010 §16). The time is retained: only a book snapshot received
+    /// strictly after the latest gap may clear a coin's staleness.
+    pub fn mark_all_stale(&mut self, mono_ns: u64) {
+        self.gap_mono_ns = self.gap_mono_ns.max(mono_ns);
         for slot in &mut self.slots {
             slot.stale = true;
         }
     }
 
-    /// Clear the stale flag for a coin once fresh data arrives.
-    pub fn mark_fresh(&mut self, coin: CoinId) {
+    /// Clear a coin's stale flag when a full **l2 book snapshot** received since
+    /// the latest gap arrives.
+    ///
+    /// This is the one place that decides what "fresh" means for a coin.
+    /// Staleness is cleared only by a book snapshot, because that is the
+    /// input the strategies consume to price and size (`book_view` reads
+    /// [`MarketSlot::book`]): a fresh `bbo`, trade, or asset-context update
+    /// leaves the l2 book pre-gap, so clearing on one of those would let a
+    /// strategy quote against pre-gap depth. A fresh book also supersedes any
+    /// older `bbo` in [`MarketSlot::best_bid`]/[`MarketSlot::best_ask`] by
+    /// timestamp, so every strategy read is then post-gap.
+    ///
+    /// `mono_ns` is the book snapshot's receive time; a snapshot stamped at or
+    /// before the gap is ignored, closing the race where a pre-gap snapshot is
+    /// still queued when the gap is observed.
+    pub fn mark_fresh(&mut self, coin: CoinId, mono_ns: u64) {
+        if mono_ns <= self.gap_mono_ns {
+            return;
+        }
         if let Some(slot) = self.slots.get_mut(coin.index()) {
             slot.stale = false;
         }
