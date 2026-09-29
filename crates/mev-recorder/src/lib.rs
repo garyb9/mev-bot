@@ -26,9 +26,10 @@ pub use planner::{
     PlanLimits, PlanTotals, PlannerError, Stream, Subscription, VolumeIndex,
 };
 pub use reader::{
-    FileCheck, InspectReport, MergeIter, MissingSeqs, ReaderError, RepairAction, RepairConfig,
-    SegmentReader, SeqHoles, SeqRange, StreamCoverage, VerifyConfig, VerifyReport,
-    append_manifest_entry, repair_manifest, segment_manifest_entry, segments_for,
+    CorruptOrphan, FileCheck, InspectReport, MergeIter, MissingSeqs, ReaderError, RepairAction,
+    RepairConfig, SegmentReader, SeqHoles, SeqRange, StreamCoverage, UnmanifestedSegment,
+    VerifyConfig, VerifyReport, append_manifest_entry, repair_manifest, segment_manifest_entry,
+    segments_for,
 };
 pub use segment::{
     DiskSpace, ManifestEntry, SegmentConfig, SegmentError, SegmentWriter, SystemDiskSpace,

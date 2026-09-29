@@ -59,6 +59,20 @@ pub enum ReaderError {
         /// The offending path.
         path: String,
     },
+    /// The recorder root directory does not exist.
+    #[error("recorder root `{0}` does not exist; nothing to do (check the profile out_dir)")]
+    MissingRoot(String),
+    /// A `.partial` file is present, so a recorder may be running or have
+    /// crashed mid-segment.
+    #[error(
+        "refusing to repair: found `{path}`; a recorder may be running or crashed \
+         mid-segment. Stop the recorder first, or run with --dry-run (a leftover \
+         `.partial` is recovered by restarting the recorder)"
+    )]
+    PartialPresent {
+        /// The offending `.partial` path.
+        path: String,
+    },
     /// The requested date was not `YYYY-MM-DD`.
     #[error("invalid date `{0}`")]
     InvalidDate(String),
@@ -198,6 +212,33 @@ pub struct StreamCoverage {
     pub coverage_pct: f64,
 }
 
+/// A segment on disk with no manifest line that [`verify`] does **not** classify
+/// as a repairable finished orphan (SPEC-0008 §17 #36).
+///
+/// Such a segment is recovered by restarting the recorder, not by
+/// [`repair_manifest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmanifestedSegment {
+    /// Path relative to `out_dir`.
+    pub file: String,
+    /// Source id.
+    pub src: String,
+    /// Connection id.
+    pub conn: String,
+    /// Decoded record count.
+    pub records: u64,
+}
+
+/// A segment on disk with no manifest line that could not be decoded at all,
+/// so [`verify`] can say nothing else about it (SPEC-0008 §17 #36).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptOrphan {
+    /// Path relative to `out_dir`.
+    pub file: String,
+    /// The decode error.
+    pub error: String,
+}
+
 /// Output of `hl record verify` (SPEC-0008 §12.1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifyReport {
@@ -209,7 +250,24 @@ pub struct VerifyReport {
     ///
     /// Each entry is the line the segment *should* have; coverage already
     /// counts its records, so a lost append no longer undercounts the day.
+    /// These are repairable by [`repair_manifest`].
     pub orphans: Vec<ManifestEntry>,
+    /// `.crashed` segments with no manifest line. A distinct category: they are
+    /// recovered by restarting the recorder, never by [`repair_manifest`], and
+    /// are a warning unless the caller passes `--strict`.
+    pub crashed_no_manifest: Vec<UnmanifestedSegment>,
+    /// Segments that decoded fully but do not end in `segment_close` and have no
+    /// manifest line. Not finalizable by [`repair_manifest`] either: restarting
+    /// the recorder only recovers `.partial` files, so `verify` fails unless
+    /// `--allow-orphans`.
+    pub unfinalized: Vec<UnmanifestedSegment>,
+    /// Segments with no manifest line that did not decode at all. Repair skips
+    /// them; `verify` fails unless `--allow-orphans`.
+    pub corrupt_orphans: Vec<CorruptOrphan>,
+    /// `*.partial` files present under the day's tree, if any. Their presence
+    /// means a recorder may be running, so orphan findings are "possibly in
+    /// flight".
+    pub partials: Vec<String>,
     /// Per-stream coverage.
     pub coverage: Vec<StreamCoverage>,
 }
@@ -638,18 +696,31 @@ struct SegmentTask {
 /// Check a day's manifest against the files on disk and compute coverage.
 ///
 /// The check is two-sided (SPEC-0008 §17 #36): it reports manifest lines whose
-/// file is missing, size/record mismatches, and finished segments present on
-/// disk with **no** manifest line (orphans). Coverage is computed over the
-/// union of manifest and orphan segments, so a lost manifest append no longer
-/// undercounts the day.
+/// file is missing, size/record mismatches, and segments present on disk with
+/// **no** manifest line. Coverage is computed over the union of manifest and
+/// orphan segments, so a lost manifest append no longer undercounts the day.
+/// Segments with no manifest line are split into the repairable finished
+/// orphans ([`VerifyReport::orphans`]) and the distinct not-repairable
+/// categories (crashed, unfinalized, corrupt), so the caller can warn instead of
+/// fail where that is right ([`VerifyReport::crashed_no_manifest`]). Any
+/// `*.partial` files found are reported so the caller can treat the orphans as
+/// possibly in flight.
+///
+/// The recorder root must exist: a missing root is an error rather than a clean
+/// empty report, so a typo in the profile cannot masquerade as "no data".
 pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
     let (day_start, day_end) =
         day_bounds(&config.date).ok_or_else(|| ReaderError::InvalidDate(config.date.clone()))?;
+    ensure_root_exists(&config.out_dir, &config.network)?;
 
     let mut report = VerifyReport {
         date: config.date.clone(),
         files: Vec::new(),
         orphans: Vec::new(),
+        crashed_no_manifest: Vec::new(),
+        unfinalized: Vec::new(),
+        corrupt_orphans: Vec::new(),
+        partials: Vec::new(),
         coverage: Vec::new(),
     };
 
@@ -698,9 +769,19 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
     for task in &plan {
         let path = config.out_dir.join(&task.file);
         let Some(entry) = &task.manifest else {
-            // An orphan: read it from disk, reconstruct the line it should have
-            // had, and feed coverage from the same envelopes.
-            let envelopes = read_envelopes(&path)?;
+            // An orphan: read it, feed coverage from its envelopes, and classify
+            // it. A corrupt one is listed and skipped; it must not abort the
+            // whole report (SPEC-0008 §17 #36).
+            let envelopes = match read_envelopes(&path) {
+                Ok(envelopes) => envelopes,
+                Err(err) => {
+                    report.corrupt_orphans.push(CorruptOrphan {
+                        file: task.file.clone(),
+                        error: err.to_string(),
+                    });
+                    continue;
+                }
+            };
             let acc = coverage
                 .entry((task.src.clone(), task.conn.clone()))
                 .or_default();
@@ -709,9 +790,29 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
                 acc.observe(env);
             }
             acc.end_segment();
-            report
-                .orphans
-                .push(segment_manifest_entry(&config.out_dir, &path, &envelopes)?);
+            if is_crashed(&path) {
+                report.crashed_no_manifest.push(UnmanifestedSegment {
+                    file: task.file.clone(),
+                    src: task.src.clone(),
+                    conn: task.conn.clone(),
+                    records: envelopes.len() as u64,
+                });
+            } else if envelopes.last().map(|env| env.kind) == Some(Kind::SegmentClose) {
+                match segment_manifest_entry(&config.out_dir, &path, &envelopes) {
+                    Ok(entry) => report.orphans.push(entry),
+                    Err(err) => report.corrupt_orphans.push(CorruptOrphan {
+                        file: task.file.clone(),
+                        error: err.to_string(),
+                    }),
+                }
+            } else {
+                report.unfinalized.push(UnmanifestedSegment {
+                    file: task.file.clone(),
+                    src: task.src.clone(),
+                    conn: task.conn.clone(),
+                    records: envelopes.len() as u64,
+                });
+            }
             continue;
         };
         let exists = path.exists();
@@ -753,6 +854,15 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
     }
     report.files.sort_by(|a, b| a.file.cmp(&b.file));
     report.orphans.sort_by(|a, b| a.file.cmp(&b.file));
+    report
+        .crashed_no_manifest
+        .sort_by(|a, b| a.file.cmp(&b.file));
+    report.unfinalized.sort_by(|a, b| a.file.cmp(&b.file));
+    report.corrupt_orphans.sort_by(|a, b| a.file.cmp(&b.file));
+    report.partials = partials_for_day(&config.out_dir, &config.network, &config.date)?
+        .iter()
+        .map(|path| rel_path(&config.out_dir, path))
+        .collect();
 
     let day_ms = day_end.saturating_sub(day_start) as u64 / 1_000_000;
     for ((src, conn), mut acc) in coverage {
@@ -855,7 +965,30 @@ pub fn segment_manifest_entry(
 /// append-only (no existing line or segment is ever rewritten or deleted), and
 /// it never creates a directory — only `manifest.jsonl` files inside the day
 /// directories that already hold the segments.
+///
+/// # Safety
+///
+/// Run this only while the recorder is **stopped**. There is deliberately no OS
+/// lock: the recorder's finalize window (rename the segment, then append its
+/// manifest line) looks exactly like an orphan, so a concurrent repair could
+/// append a duplicate line, and two processes appending to one
+/// `manifest.jsonl` is the cross-process lost-append race that the in-process
+/// `manifest_append_lock` cannot cover. As a cheap fail-closed guard a real run
+/// therefore refuses when any `*.partial` file is present under the day's tree,
+/// which means a writer may be mid-segment. `--dry-run` writes nothing and is
+/// safe at any time. A missing recorder root is an error, not an empty result.
 pub fn repair_manifest(config: &RepairConfig) -> Result<Vec<RepairAction>, ReaderError> {
+    ensure_root_exists(&config.out_dir, &config.network)?;
+    if !config.dry_run
+        && let Some(partial) = partials_for_day(&config.out_dir, &config.network, &config.date)?
+            .into_iter()
+            .next()
+    {
+        return Err(ReaderError::PartialPresent {
+            path: partial.display().to_string(),
+        });
+    }
+
     let mut known: BTreeSet<String> = BTreeSet::new();
     for path in manifests_for(&config.out_dir, &config.network, &config.date)? {
         for entry in read_manifest(&path)? {
@@ -872,7 +1005,9 @@ pub fn repair_manifest(config: &RepairConfig) -> Result<Vec<RepairAction>, Reade
         if is_crashed(&path) {
             actions.push(RepairAction::Skip {
                 file,
-                reason: "crashed segment (not fully finalized)".to_string(),
+                reason: "crashed segment: recover by restarting the recorder; \
+                         not repairable by repair-manifest"
+                    .to_string(),
             });
             continue;
         }
@@ -889,7 +1024,9 @@ pub fn repair_manifest(config: &RepairConfig) -> Result<Vec<RepairAction>, Reade
         if envelopes.last().map(|env| env.kind) != Some(Kind::SegmentClose) {
             actions.push(RepairAction::Skip {
                 file,
-                reason: "no segment_close (not fully finalized)".to_string(),
+                reason: "no segment_close: recover by restarting the recorder; \
+                         not repairable by repair-manifest"
+                    .to_string(),
             });
             continue;
         }
@@ -994,6 +1131,62 @@ fn manifests_for(out_dir: &Path, network: &str, date: &str) -> Result<Vec<PathBu
 
 fn is_crashed(path: &Path) -> bool {
     path.to_string_lossy().ends_with(".crashed")
+}
+
+/// Every `*.partial` file under the day's `{src}/{date}` trees, sorted.
+///
+/// A `.partial` means a recorder is writing a segment or crashed mid-segment,
+/// so [`repair_manifest`] must not run concurrently with it. Unlike
+/// [`segments_for`] a missing root is not an error here: the caller has already
+/// checked the root, and "no partials" is the normal state.
+fn partials_for_day(
+    out_dir: &Path,
+    network: &str,
+    date: &str,
+) -> Result<Vec<PathBuf>, ReaderError> {
+    let root = out_dir.join(network);
+    let mut partials = Vec::new();
+    let src_dirs = match fs::read_dir(&root) {
+        Ok(dirs) => dirs,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(partials),
+        Err(err) => return Err(err.into()),
+    };
+    for src in src_dirs {
+        let day_dir = src?.path().join(date);
+        if day_dir.is_dir() {
+            collect_partials(&day_dir, &mut partials)?;
+        }
+    }
+    partials.sort();
+    Ok(partials)
+}
+
+/// Recursively collect `*.partial` files under `dir`.
+fn collect_partials(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ReaderError> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_partials(&path, out)?;
+        } else if path.extension().is_some_and(|ext| ext == "partial") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// The recorder root (and the network sub-tree under it) must exist before an
+/// analysis walks it. A missing root is an error, not a clean empty report, so a
+/// wrong profile or network cannot look like "no data" (SPEC-0008 §17 #36).
+/// This only reads; nothing is created.
+fn ensure_root_exists(out_dir: &Path, network: &str) -> Result<(), ReaderError> {
+    if !out_dir.is_dir() {
+        return Err(ReaderError::MissingRoot(out_dir.display().to_string()));
+    }
+    let root = out_dir.join(network);
+    if !root.is_dir() {
+        return Err(ReaderError::MissingRoot(root.display().to_string()));
+    }
+    Ok(())
 }
 
 /// The channel an envelope belongs to: a frame's `channel` field, or the kind
@@ -2232,5 +2425,286 @@ mod tests {
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(matches!(actions[0], RepairAction::Skip { .. }));
         assert!(!manifest.exists());
+    }
+
+    fn spawn_writer(
+        dir: &Path,
+        src: &str,
+        conn: &str,
+        base: i64,
+    ) -> (SegmentWriter, Arc<FixedEnvelopeClock>) {
+        let clock = Arc::new(FixedEnvelopeClock::new(base, 0));
+        let config = SegmentConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            src: src.into(),
+            conn: conn.into(),
+            clock: clock.clone(),
+            ..SegmentConfig::default()
+        };
+        (SegmentWriter::spawn(config).unwrap(), clock)
+    }
+
+    /// A real (non-dry) `repair_manifest` refuses while any `*.partial` exists,
+    /// writes nothing, and succeeds once the partial is gone; `--dry-run` is
+    /// safe even then (SPEC-0008 §17 #36, review MV-1b).
+    #[test]
+    fn repair_refuses_when_a_partial_is_present() {
+        let tmp = temp_dir("repair-partial");
+        let dir = tmp.path();
+        let manifest = write_finalized_segment(dir, 5, 1_767_227_400_000_000_000);
+        fs::remove_file(&manifest).unwrap();
+
+        let hour_dir = dir.join("testnet/hl-ws/2026-01-01/00");
+        let partial = hour_dir.join("hl-ws-01-123.jsonl.zst.partial");
+        fs::write(&partial, b"mid-segment bytes").unwrap();
+
+        let real = RepairConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+            dry_run: false,
+        };
+        let err = repair_manifest(&real).unwrap_err();
+        match &err {
+            ReaderError::PartialPresent { path } => {
+                assert!(path.ends_with("hl-ws-01-123.jsonl.zst.partial"), "{path}");
+            }
+            other => panic!("expected PartialPresent, got {other:?}"),
+        }
+        assert!(!manifest.exists(), "a refused repair changed the manifest");
+
+        // Dry-run is allowed with the partial present and still writes nothing.
+        let dry = RepairConfig {
+            dry_run: true,
+            ..real.clone()
+        };
+        let actions = repair_manifest(&dry).unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(!manifest.exists(), "dry-run created the manifest");
+
+        // Once the partial is gone the real repair proceeds.
+        fs::remove_file(&partial).unwrap();
+        let actions = repair_manifest(&real).unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(manifest.exists());
+    }
+
+    /// `verify` reports any `*.partial` files so the caller can downgrade orphan
+    /// findings to "possibly in flight".
+    #[test]
+    fn verify_reports_partials() {
+        let tmp = temp_dir("verify-partial");
+        let dir = tmp.path();
+        let manifest = write_finalized_segment(dir, 3, 1_767_227_400_000_000_000);
+        fs::remove_file(&manifest).unwrap();
+        fs::write(
+            dir.join("testnet/hl-ws/2026-01-01/00/hl-ws-01-77.jsonl.zst.partial"),
+            b"mid-segment bytes",
+        )
+        .unwrap();
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert_eq!(report.partials.len(), 1, "{:?}", report.partials);
+        assert_eq!(report.orphans.len(), 1);
+    }
+
+    /// A missing recorder root is an explicit error for both analyses, and
+    /// neither creates anything.
+    #[test]
+    fn absent_root_errors_and_creates_nothing() {
+        let tmp = temp_dir("absent-root");
+        let missing = tmp.path().join("does-not-exist");
+
+        let verify_err = verify(&VerifyConfig {
+            out_dir: missing.clone(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(verify_err, ReaderError::MissingRoot(_)),
+            "{verify_err:?}"
+        );
+
+        let repair_err = repair_manifest(&RepairConfig {
+            out_dir: missing.clone(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+            dry_run: true,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(repair_err, ReaderError::MissingRoot(_)),
+            "{repair_err:?}"
+        );
+
+        assert!(!missing.exists(), "an absent root was created");
+
+        // An existing out_dir with no network sub-tree is also a missing root,
+        // not a silent "no data" success.
+        let net_err = verify(&VerifyConfig {
+            out_dir: tmp.path().to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(net_err, ReaderError::MissingRoot(_)),
+            "{net_err:?}"
+        );
+    }
+
+    /// `.crashed` and unfinalized orphans are classified apart from repairable
+    /// finished orphans; only the latter is `orphans` (SPEC-0008 §17 #36).
+    #[test]
+    fn verify_classifies_crashed_and_unfinalized() {
+        let tmp = temp_dir("verify-classes");
+        let dir = tmp.path();
+        let base = 1_767_227_400_000_000_000i64;
+        let clock = FixedEnvelopeClock::new(base, 0);
+        let env = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "data");
+        // A `.jsonl.zst` with no `segment_close`, and a `.crashed` file; both get
+        // a manifest line from `write_segment`, which we then delete.
+        write_segment(
+            dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            base,
+            std::slice::from_ref(&env),
+            false,
+        );
+        write_segment(
+            dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            base + 10_000_000_000,
+            std::slice::from_ref(&env),
+            true,
+        );
+        fs::remove_file(dir.join("testnet/hl-ws/2026-01-01/manifest.jsonl")).unwrap();
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert!(report.orphans.is_empty(), "{:?}", report.orphans);
+        assert!(
+            report.corrupt_orphans.is_empty(),
+            "{:?}",
+            report.corrupt_orphans
+        );
+        assert_eq!(report.crashed_no_manifest.len(), 1, "{report:?}");
+        assert_eq!(report.unfinalized.len(), 1, "{report:?}");
+    }
+
+    /// A corrupt orphan is listed (path + error) and must not abort the rest of
+    /// the report: the manifest-backed segment is still verified.
+    #[test]
+    fn verify_lists_corrupt_orphans_and_keeps_going() {
+        let tmp = temp_dir("verify-corrupt-orphan");
+        let dir = tmp.path();
+        // One healthy finalized segment, with its manifest line.
+        write_finalized_segment(dir, 4, 1_767_227_400_000_000_000);
+        // A corrupt `.jsonl.zst` with no manifest line.
+        let bad = dir.join("testnet/hl-ws/2026-01-01/00/hl-ws-01-9999.jsonl.zst");
+        fs::write(&bad, b"this is not a zstd stream at all, really it is not").unwrap();
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert_eq!(report.files.len(), 1, "{:?}", report.files);
+        assert!(report.files[0].records_ok && report.files[0].size_ok);
+        assert_eq!(report.corrupt_orphans.len(), 1, "{report:?}");
+        assert!(
+            report.corrupt_orphans[0]
+                .file
+                .ends_with("hl-ws-01-9999.jsonl.zst")
+        );
+        assert!(!report.corrupt_orphans[0].error.is_empty());
+    }
+
+    /// A mixed day: a manifest-backed segment and a finished orphan, in two
+    /// different hours, where the orphan contains `gap_start`/`gap_end` records.
+    /// Coverage unions both, the orphan is flagged, and the gap is excluded.
+    #[test]
+    fn verify_mixed_manifest_and_orphan_across_two_hours_with_gap() {
+        let tmp = temp_dir("verify-mixed");
+        let dir = tmp.path();
+        let base_h0 = 1_767_227_400_000_000_000i64; // 2026-01-01T00:30:00Z
+        let base_h1 = base_h0 + 3_600_000_000_000; // 01:30:00Z
+
+        // Hour 00: a plain finalized segment, manifest line kept.
+        write_finalized_segment(dir, 10, base_h0);
+
+        // Hour 01: a finalized segment containing a gap, whose manifest line we
+        // drop to make it an orphan.
+        let (writer, clock) = spawn_writer(dir, "hl-ws", "hl-ws-01", base_h1);
+        for i in 0..10u64 {
+            clock.set_t_ns(base_h1 + i as i64 * 1_000_000);
+            assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", i, "data")));
+        }
+        assert!(writer.try_send(Envelope::gap_start_at(
+            "hl-ws",
+            "hl-ws-01",
+            10,
+            base_h1 + 10_000_000,
+            0,
+            "closed",
+            "server closed",
+        )));
+        assert!(writer.try_send(Envelope::gap_end_at(
+            "hl-ws",
+            "hl-ws-01",
+            11,
+            base_h1 + 40_000_000,
+            0,
+            30,
+        )));
+        clock.set_t_ns(base_h1 + 50_000_000);
+        assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 12, "data")));
+        writer.shutdown().unwrap();
+
+        let manifest = dir.join("testnet/hl-ws/2026-01-01/manifest.jsonl");
+        let text = fs::read_to_string(&manifest).unwrap();
+        let kept: String = text
+            .lines()
+            .filter(|line| !line.contains("/01/"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&manifest, kept).unwrap();
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert_eq!(report.files.len(), 1, "{:?}", report.files);
+        assert!(
+            report.files[0].file.contains("/00/"),
+            "{}",
+            report.files[0].file
+        );
+        assert_eq!(report.orphans.len(), 1, "{report:?}");
+        assert!(report.orphans[0].file.contains("/01/"), "{report:?}");
+        assert_eq!(report.coverage.len(), 1, "{:?}", report.coverage);
+        assert!(
+            report.coverage[0].covered_ms > 0,
+            "the orphan's records were not counted: {:?}",
+            report.coverage
+        );
     }
 }

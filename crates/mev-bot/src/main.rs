@@ -192,6 +192,10 @@ enum RecordCmd {
         /// Do not fail when finished segments have no manifest line (orphans).
         #[arg(long)]
         allow_orphans: bool,
+        /// Fail on `.crashed`/unfinalized segments with no manifest line too
+        /// (they are warnings otherwise).
+        #[arg(long)]
+        strict: bool,
     },
     /// Append the missing manifest line for orphan finished segments
     /// (SPEC-0008 §17 #36). Maintenance tool; never run automatically.
@@ -396,7 +400,14 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
             Some(RecordCmd::Verify {
                 date,
                 allow_orphans,
-            }) => record::verify(profile, network.map(Into::into), &date, allow_orphans),
+                strict,
+            }) => record::verify(
+                profile,
+                network.map(Into::into),
+                &date,
+                allow_orphans,
+                strict,
+            ),
             Some(RecordCmd::RepairManifest { date, dry_run }) => {
                 record::repair_manifest(profile, network.map(Into::into), &date, dry_run)
             }

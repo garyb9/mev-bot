@@ -1549,6 +1549,7 @@ pub fn verify(
     network: Option<Network>,
     date: &str,
     allow_orphans: bool,
+    strict: bool,
 ) -> Result<()> {
     let (name, profile) = load_profile(profile.as_deref(), network)?;
     let network = profile_network(&profile)?;
@@ -1569,12 +1570,47 @@ pub fn verify(
             if file.size_ok { "" } else { " MISMATCH" }
         );
     }
+    println!("partials: {}", report.partials.len());
+    for partial in &report.partials {
+        println!("  PARTIAL {partial}");
+    }
+    if !report.partials.is_empty() {
+        println!(
+            "  note: `.partial` files are present, so a recorder may be running; \
+             orphan findings below are reported as possibly in flight and do not \
+             fail verify"
+        );
+    }
     println!("orphans: {}", report.orphans.len());
     for orphan in &report.orphans {
         println!(
             "  ORPHAN {:<70} {}/{} records={}",
             orphan.file, orphan.src, orphan.conn, orphan.records
         );
+    }
+    println!(
+        "crashed, no manifest line: {}",
+        report.crashed_no_manifest.len()
+    );
+    for seg in &report.crashed_no_manifest {
+        println!(
+            "  CRASHED {:<70} {}/{} records={}",
+            seg.file, seg.src, seg.conn, seg.records
+        );
+    }
+    println!(
+        "unfinalized, no manifest line: {}",
+        report.unfinalized.len()
+    );
+    for seg in &report.unfinalized {
+        println!(
+            "  UNFINALIZED {:<70} {}/{} records={}",
+            seg.file, seg.src, seg.conn, seg.records
+        );
+    }
+    println!("corrupt orphans: {}", report.corrupt_orphans.len());
+    for seg in &report.corrupt_orphans {
+        println!("  CORRUPT {:<70} {}", seg.file, seg.error);
     }
     println!("coverage:");
     for stream in &report.coverage {
@@ -1583,28 +1619,103 @@ pub fn verify(
             stream.src, stream.conn, stream.coverage_pct, stream.covered_ms
         );
     }
-    verify_exit(&report, allow_orphans)
+    verify_exit(&report, allow_orphans, strict)
 }
 
-/// Fail `verify` when orphan segments remain, unless they were explicitly
-/// allowed.
-fn verify_exit(report: &reader::VerifyReport, allow_orphans: bool) -> Result<()> {
-    if report.orphans.is_empty() {
-        return Ok(());
-    }
-    if allow_orphans {
+/// Decide `verify`'s exit status from the report (SPEC-0008 §17 #36).
+///
+/// Failing findings: repairable finished orphans (unless `--allow-orphans`, or
+/// `*.partial` files are present and they may be in flight), corrupt orphans and
+/// unfinalized segments (unless `--allow-orphans`). Warning only, unless
+/// `--strict`: `.crashed` segments with no manifest line, which are recovered by
+/// restarting the recorder.
+fn verify_exit(report: &reader::VerifyReport, allow_orphans: bool, strict: bool) -> Result<()> {
+    let in_flight = !report.partials.is_empty();
+    if in_flight {
         warn!(
-            orphans = report.orphans.len(),
-            "orphan segments ignored because --allow-orphans was passed"
+            partials = report.partials.len(),
+            "`.partial` files are present; treating orphan findings as possibly in flight"
         );
-        return Ok(());
     }
-    bail!(
-        "{} segment(s) on disk have no manifest line (orphans); run \
-         `hl record repair-manifest --date {}` or pass --allow-orphans",
-        report.orphans.len(),
-        report.date
-    );
+
+    if !report.orphans.is_empty() {
+        if allow_orphans || in_flight {
+            warn!(
+                orphans = report.orphans.len(),
+                "finished orphans ignored ({})",
+                if in_flight {
+                    "possibly in flight; a `.partial` file is present"
+                } else {
+                    "--allow-orphans"
+                }
+            );
+        } else {
+            bail!(
+                "{} finished segment(s) on disk have no manifest line (orphans); run \
+                 `hl record repair-manifest --date {}` or pass --allow-orphans",
+                report.orphans.len(),
+                report.date
+            );
+        }
+    }
+
+    if !report.corrupt_orphans.is_empty() {
+        if allow_orphans {
+            warn!(
+                corrupt_orphans = report.corrupt_orphans.len(),
+                "corrupt orphan segments ignored because --allow-orphans was passed"
+            );
+        } else {
+            let first = &report.corrupt_orphans[0];
+            bail!(
+                "{} segment(s) on disk have no manifest line and did not decode \
+                 (corrupt orphans), e.g. `{}`: {}; not repairable by repair-manifest, \
+                 recover by restarting the recorder; pass --allow-orphans to ignore",
+                report.corrupt_orphans.len(),
+                first.file,
+                first.error
+            );
+        }
+    }
+
+    // A finalized-name segment without `segment_close` cannot be repaired by
+    // `repair-manifest` (restarting the recorder only recovers `.partial`
+    // files), so it fails like a corrupt orphan unless allowed.
+    if !report.unfinalized.is_empty() {
+        if allow_orphans {
+            warn!(
+                unfinalized = report.unfinalized.len(),
+                "unfinalized segments ignored because --allow-orphans was passed"
+            );
+        } else {
+            let first = &report.unfinalized[0];
+            bail!(
+                "{} segment(s) on disk have no manifest line and no segment_close \
+                 (unfinalized), e.g. `{}`; not repairable by repair-manifest; pass \
+                 --allow-orphans to ignore",
+                report.unfinalized.len(),
+                first.file
+            );
+        }
+    }
+
+    // A `.crashed` file without a manifest line is expected after a crash whose
+    // manifest append was lost: warn, and fail only with `--strict`.
+    if !report.crashed_no_manifest.is_empty() {
+        if strict {
+            bail!(
+                "{} crashed segment(s) on disk have no manifest line; not repairable by \
+                 repair-manifest, recover by restarting the recorder",
+                report.crashed_no_manifest.len()
+            );
+        }
+        warn!(
+            crashed = report.crashed_no_manifest.len(),
+            "crashed segments with no manifest line are not repairable by repair-manifest; \
+             recover by restarting the recorder (pass --strict to fail)"
+        );
+    }
+    Ok(())
 }
 
 /// Append the missing manifest line for each orphan finished segment (SPEC-0008
@@ -3069,11 +3180,22 @@ mod tests {
         );
     }
 
-    /// `verify` exits non-zero for orphans unless `--allow-orphans` is passed.
-    #[test]
-    fn verify_fails_on_orphans_unless_allow_orphans() {
-        let orphan = mev_recorder::ManifestEntry {
-            file: "testnet/hl-ws/2026-01-01/00/hl-ws-01-1.jsonl.zst".into(),
+    fn empty_report() -> reader::VerifyReport {
+        reader::VerifyReport {
+            date: "2026-01-01".into(),
+            files: Vec::new(),
+            orphans: Vec::new(),
+            crashed_no_manifest: Vec::new(),
+            unfinalized: Vec::new(),
+            corrupt_orphans: Vec::new(),
+            partials: Vec::new(),
+            coverage: Vec::new(),
+        }
+    }
+
+    fn orphan_entry(file: &str) -> mev_recorder::ManifestEntry {
+        mev_recorder::ManifestEntry {
+            file: file.into(),
             src: "hl-ws".into(),
             conn: "hl-ws-01".into(),
             first_t_ns: 1,
@@ -3082,22 +3204,94 @@ mod tests {
             bytes_raw: 4,
             bytes_zst: 5,
             crashed: false,
-        };
-        let report = reader::VerifyReport {
-            date: "2026-01-01".into(),
-            files: Vec::new(),
-            orphans: vec![orphan],
-            coverage: Vec::new(),
-        };
-        assert!(verify_exit(&report, false).is_err());
-        assert!(verify_exit(&report, true).is_ok());
+        }
+    }
 
-        let clean = reader::VerifyReport {
-            date: "2026-01-01".into(),
-            files: Vec::new(),
-            orphans: Vec::new(),
-            coverage: Vec::new(),
-        };
-        assert!(verify_exit(&clean, false).is_ok());
+    fn unmanifested(file: &str) -> reader::UnmanifestedSegment {
+        reader::UnmanifestedSegment {
+            file: file.into(),
+            src: "hl-ws".into(),
+            conn: "hl-ws-01".into(),
+            records: 3,
+        }
+    }
+
+    /// `verify` exits non-zero for orphans unless `--allow-orphans` is passed,
+    /// and a `.partial` file (a recorder may be running) downgrades them to a
+    /// warning.
+    #[test]
+    fn verify_exit_orphans_allow_and_partial_downgrade() {
+        let mut report = empty_report();
+        report.orphans.push(orphan_entry(
+            "testnet/hl-ws/2026-01-01/00/hl-ws-01-1.jsonl.zst",
+        ));
+        assert!(verify_exit(&report, false, false).is_err());
+        assert!(verify_exit(&report, true, false).is_ok());
+
+        // A `.partial` means the orphans may be in flight: do not fail.
+        report
+            .partials
+            .push("testnet/hl-ws/2026-01-01/00/hl-ws-01-2.jsonl.zst.partial".into());
+        assert!(verify_exit(&report, false, false).is_ok());
+
+        assert!(verify_exit(&empty_report(), false, false).is_ok());
+    }
+
+    /// A `.crashed` segment with no manifest line warns by default and fails
+    /// only with `--strict`; the wording says how to recover, never "run
+    /// repair-manifest".
+    #[test]
+    fn verify_exit_strict_on_crashed() {
+        let mut report = empty_report();
+        report.crashed_no_manifest.push(unmanifested(
+            "testnet/hl-ws/2026-01-01/00/hl-ws-01-9.jsonl.zst.crashed",
+        ));
+        assert!(
+            verify_exit(&report, false, false).is_ok(),
+            "a crashed segment without a manifest line must warn, not fail"
+        );
+        let err = verify_exit(&report, false, true)
+            .expect_err("--strict must fail on a crashed segment without a manifest line");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not repairable by repair-manifest")
+                && msg.contains("recover by restarting the recorder"),
+            "message should say how to recover: {msg}"
+        );
+        assert!(
+            !msg.contains("repair-manifest --date"),
+            "must not tell the operator to run repair-manifest: {msg}"
+        );
+    }
+
+    /// An unfinalized segment with no manifest line cannot be repaired by
+    /// `repair-manifest`; it fails unless `--allow-orphans`.
+    #[test]
+    fn verify_exit_unfinalized_fails_unless_allowed() {
+        let mut report = empty_report();
+        report.unfinalized.push(unmanifested(
+            "testnet/hl-ws/2026-01-01/00/hl-ws-01-8.jsonl.zst",
+        ));
+        let err = verify_exit(&report, false, false).expect_err("unfinalized must fail");
+        assert!(
+            err.to_string()
+                .contains("not repairable by repair-manifest"),
+            "{err}"
+        );
+        assert!(verify_exit(&report, true, false).is_ok());
+    }
+
+    /// A corrupt orphan fails by default (consistently with repair's `Skip`) and
+    /// passes with `--allow-orphans`.
+    #[test]
+    fn verify_exit_corrupt_orphans() {
+        let mut report = empty_report();
+        report.corrupt_orphans.push(reader::CorruptOrphan {
+            file: "testnet/hl-ws/2026-01-01/00/hl-ws-01-7.jsonl.zst".into(),
+            error: "envelope decode error".into(),
+        });
+        let err = verify_exit(&report, false, false).expect_err("corrupt orphan must fail");
+        assert!(err.to_string().contains("--allow-orphans"), "{err}");
+        assert!(verify_exit(&report, true, false).is_ok());
     }
 }
