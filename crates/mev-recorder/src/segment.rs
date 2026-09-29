@@ -23,6 +23,7 @@ use thiserror::Error;
 use tracing::{debug, error, warn};
 
 use crate::envelope::{Envelope, EnvelopeClock, SegmentOpenMeta, SystemEnvelopeClock};
+use crate::mount_guard::{MOUNT_RECHECK_INTERVAL, MountError, MountGuard};
 
 /// At most one "queue full" warning per this interval.
 const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
@@ -36,6 +37,27 @@ pub enum SegmentError {
     /// An envelope could not be serialized.
     #[error("envelope serialization failed: {0}")]
     Encode(#[from] serde_json::Error),
+    /// The `require_mount` guard refused a directory or file creation.
+    #[error("mount guard: {0}")]
+    Mount(#[from] MountError),
+}
+
+/// Whether an I/O error means the segment's device or file vanished, which must
+/// stop the stream rather than be retried (R-14 §4).
+#[cfg(unix)]
+fn is_mount_io_error(err: &SegmentError) -> bool {
+    let SegmentError::Io(io) = err else {
+        return false;
+    };
+    matches!(
+        io.raw_os_error(),
+        Some(libc::EIO) | Some(libc::ENOENT) | Some(libc::ENODEV)
+    )
+}
+
+#[cfg(not(unix))]
+fn is_mount_io_error(_err: &SegmentError) -> bool {
+    false
 }
 
 /// A source of free-disk-space measurements, injectable for tests.
@@ -97,6 +119,8 @@ pub struct SegmentConfig {
     pub disk: Arc<dyn DiskSpace>,
     /// Stream priority, lowest first; reserved for the multi-stream disk guard.
     pub priority: u8,
+    /// Optional `require_mount` guard (R-14). Defaults to unguarded.
+    pub mount_guard: Arc<MountGuard>,
 }
 
 impl Default for SegmentConfig {
@@ -115,6 +139,7 @@ impl Default for SegmentConfig {
             clock: Arc::new(SystemEnvelopeClock::new()),
             disk: Arc::new(SystemDiskSpace),
             priority: 0,
+            mount_guard: Arc::new(MountGuard::unguarded()),
         }
     }
 }
@@ -180,6 +205,9 @@ impl SegmentWriter {
     /// Recover leftover `.partial` files for this connection and spawn the
     /// writer thread with a bounded queue of `channel_capacity` envelopes.
     pub fn spawn(config: SegmentConfig) -> Result<Self, SegmentError> {
+        // Refuse to start before touching disk if the required mount is not a
+        // real mount or `out_dir` escapes it (R-14 §1). Creates nothing.
+        config.mount_guard.validate_startup(&config.out_dir)?;
         recover_crashed(&config)?;
         let (tx, rx) = sync_channel(config.channel_capacity.max(1));
         let src = config.src.clone();
@@ -245,8 +273,15 @@ impl Drop for SegmentWriter {
 
 fn run(config: SegmentConfig, rx: &Receiver<Msg>) {
     let mut state = WriterState::new(config);
+    // A guarded writer must notice a disconnection within the 2 s watchdog even
+    // when no segment rotates, so wake at least that often.
+    let poll = if state.config.mount_guard.is_guarded() {
+        state.config.flush_interval.min(MOUNT_RECHECK_INTERVAL)
+    } else {
+        state.config.flush_interval
+    };
     loop {
-        match rx.recv_timeout(state.config.flush_interval) {
+        match rx.recv_timeout(poll) {
             Ok(Msg::Env(env)) => {
                 if let Err(err) = state.write(env) {
                     error!(error = %err, "segment write failed");
@@ -267,6 +302,7 @@ struct WriterState {
     current: Option<OpenSegment>,
     last_flush: Instant,
     last_disk_check: Instant,
+    last_mount_check: Instant,
     last_start_t_ns: i64,
     stopped: bool,
 }
@@ -279,6 +315,7 @@ impl WriterState {
             current: None,
             last_flush: now,
             last_disk_check: now,
+            last_mount_check: now,
             last_start_t_ns: i64::MIN,
             stopped: false,
         }
@@ -304,10 +341,35 @@ impl WriterState {
                 start_t_ns = self.last_start_t_ns.saturating_add(1);
             }
             self.last_start_t_ns = start_t_ns;
-            self.current = Some(OpenSegment::create(&self.config, &env, start_t_ns)?);
+            match OpenSegment::create(&self.config, &env, start_t_ns) {
+                Ok(seg) => self.current = Some(seg),
+                Err(SegmentError::Mount(err)) => {
+                    warn!(
+                        src = %self.config.src,
+                        conn = %self.config.conn,
+                        error = %err,
+                        "mount guard refused a new segment; stopping stream"
+                    );
+                    self.stop_for_mount();
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
         }
-        if let Some(seg) = &mut self.current {
-            seg.write_raw(&line, &env)?;
+        if let Some(seg) = &mut self.current
+            && let Err(err) = seg.write_raw(&line, &env)
+        {
+            if is_mount_io_error(&err) {
+                warn!(
+                    src = %self.config.src,
+                    conn = %self.config.conn,
+                    error = %err,
+                    "write failed on the recording mount; stopping stream"
+                );
+                self.stop_for_mount();
+                return Ok(());
+            }
+            return Err(err);
         }
         Ok(())
     }
@@ -315,6 +377,23 @@ impl WriterState {
     fn maintenance(&mut self) {
         if self.stopped {
             return;
+        }
+        // Re-check a required mount on a timer so a disconnect is noticed even
+        // when no rotation is due (R-14 §4).
+        if self.config.mount_guard.is_guarded()
+            && self.last_mount_check.elapsed() >= MOUNT_RECHECK_INTERVAL
+        {
+            self.last_mount_check = Instant::now();
+            if let Err(err) = self.config.mount_guard.check_or_trip() {
+                warn!(
+                    src = %self.config.src,
+                    conn = %self.config.conn,
+                    error = %err,
+                    "mount guard tripped; stopping stream"
+                );
+                self.stop_for_mount();
+                return;
+            }
         }
         // The disk guard can only be acted on while a segment is open: the
         // `gap_start{reason:"disk"}` record is written into the current
@@ -330,18 +409,29 @@ impl WriterState {
                 return;
             }
         }
-        if self.last_flush.elapsed() >= self.config.flush_interval {
-            self.flush();
+        if self.last_flush.elapsed() >= self.config.flush_interval
+            && let Err(err) = self.flush()
+        {
+            if is_mount_io_error(&err) {
+                warn!(
+                    src = %self.config.src,
+                    conn = %self.config.conn,
+                    error = %err,
+                    "flush failed on the recording mount; stopping stream"
+                );
+                self.stop_for_mount();
+                return;
+            }
+            error!(error = %err, "segment flush failed");
         }
     }
 
-    fn flush(&mut self) {
-        if let Some(seg) = &mut self.current
-            && let Err(err) = seg.flush()
-        {
-            error!(error = %err, "segment flush failed");
+    fn flush(&mut self) -> Result<(), SegmentError> {
+        if let Some(seg) = &mut self.current {
+            seg.flush()?;
         }
         self.last_flush = Instant::now();
+        Ok(())
     }
 
     fn disk_low(&self) -> bool {
@@ -381,6 +471,40 @@ impl WriterState {
         self.finalize_current();
     }
 
+    /// Stop the stream because the required mount vanished (R-14 §2).
+    ///
+    /// The `gap_start{reason:"disk"}` is written through the *already open*
+    /// file descriptor, which can only reach the original device, never the
+    /// root disk; no path-based create, rename, or manifest append happens.
+    /// The open segment is then dropped without finalizing: finalization is
+    /// path-based (`fsync` + rename + manifest) and would risk the wrong disk,
+    /// so the leftover `.partial` is left for crash recovery on the next start.
+    fn stop_for_mount(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        self.config.mount_guard.trip();
+        let seq = self.current.as_ref().map_or(0, |seg| seg.last_seq);
+        let gap = Envelope::gap_start(
+            &*self.config.clock,
+            &self.config.src,
+            &self.config.conn,
+            seq,
+            "disk",
+            "require_mount is no longer mounted",
+        );
+        if let Some(seg) = &mut self.current
+            && let Ok(mut line) = serde_json::to_vec(&gap)
+        {
+            line.push(b'\n');
+            if let Err(err) = seg.write_raw(&line, &gap) {
+                debug!(error = %err, "failed to write mount gap record");
+            }
+        }
+        self.current = None;
+    }
+
     fn finalize_current(&mut self) {
         let Some(seg) = self.current.take() else {
             return;
@@ -399,7 +523,7 @@ impl WriterState {
                     crashed: false,
                 };
                 let path = manifest_path_for_t_ns(&self.config, finished.first_t_ns);
-                if let Err(err) = append_manifest_line(&path, &entry) {
+                if let Err(err) = append_manifest_line(&path, &entry, &self.config.mount_guard) {
                     error!(error = %err, "manifest append failed");
                 }
             }
@@ -426,6 +550,8 @@ impl OpenSegment {
         first_env: &Envelope,
         start_t_ns: i64,
     ) -> Result<Self, SegmentError> {
+        // Re-check immediately before `create_dir_all` (R-14 §2).
+        config.mount_guard.check_or_trip()?;
         let (year, month, day, hour) = utc_parts(start_t_ns);
         let dir = config
             .out_dir
@@ -481,6 +607,9 @@ impl OpenSegment {
     }
 
     fn finish(self, config: &SegmentConfig) -> Result<FinishedSegment, SegmentError> {
+        // `fsync` + rename are path-based writes; re-check the mount first
+        // (R-14 §2). On failure the segment is dropped and left as `.partial`.
+        config.mount_guard.check_or_trip()?;
         let OpenSegment {
             mut encoder,
             partial_path,
@@ -558,6 +687,8 @@ fn recover_crashed(config: &SegmentConfig) -> Result<(), SegmentError> {
     if !root.is_dir() {
         return Ok(());
     }
+    // Recovery renames `.partial` files and appends manifest lines: guard it.
+    config.mount_guard.check_or_trip()?;
     let mut partials = Vec::new();
     collect_partials(&root, &mut partials)?;
     // Match the connection exactly by parsing the name: a prefix test would let
@@ -596,7 +727,7 @@ fn recover_crashed(config: &SegmentConfig) -> Result<(), SegmentError> {
             .and_then(Path::parent)
             .map(|day| day.join("manifest.jsonl"))
             .unwrap_or_else(|| manifest_path_for_t_ns(config, start_t_ns));
-        append_manifest_line(&manifest, &entry)?;
+        append_manifest_line(&manifest, &entry, &config.mount_guard)?;
     }
     Ok(())
 }
@@ -626,7 +757,13 @@ fn parse_partial_name(name: &str) -> Option<(String, i64)> {
     Some((conn.to_string(), t_ns))
 }
 
-fn append_manifest_line(path: &Path, entry: &ManifestEntry) -> Result<(), SegmentError> {
+fn append_manifest_line(
+    path: &Path,
+    entry: &ManifestEntry,
+    guard: &MountGuard,
+) -> Result<(), SegmentError> {
+    // Re-check immediately before `create_dir_all`/open (R-14 §2).
+    guard.check_or_trip()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -686,6 +823,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 mod tests {
     use super::*;
     use crate::envelope::{FixedEnvelopeClock, Kind};
+    use crate::mount_guard::test_support::FakeMountProbe;
     use std::io::Read;
 
     fn decode_records(path: &Path) -> Vec<Envelope> {
@@ -1075,5 +1213,185 @@ mod tests {
             .filter(|env| env.kind == Kind::Frame)
             .count();
         assert_eq!(frames as u64, total);
+    }
+
+    // -- R-14 mount guard ---------------------------------------------------
+
+    /// Every path under `root` (directories and files), sorted. Used to prove
+    /// the writer creates nothing once the required mount is gone.
+    fn path_set(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                }
+                out.push(path);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A guarded config rooted at `mount/mev-rec` with `mount` as the required
+    /// mount, built around a fake probe.
+    fn guarded_config(
+        mount: &Path,
+        clock: Arc<FixedEnvelopeClock>,
+    ) -> (Arc<FakeMountProbe>, Arc<MountGuard>, SegmentConfig) {
+        let out = mount.join("mev-rec");
+        fs::create_dir_all(&out).unwrap();
+        let probe = Arc::new(FakeMountProbe::new(mount));
+        let guard = Arc::new(MountGuard::new(Some(mount.to_path_buf()), probe.clone()));
+        guard.validate_startup(&out).unwrap();
+        let mut cfg = config(&out, clock, "hl-ws", "hl-ws-01");
+        cfg.mount_guard = guard.clone();
+        (probe, guard, cfg)
+    }
+
+    #[test]
+    fn unset_require_mount_is_unguarded() {
+        let cfg = SegmentConfig::default();
+        assert!(
+            !cfg.mount_guard.is_guarded(),
+            "default config must not require a mount"
+        );
+    }
+
+    #[test]
+    fn mount_guard_blocks_the_first_segment_without_creating_anything() {
+        let tmp = temp_dir("mount-first");
+        let mount = tmp.path();
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let (probe, guard, cfg) = guarded_config(mount, clock.clone());
+        let mut state = WriterState::new(cfg);
+
+        probe.set_mounted(false);
+        let before = path_set(mount);
+        state
+            .write(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 0, "a"))
+            .unwrap();
+
+        assert!(
+            state.stopped,
+            "writer did not stop after the mount vanished"
+        );
+        assert!(guard.is_tripped());
+        assert_eq!(
+            path_set(mount),
+            before,
+            "a directory or file was created while unmounted"
+        );
+    }
+
+    #[test]
+    fn mount_guard_stops_on_rotation_when_mount_disappears() {
+        let tmp = temp_dir("mount-rotation");
+        let mount = tmp.path();
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let (probe, guard, cfg) = guarded_config(mount, clock.clone());
+        let mut state = WriterState::new(cfg);
+
+        state
+            .write(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 0, "a"))
+            .unwrap();
+        assert!(state.current.is_some());
+        let before = path_set(mount);
+
+        probe.set_mounted(false);
+        clock.set_t_ns(H2); // force an hour rotation, which creates a new file
+        state
+            .write(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 1, "b"))
+            .unwrap();
+
+        assert!(
+            state.stopped,
+            "writer did not stop after the mount vanished"
+        );
+        assert!(state.current.is_none());
+        assert!(guard.is_tripped());
+        assert_eq!(
+            path_set(mount),
+            before,
+            "a directory or file was created while unmounted"
+        );
+    }
+
+    #[test]
+    fn mount_watchdog_stops_without_a_rotation() {
+        let tmp = temp_dir("mount-watchdog");
+        let mount = tmp.path();
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let (probe, guard, cfg) = guarded_config(mount, clock.clone());
+        let mut state = WriterState::new(cfg);
+
+        state
+            .write(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 0, "a"))
+            .unwrap();
+        assert!(state.current.is_some());
+        let before = path_set(mount);
+
+        probe.set_mounted(false);
+        // Force the 2 s watchdog to be due without sleeping.
+        state.last_mount_check = Instant::now() - MOUNT_RECHECK_INTERVAL - Duration::from_secs(1);
+        state.maintenance();
+
+        assert!(state.stopped, "watchdog did not stop the stream");
+        assert!(state.current.is_none());
+        assert!(guard.is_tripped());
+        assert_eq!(
+            path_set(mount),
+            before,
+            "a directory or file was created while unmounted"
+        );
+    }
+
+    #[test]
+    fn mount_guard_allows_a_normal_run_while_mounted() {
+        let tmp = temp_dir("mount-ok");
+        let mount = tmp.path();
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let (_probe, guard, cfg) = guarded_config(mount, clock.clone());
+        let out = mount.join("mev-rec");
+        let writer = SegmentWriter::spawn(cfg).unwrap();
+
+        for i in 0..5u64 {
+            clock.set_t_ns(H1 + i as i64);
+            assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", i, "x")));
+        }
+        writer.shutdown();
+
+        assert!(!guard.is_tripped());
+        let files = files_with_ext(&out.join("testnet/hl-ws"), "zst");
+        assert_eq!(
+            files.len(),
+            1,
+            "mounted writer did not finalize its segment"
+        );
+        assert_eq!(
+            read_records(&files[0])
+                .iter()
+                .filter(|env| env.kind == Kind::Frame)
+                .count(),
+            5
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_io_errors_are_recognized() {
+        for code in [libc::EIO, libc::ENOENT, libc::ENODEV] {
+            let err = SegmentError::Io(io::Error::from_raw_os_error(code));
+            assert!(is_mount_io_error(&err), "errno {code} not recognized");
+        }
+        let other = SegmentError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "no"));
+        assert!(!is_mount_io_error(&other));
+        let encode = SegmentError::Mount(MountError::Missing {
+            mount: PathBuf::from("/mnt/e"),
+        });
+        assert!(!is_mount_io_error(&encode));
     }
 }

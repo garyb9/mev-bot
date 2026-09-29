@@ -8,6 +8,7 @@
 //! and reader, the subscription planner, and the REST snapshotter.
 
 pub mod envelope;
+pub mod mount_guard;
 pub mod planner;
 pub mod reader;
 pub mod segment;
@@ -16,6 +17,9 @@ pub mod sources;
 pub use envelope::{
     Envelope, EnvelopeClock, FixedEnvelopeClock, Kind, MonoClock, SCHEMA_VERSION, SegmentOpenMeta,
     SystemEnvelopeClock,
+};
+pub use mount_guard::{
+    MOUNT_RECHECK_INTERVAL, MountError, MountGuard, MountProbe, SystemMountProbe,
 };
 pub use planner::{
     Connection, HlProfile, MAX_SUBSCRIBE_MSGS_PER_SEC, MIN_NEW_CONN_INTERVAL, Pacer, Plan,

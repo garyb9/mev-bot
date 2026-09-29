@@ -40,6 +40,7 @@ mev-strategy.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 criterion.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 tempfile.workspace = true
 

@@ -34,8 +34,9 @@ use mev_hl_client::{
 };
 use mev_metrics::{health::Health, names};
 use mev_recorder::{
-    Connection, DiskSpace, Envelope, EnvelopeClock, EnvelopeSink, HlProfile, Kind, SegmentConfig,
-    SegmentOpenMeta, SegmentWriter, SystemDiskSpace, SystemEnvelopeClock, VolumeIndex,
+    Connection, DiskSpace, Envelope, EnvelopeClock, EnvelopeSink, HlProfile, Kind,
+    MOUNT_RECHECK_INTERVAL, MountGuard, SegmentConfig, SegmentOpenMeta, SegmentWriter,
+    SystemDiskSpace, SystemEnvelopeClock, SystemMountProbe, VolumeIndex,
     planner::{Stream, plan as build_plan},
     reader,
     sources::{
@@ -91,6 +92,10 @@ struct Profile {
     zstd_level: i32,
     /// Stop recording when free disk drops below this many GiB.
     min_free_gb: u64,
+    /// Absolute mount path the recorder must write under, if any (R-14). When
+    /// set, startup fails unless it is a real mount and `out_dir` is inside it,
+    /// and the stream stops if the mount disappears. Unset = current behaviour.
+    require_mount: Option<PathBuf>,
     /// Local retention in days (applied by R-10 shipping, not yet here).
     #[allow(dead_code)]
     retain_days: u64,
@@ -119,6 +124,7 @@ impl Default for Profile {
             out_dir: PathBuf::from("data/rec"),
             zstd_level: 3,
             min_free_gb: 20,
+            require_mount: None,
             retain_days: 30,
             meta_refresh_secs: 300,
             http_port: 9091,
@@ -417,6 +423,18 @@ pub async fn run(
 ) -> Result<()> {
     let (name, profile) = load_profile(profile.as_deref(), network)?;
     let network = profile_network(&profile)?;
+
+    // Fail fast, before any network access or directory creation, if the
+    // required recording mount is not a real mount or `out_dir` escapes it
+    // (R-14 §1). `create_dir_all` below runs only after this passes.
+    let mount_guard = Arc::new(MountGuard::new(
+        profile.require_mount.clone(),
+        Arc::new(SystemMountProbe),
+    ));
+    mount_guard
+        .validate_startup(&profile.out_dir)
+        .context("validating the recording profile require_mount")?;
+
     let prometheus = mev_metrics::prometheus::install_recorder();
     metrics::counter!(names::STARTUPS).increment(1);
 
@@ -485,6 +503,7 @@ pub async fn run(
             &meta,
             clock.clone(),
             connection_priority(conn),
+            mount_guard.clone(),
         ))
         .with_context(|| format!("spawning segment writer for {}", conn.id))?;
         let protocol: Box<dyn Fn() -> Box<dyn Protocol> + Send> =
@@ -512,6 +531,7 @@ pub async fn run(
                 &meta,
                 clock.clone(),
                 1,
+                mount_guard.clone(),
             ))
             .context("spawning segment writer for hl-rest")?,
         );
@@ -538,6 +558,7 @@ pub async fn run(
                 &meta,
                 clock.clone(),
                 1,
+                mount_guard.clone(),
             ))
             .context("spawning segment writer for deribit")?,
         );
@@ -560,16 +581,28 @@ pub async fn run(
         recorder_health,
         health.clone(),
         clock.clone(),
+        mount_guard.clone(),
         shutdown_rx.clone(),
     )));
 
     // Serve HTTP until a shutdown signal; `serve` also handles SIGTERM/SIGINT.
-    let serve_task = tokio::spawn(crate::serve(health, prometheus, profile.http_port));
+    let mut serve_task = tokio::spawn(crate::serve(health, prometheus, profile.http_port));
 
-    let serve_result = serve_task.await;
-    if let Ok(Err(err)) = serve_result {
+    // Also stop when the required mount disappears, not only on a signal
+    // (R-14 §2). The wait is pending forever when no mount is required.
+    let mut serve_result = None;
+    let mount_tripped = tokio::select! {
+        result = &mut serve_task => {
+            serve_result = Some(result);
+            false
+        }
+        _ = wait_for_mount_stop(mount_guard.clone()) => true,
+    };
+    if let Some(Ok(Err(err))) = serve_result {
         warn!(error = %err, "http server stopped with an error");
     }
+    // A writer may have tripped the guard just before the signal arrived.
+    let mount_tripped = mount_tripped || mount_guard.is_tripped();
 
     info!("shutdown requested; finalizing recorder");
     let _ = shutdown_tx.send(true);
@@ -578,8 +611,36 @@ pub async fn run(
     for task in tasks {
         let _ = task.await;
     }
+
+    if mount_tripped {
+        // All writers have stopped; make the process exit non-zero rather than
+        // silently recording to a fallback location (there is none).
+        serve_task.abort();
+        let mount = mount_guard
+            .require_mount()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        bail!("require_mount `{mount}` is no longer a mount; recorder stopped");
+    }
     info!("recorder stopped");
     Ok(())
+}
+
+/// Wait until the mount guard trips, or forever when none is required.
+async fn wait_for_mount_stop(guard: Arc<MountGuard>) {
+    if !guard.is_guarded() {
+        std::future::pending::<()>().await;
+        return;
+    }
+    let mut tick = tokio::time::interval(MOUNT_RECHECK_INTERVAL);
+    tick.tick().await; // consume the immediate first tick
+    loop {
+        tick.tick().await;
+        if guard.is_tripped() || guard.check().is_err() {
+            guard.trip();
+            return;
+        }
+    }
 }
 
 /// Priority for a connection's disk guard: the most important (lowest) stream on
@@ -602,6 +663,7 @@ fn segment_config(
     meta: &SegmentOpenMeta,
     clock: Arc<dyn EnvelopeClock>,
     priority: u8,
+    mount_guard: Arc<MountGuard>,
 ) -> SegmentConfig {
     SegmentConfig {
         out_dir: profile.out_dir.clone(),
@@ -617,6 +679,7 @@ fn segment_config(
         clock,
         disk: Arc::new(SystemDiskSpace),
         priority,
+        mount_guard,
     }
 }
 
@@ -1148,17 +1211,21 @@ async fn disk_monitor(out_dir: PathBuf, mut shutdown: watch::Receiver<bool>) {
 }
 
 /// Update `/readyz` from the connection/REST liveness state until shutdown.
+///
+/// A tripped [`MountGuard`] forces not-ready even while the sockets are still
+/// healthy, so `/readyz` reflects that the recorder can no longer write.
 async fn readiness_monitor(
     recorder: Arc<RecorderHealth>,
     health: Health,
     clock: Arc<dyn EnvelopeClock>,
+    mount_guard: Arc<MountGuard>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut tick = tokio::time::interval(READY_SAMPLE_INTERVAL);
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let ready = recorder.ready(
+                let ready = !mount_guard.is_tripped() && recorder.ready(
                     clock.mono_ns(),
                     READY_WATCHDOG.as_nanos() as u64,
                     REST_READY_STALE.as_nanos() as u64,
@@ -1683,6 +1750,104 @@ mod tests {
     }
 
     #[test]
+    fn require_mount_defaults_to_unset() {
+        let config = parse_toml("[profile.default]\nnetwork = \"mainnet\"\n").unwrap();
+        assert_eq!(config.profile.get("default").unwrap().require_mount, None);
+    }
+
+    #[test]
+    fn require_mount_parses_an_absolute_path() {
+        let config = parse_toml(
+            "[profile.default]\n\
+             out_dir = \"/mnt/e/mev-rec\"\n\
+             require_mount = \"/mnt/e\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .profile
+                .get("default")
+                .unwrap()
+                .require_mount
+                .as_deref(),
+            Some(Path::new("/mnt/e"))
+        );
+    }
+
+    /// A tripped guard forces `/readyz` not-ready even while the connections
+    /// look healthy (R-14 §2).
+    #[tokio::test]
+    async fn readiness_monitor_is_not_ready_when_the_mount_is_tripped() {
+        let clock: Arc<dyn EnvelopeClock> = Arc::new(mev_recorder::FixedEnvelopeClock::new(1, 0));
+        let health = Health::new();
+        health.set_ready(true);
+        let guard = Arc::new(MountGuard::unguarded());
+        guard.trip();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(readiness_monitor(
+            RecorderHealth::new(Vec::new()),
+            health.clone(),
+            clock,
+            guard,
+            shutdown_rx,
+        ));
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+            if !health.is_ready() {
+                break;
+            }
+        }
+        let _ = shutdown_tx.send(true);
+        let _ = task.await;
+        assert!(
+            !health.is_ready(),
+            "a tripped mount must make /readyz not ready"
+        );
+    }
+
+    /// The mount watchdog fires once the required mount is gone, which is what
+    /// makes `run` return an error (process exit non-zero).
+    #[tokio::test(start_paused = true)]
+    async fn mount_watchdog_fires_when_the_required_mount_is_not_a_mount() {
+        let tmp = temp_dir("watchdog-run");
+        let guard = Arc::new(MountGuard::new(
+            Some(tmp.path().to_path_buf()),
+            Arc::new(SystemMountProbe),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), wait_for_mount_stop(guard.clone()))
+            .await
+            .expect("watchdog did not fire");
+        assert!(guard.is_tripped());
+    }
+
+    /// With no `require_mount`, the watchdog never fires (current behaviour).
+    #[tokio::test(start_paused = true)]
+    async fn mount_watchdog_stays_pending_when_unguarded() {
+        let guard = Arc::new(MountGuard::unguarded());
+        let result =
+            tokio::time::timeout(Duration::from_secs(60), wait_for_mount_stop(guard.clone())).await;
+        assert!(result.is_err(), "unguarded watchdog must never complete");
+        assert!(!guard.is_tripped());
+    }
+
+    #[test]
+    fn segment_config_carries_the_mount_guard() {
+        let guard = Arc::new(MountGuard::unguarded());
+        let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
+        let config = segment_config(
+            &Profile::default(),
+            Network::Mainnet,
+            "hl-ws",
+            "hl-ws-01",
+            &SegmentOpenMeta::default(),
+            clock,
+            1,
+            guard.clone(),
+        );
+        assert!(Arc::ptr_eq(&config.mount_guard, &guard));
+    }
+
+    #[test]
     fn deribit_defaults_to_disabled() {
         let config = parse_toml("[profile.default]\nnetwork = \"mainnet\"\n").unwrap();
         let deribit = &config.profile.get("default").unwrap().deribit;
@@ -1757,6 +1922,7 @@ mod tests {
                 &SegmentOpenMeta::default(),
                 clock.clone(),
                 1,
+                Arc::new(MountGuard::unguarded()),
             ))
             .unwrap(),
         );
@@ -1876,6 +2042,7 @@ mod tests {
             &SegmentOpenMeta::default(),
             clock.clone(),
             1,
+            Arc::new(MountGuard::unguarded()),
         ))
         .unwrap();
         let ws_url = format!("ws://{ws_addr}");
@@ -1906,6 +2073,7 @@ mod tests {
                 &SegmentOpenMeta::default(),
                 clock.clone(),
                 1,
+                Arc::new(MountGuard::unguarded()),
             ))
             .unwrap(),
         );

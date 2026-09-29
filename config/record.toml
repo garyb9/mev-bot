@@ -17,6 +17,12 @@ network = "mainnet"
 out_dir = "data/rec"
 zstd_level = 3
 min_free_gb = 20
+# R-14 disk-mount guard. Unset (the default) keeps the current behaviour. When
+# set to an absolute path, the recorder refuses to start unless that path is a
+# real mount point (e.g. an external SSD at /mnt/e) AND out_dir is inside it,
+# re-checks it before every file/directory creation, and stops the stream (and
+# exits non-zero) if the mount disappears. Never falls back to another disk.
+# require_mount = "/mnt/e"
 retain_days = 30
 meta_refresh_secs = 300          # re-resolve universes, pick up new listings
 # Port for `/healthz`, `/readyz`, `/metrics` (SPEC-0008 §12.2). Kept separate
