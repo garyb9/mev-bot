@@ -37,7 +37,8 @@ SHIM_DIR="$STATE_DIR/ssd-cfg"
 SENTINEL="$REC_DIR/.mev-rec-root"
 BIN="$REPO_ROOT/target/release/hl"
 PROFILE="default"
-MIN_FREE_GB=200
+MIN_FREE_GB=200            # required to START
+WATCHDOG_MIN_FREE_GB=50    # watchdog floor; below the profile's min_free_gb=100 guard
 PROFILE_FILE="$REPO_ROOT/config/record-ssd.toml"
 
 CHECK_REASON=""
@@ -61,6 +62,7 @@ USAGE
 # Re-verify that /mnt/e is the real external SSD. Creates NOTHING. Returns 0 on
 # success; on failure sets CHECK_REASON to a human-readable cause and returns 1.
 check_mount() {
+    local min_free="${1:-$MIN_FREE_GB}"
     CHECK_REASON=""
     if [[ ! -d "$MOUNT" ]]; then
         CHECK_REASON="$MOUNT does not exist"
@@ -101,8 +103,8 @@ check_mount() {
         CHECK_REASON="could not read free space for $MOUNT"
         return 1
     fi
-    if (( avail < MIN_FREE_GB )); then
-        CHECK_REASON="$MOUNT has ${avail}G free (< ${MIN_FREE_GB}G required)"
+    if (( avail < min_free )); then
+        CHECK_REASON="$MOUNT has ${avail}G free (< ${min_free}G required)"
         return 1
     fi
     return 0
@@ -160,9 +162,16 @@ cmd_start() {
         exit 1
     fi
     if [[ ! -d "$REC_DIR" ]]; then
+        check_mount || { echo "run-ssd.sh: mount lost before mkdir: $CHECK_REASON" >&2; exit 1; }
         mkdir "$REC_DIR"
     fi
 
+    # Re-verify right before writing the sentinel: a disconnect between the
+    # preflight and the mkdir must not leave a sentinel on the root disk.
+    if ! check_mount; then
+        echo "run-ssd.sh: mount lost before sentinel write: $CHECK_REASON" >&2
+        exit 1
+    fi
     local source
     source="$(findmnt -no SOURCE "$MOUNT")"
     printf '%s %s\n' "$source" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SENTINEL"
@@ -212,7 +221,7 @@ watchdog() {
     local rec_pid="$1"
     local reason=""
     while :; do
-        if ! check_mount; then
+        if ! check_mount "$WATCHDOG_MIN_FREE_GB"; then
             reason="$CHECK_REASON"
             break
         fi
