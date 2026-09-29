@@ -189,7 +189,7 @@ impl RawWsConn {
             metrics_src: src,
             pending_reconnect: false,
         };
-        conn.resubscribe().await?;
+        send_subscriptions(&mut conn.socket, &*conn.protocol, &conn.subscriptions).await?;
         metrics::counter!(names::WS_RECONNECTS, "src" => src, "reason" => "open").increment(1);
         metrics::gauge!(names::WS_CONNECTED, "src" => src).set(1.0);
         Ok(conn)
@@ -205,31 +205,25 @@ impl RawWsConn {
         self.last_data.elapsed().as_millis()
     }
 
-    async fn resubscribe(&mut self) -> Result<()> {
-        let subs = self.subscriptions.clone();
-        for sub in &subs {
-            let frame = self.protocol.subscribe_frame(sub);
-            self.socket
-                .send(Message::Text(frame.into()))
-                .await
-                .map_err(|e| Error::Http(e.to_string()))?;
-        }
-        Ok(())
-    }
-
     /// Dial with full-jitter backoff until a connection opens or shutdown is
     /// requested. Returns `Ok(())` on reconnect and `Err` on shutdown.
     ///
-    /// The attempt counter is reset only after a **healthy** connection: at
-    /// entry, if the previous connection had been up for [`HEALTHY_AFTER`],
-    /// backoff restarts at the minimum. Otherwise it keeps growing, so a host
-    /// that accepts and immediately drops cannot pin the backoff low.
+    /// The attempt counter is reset only after a **healthy** connection: a
+    /// drop that follows a run of at least [`HEALTHY_AFTER`] resets it in
+    /// [`RawWsConn::gap_now`] (at the drop, before the first retry). Otherwise
+    /// it keeps growing, so a host that accepts and immediately drops cannot
+    /// pin the backoff low. Resetting at the drop — a single synchronous step —
+    /// rather than here means a reconnect future that is cancelled and
+    /// restarted does not re-run the reset and cannot pin the backoff low.
+    ///
+    /// Cancel safety: the new socket is built in locals and every field is
+    /// committed in one synchronous step at the end, only after the full
+    /// subscription set has been sent. If this future is dropped mid-attempt,
+    /// `self` still points at the previous socket and `self.attempt` keeps its
+    /// last increment, so the next call redials and resubscribes from scratch
+    /// without ever exposing a partially-subscribed live socket.
     async fn reconnect(&mut self) -> Result<()> {
         metrics::gauge!(names::WS_CONNECTED, "src" => self.metrics_src).set(0.0);
-        // Reset the attempt counter after a healthy run.
-        if self.opened_at.elapsed() >= HEALTHY_AFTER {
-            self.attempt = 0;
-        }
         loop {
             self.attempt = self.attempt.saturating_add(1);
             let backoff = jittered_backoff(self.attempt);
@@ -240,21 +234,20 @@ impl RawWsConn {
                 _ = tokio::time::sleep(backoff) => {}
             }
 
-            let socket = match dial(&self.protocol.url()).await {
+            let mut socket = match dial(&self.protocol.url()).await {
                 Ok(socket) => socket,
                 Err(err) => {
                     tracing::warn!(attempt = self.attempt, error = %err, "websocket reconnect failed");
                     continue;
                 }
             };
-            self.socket = socket;
-            let now = Instant::now();
-            self.last_data = now;
-            self.opened_at = now;
             // A resubscribe send failure means this connection is unusable:
             // treat it as another failed attempt and keep backing off, instead
-            // of terminating the stream.
-            if let Err(err) = self.resubscribe().await {
+            // of terminating the stream. Send on the local socket so a cancel
+            // in here drops the partial connection and leaves `self` untouched.
+            if let Err(err) =
+                send_subscriptions(&mut socket, &*self.protocol, &self.subscriptions).await
+            {
                 tracing::warn!(
                     attempt = self.attempt,
                     error = %err,
@@ -262,6 +255,12 @@ impl RawWsConn {
                 );
                 continue;
             }
+            // The connection is fully usable now: commit it and every piece of
+            // per-connection bookkeeping in one synchronous step.
+            let now = Instant::now();
+            self.socket = socket;
+            self.last_data = now;
+            self.opened_at = now;
             self.next_ping = now + self.ping_interval;
             metrics::counter!(
                 names::WS_RECONNECTS,
@@ -281,12 +280,18 @@ impl RawWsConn {
     /// any reconnect attempt), then performs the reconnect on the following
     /// call and yields [`RawEvent::Opened`] once it is back. On shutdown it
     /// returns `Err`.
+    ///
+    /// Cancel safety: the reconnect branch clears `pending_reconnect` only
+    /// after [`RawWsConn::reconnect`] returns `Ok`, so a dropped future leaves
+    /// the reconnect pending. The next call retries the reconnect and still
+    /// yields exactly one `Opened`, never a second `Gap` for the same outage.
     pub async fn next(&mut self) -> Result<RawEvent> {
         if self.pending_reconnect {
             // A `Gap` was returned by the previous call: reconnect now (with
-            // backoff, resubscribe retries, and shutdown interruption).
-            self.pending_reconnect = false;
+            // backoff, resubscribe retries, and shutdown interruption). Clear
+            // the flag only once the reconnect really succeeded.
             self.reconnect().await?;
+            self.pending_reconnect = false;
             return Ok(RawEvent::Opened {
                 attempt: self.attempt,
             });
@@ -368,6 +373,13 @@ impl RawWsConn {
         // The socket is already down; reflect it immediately rather than when
         // the reconnect starts on the next call.
         metrics::gauge!(names::WS_CONNECTED, "src" => self.metrics_src).set(0.0);
+        // Reset the attempt counter after a healthy run, exactly once per
+        // outage. Doing it here (synchronous, at the drop) instead of inside
+        // `reconnect` means a cancelled-and-restarted reconnect cannot re-run
+        // the reset and so cannot pin the backoff low.
+        if self.opened_at.elapsed() >= HEALTHY_AFTER {
+            self.attempt = 0;
+        }
         self.pending_reconnect = true;
         tracing::debug!(reason, detail, "websocket gap detected");
         RawEvent::Gap {
@@ -417,6 +429,27 @@ pub(crate) fn set_tcp_nodelay(stream: &MaybeTlsStream<TcpStream>) -> Result<()> 
         .get_ref()
         .set_nodelay(true)
         .map_err(|e| Error::Http(format!("failed to set TCP_NODELAY: {e}")))
+}
+
+/// Send the full subscription set over `socket` (SPEC-0008 §7.5).
+///
+/// Free rather than a method on [`RawWsConn`] so a reconnect can resubscribe a
+/// **local** socket before committing it to the struct, which keeps
+/// [`RawWsConn::next`] cancel-safe: dropping the future drops the partial
+/// connection instead of leaving it live with only some subscriptions.
+async fn send_subscriptions(
+    socket: &mut Socket,
+    protocol: &dyn Protocol,
+    subscriptions: &[String],
+) -> Result<()> {
+    for sub in subscriptions {
+        let frame = protocol.subscribe_frame(sub);
+        socket
+            .send(Message::Text(frame.into()))
+            .await
+            .map_err(|e| Error::Http(e.to_string()))?;
+    }
+    Ok(())
 }
 
 async fn dial(url: &str) -> Result<Socket> {
@@ -734,10 +767,11 @@ mod tests {
     }
 
     /// A drop is announced at once, before any reconnect: with the server
-    /// refusing connections for 2 s, the `Gap` must arrive almost immediately
-    /// and `Opened` must be the later call.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// refusing connections for 2 s of logical time, the `Gap` arrives without
+    /// advancing the clock and `Opened` is the later call (SPEC-0008 RW-2).
+    #[tokio::test(start_paused = true)]
     async fn gap_is_immediate_and_opened_after_the_reconnect() {
+        const REFUSAL: Duration = Duration::from_secs(2);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -747,9 +781,9 @@ mod tests {
             ws.send(Message::Text("hello".into())).await.unwrap();
             ws.close(None).await.unwrap();
             drop(ws);
-            // Refuse the next reconnect for 2 s by delaying the handshake.
+            // Refuse the next reconnect by delaying the handshake.
             let (stream, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(REFUSAL).await;
             let mut ws = accept_async(stream).await.unwrap();
             while let Some(Ok(_)) = ws.next().await {}
         });
@@ -757,47 +791,53 @@ mod tests {
             protocol(format!("ws://{addr}")),
             vec![],
             Duration::from_secs(3_600),
-            Duration::from_secs(30),
+            Duration::from_secs(3_600),
         )
         .await
         .unwrap();
         let _ = conn.next().await.unwrap(); // the hello
 
+        // The drop is announced at the drop: no logical time may pass.
         let started = Instant::now();
         let gap = conn.next().await.unwrap();
-        let gap_ms = started.elapsed();
+        let gap_waited = started.elapsed();
         match gap {
             RawEvent::Gap { ref reason, .. } => assert_eq!(reason, "closed"),
             other => panic!("expected a gap, got {other:?}"),
         }
-        assert!(
-            gap_ms < Duration::from_millis(200),
-            "the gap took {gap_ms:?}; it must be announced at the drop, not after the reconnect"
+        assert_eq!(
+            gap_waited,
+            Duration::ZERO,
+            "the gap waited {gap_waited:?}; it must be announced at the drop, not after the reconnect"
         );
 
-        // The reconnect happens on the next call, after the 2 s refusal.
+        // The reconnect happens on the next call, after the refusal.
         let reopen_started = Instant::now();
         let opened = conn.next().await.unwrap();
         assert!(matches!(opened, RawEvent::Opened { .. }), "{opened:?}");
         assert!(
-            reopen_started.elapsed() >= Duration::from_millis(1_500),
+            reopen_started.elapsed() >= REFUSAL,
             "Opened arrived before the server let the reconnect through"
         );
     }
 
-    /// `Gap` carries the disconnect wall-clock and monotonic times, taken
-    /// before the reconnect, so an outage can be bracketed by at least the
-    /// server's known downtime. This fails if the timestamp were taken after
-    /// the reconnect.
+    /// `Gap` carries the disconnect wall-clock and monotonic times, taken at the
+    /// instant the drop is detected, before any reconnect. This fails if the
+    /// stamp is taken at the `next()` call (too early), after the reconnect
+    /// (too late), or at the reconnect call.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gap_carries_the_disconnect_time() {
-        const DOWNTIME: Duration = Duration::from_millis(400);
+        const DROP_DELAY: Duration = Duration::from_millis(500);
+        const DOWNTIME: Duration = Duration::from_millis(500);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
+            // The connection stays up for DROP_DELAY, so a stamp taken at
+            // `next()`-entry would predate the real drop by that much.
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
             ws.send(Message::Text("hello".into())).await.unwrap();
+            tokio::time::sleep(DROP_DELAY).await;
             ws.close(None).await.unwrap();
             drop(ws);
             let (stream, _) = listener.accept().await.unwrap();
@@ -809,13 +849,17 @@ mod tests {
             protocol(format!("ws://{addr}")),
             vec![],
             Duration::from_secs(3_600),
-            Duration::from_secs(30),
+            Duration::from_secs(3_600),
         )
         .await
         .unwrap();
         let _ = conn.next().await.unwrap(); // the hello
 
+        // Stamp the monotonic clock at `next()`-entry: the drop is DROP_DELAY
+        // later, so a stamp taken at entry would be too early.
+        let entry_ns = mono_ns();
         let gap = conn.next().await.unwrap();
+        let after_gap_ns = mono_ns();
         let RawEvent::Gap {
             reason,
             disconnect_ns,
@@ -827,19 +871,197 @@ mod tests {
         };
         assert_eq!(reason, "closed");
         assert!(disconnect_ns > 0);
+        assert!(
+            disconnect_ns >= entry_ns + DROP_DELAY.as_nanos() as u64 / 2,
+            "disconnect_ns {disconnect_ns} was stamped at the next() call, before the drop at entry+{DROP_DELAY:?}"
+        );
+        assert!(
+            disconnect_ns <= after_gap_ns,
+            "disconnect_ns was stamped after the gap was observed"
+        );
         let wall_gap_ns = t_ns;
         assert!(wall_gap_ns > 0);
 
-        // The reconnect completes DOWNTIME later; `t_ns` must predate that by
-        // roughly the downtime (this fails if the stamp were taken after).
+        // The reconnect completes at least DOWNTIME later; the stamp must
+        // predate it and not be taken at the reconnect call.
+        let reconnect_entry_ns = mono_ns();
         let opened = conn.next().await.unwrap();
         assert!(matches!(opened, RawEvent::Opened { .. }));
-        let after_reconnect_ns = now_ns();
-        let measured = Duration::from_nanos((after_reconnect_ns - wall_gap_ns).max(0) as u64);
+        let after_reconnect_ns = mono_ns();
         assert!(
-            measured >= DOWNTIME.mul_f64(0.6),
-            "gap t_ns was stamped too late: measured outage {measured:?}"
+            disconnect_ns < reconnect_entry_ns,
+            "disconnect_ns was stamped at the reconnect call"
         );
+        let measured = Duration::from_nanos(after_reconnect_ns.saturating_sub(disconnect_ns));
+        assert!(
+            measured >= DOWNTIME.mul_f64(0.5),
+            "the gap did not cover the outage: {measured:?}"
+        );
+        let wall_measured = Duration::from_nanos((now_ns() - wall_gap_ns).max(0) as u64);
+        assert!(
+            wall_measured >= DOWNTIME.mul_f64(0.5),
+            "gap t_ns was stamped too late: measured outage {wall_measured:?}"
+        );
+    }
+
+    /// Cancelling `next()` mid-reconnect (as `run_ws_conn`'s 60 s tick does)
+    /// must not produce a second `Gap` for the same outage, must not reset the
+    /// backoff attempt counter, and must still yield exactly one `Opened` when
+    /// the server returns (SPEC-0008 RW-3).
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_reconnect_yields_one_gap_and_keeps_backoff() {
+        const REFUSAL: Duration = Duration::from_secs(180);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepts_task = accepts.clone();
+        tokio::spawn(async move {
+            // Round 0: normal connection, read the subscribe, close (the outage
+            // begins).
+            let (stream, _) = listener.accept().await.unwrap();
+            accepts_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut ws = accept_async(stream).await.unwrap();
+            let _ = ws.next().await;
+            ws.close(None).await.ok();
+            drop(ws);
+            // Refuse every dial for REFUSAL of logical time, then keep serving
+            // whatever the client dials next (a tick may cancel a dial mid
+            // handshake, so do not bind the server to one socket).
+            let deadline = tokio::time::Instant::now() + REFUSAL;
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepts_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if tokio::time::Instant::now() < deadline {
+                    drop(stream);
+                    continue;
+                }
+                if let Ok(mut ws) = accept_async(stream).await {
+                    while let Some(Ok(_)) = ws.next().await {}
+                }
+            }
+        });
+        let mut conn = RawWsConn::connect_with(
+            protocol(format!("ws://{addr}")),
+            vec!["s".to_string()],
+            Duration::from_secs(3_600),
+            Duration::from_secs(3_600),
+        )
+        .await
+        .unwrap();
+
+        // Drive the connection like run_ws_conn: a 60 s tick races next() and
+        // drops the in-flight reconnect whenever it fires.
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.tick().await; // consume the immediate tick
+        let mut gaps = 0u32;
+        let mut opened = None;
+        for _ in 0..10_000 {
+            tokio::select! {
+                _ = tick.tick() => {}
+                event = conn.next() => match event.unwrap() {
+                    RawEvent::Gap { .. } => gaps += 1,
+                    RawEvent::Opened { attempt } => {
+                        opened = Some(attempt);
+                        break;
+                    }
+                    _ => {}
+                },
+            }
+        }
+        let attempt = opened.expect("no Opened after the outage");
+        assert_eq!(gaps, 1, "a cancelled reconnect emitted another Gap");
+        let accepts = accepts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            accepts >= 3,
+            "expected several refused dials, got {accepts}"
+        );
+        assert!(
+            attempt >= accepts as u32,
+            "the backoff attempt counter was reset: attempt {attempt} < {accepts} dials"
+        );
+    }
+
+    /// Cancelling `next()` between assigning the new socket and finishing the
+    /// resubscribe must not leave a live socket with only some subscriptions:
+    /// the next call redials and (re)subscribes the full set, then yields
+    /// `Opened` (SPEC-0008 RW-3).
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_resubscribe_leaves_no_partial_subscriptions() {
+        use tokio::sync::Notify;
+        use tokio::sync::mpsc;
+
+        const N: usize = 1024;
+        // ~4 KiB per subscription, so the reconnect's resubscribe cannot finish
+        // while the server reads only the first frame: the writes fill the
+        // socket buffers and the future parks, exactly the cancel window.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first_sub_tx, mut first_sub_rx) = mpsc::unbounded_channel::<()>();
+        let (full_tx, mut full_rx) = mpsc::unbounded_channel::<usize>();
+        let round1_go = std::sync::Arc::new(Notify::new());
+        let round1_go_task = round1_go.clone();
+        tokio::spawn(async move {
+            // Round 0: read the full subscribe set, then close.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            for _ in 0..N {
+                let _ = ws.next().await;
+            }
+            ws.close(None).await.ok();
+            drop(ws);
+            // Round 1: handshake, read exactly one subscribe frame, signal the
+            // test to cancel, then stop reading and wait to be released.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            if let Some(Ok(_)) = ws.next().await {
+                let _ = first_sub_tx.send(());
+            }
+            round1_go_task.notified().await;
+            drop(ws);
+            // Round 2: the recovered connection must see the full set.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let mut count = 0usize;
+            while let Some(Ok(Message::Text(_))) = ws.next().await {
+                count += 1;
+                if count == N {
+                    let _ = full_tx.send(count);
+                }
+            }
+        });
+
+        let subs: Vec<String> = (0..N)
+            .map(|i| format!("{i}:{}", "x".repeat(4 * 1024)))
+            .collect();
+        let mut conn = RawWsConn::connect_with(
+            protocol(format!("ws://{addr}")),
+            subs,
+            Duration::from_secs(3_600),
+            Duration::from_secs(3_600),
+        )
+        .await
+        .unwrap();
+
+        // The initial close produces the outage that triggers the reconnect.
+        let gap = conn.next().await.unwrap();
+        assert!(matches!(gap, RawEvent::Gap { .. }), "{gap:?}");
+
+        // Reconnect until the server has read one subscribe frame, then cancel.
+        {
+            let fut = conn.next();
+            tokio::pin!(fut);
+            tokio::select! {
+                _ = first_sub_rx.recv() => {}
+                event = &mut fut => panic!("reconnect completed before the cancel: {event:?}"),
+            }
+        }
+        round1_go.notify_one();
+
+        // Recovery: the client must redial and resubscribe the full set.
+        let opened = conn.next().await.unwrap();
+        assert!(matches!(opened, RawEvent::Opened { .. }), "{opened:?}");
+        let count = full_rx.recv().await.expect("the full subscribe set");
+        assert_eq!(count, N, "the recovered socket was missing subscriptions");
     }
 
     /// A host that accepts then resets every connection must not terminate the

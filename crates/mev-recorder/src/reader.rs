@@ -743,7 +743,17 @@ impl CoverageAcc {
             self.seg_max = Some(self.seg_max.map_or(env.t_ns, |t| t.max(env.t_ns)));
         }
         match env.kind {
-            Kind::GapStart => self.open_gap = Some(env.t_ns),
+            Kind::GapStart => {
+                // A second `gap_start` with no `gap_end` between (for example a
+                // `shutdown` arriving mid-outage) closes the current gap at the
+                // new start before opening it, matching the Python
+                // `_GapTracker._open`. Overwriting the start instead would
+                // count `[disconnect, shutdown)` as covered.
+                if let Some(start) = self.open_gap {
+                    self.gaps.push((start, env.t_ns.max(start)));
+                }
+                self.open_gap = Some(env.t_ns);
+            }
             Kind::GapEnd => {
                 if let Some(start) = self.open_gap.take() {
                     self.gaps.push((start, env.t_ns));
@@ -1247,6 +1257,68 @@ mod tests {
         let inspected = inspect(&files).unwrap();
         assert_eq!(inspected.gap_count, 1);
         assert_eq!(inspected.gap_total_ms, 25);
+    }
+
+    /// A shutdown during an open gap emits a second `gap_start` with no
+    /// `gap_end`. The reader must close the first gap at the shutdown, so
+    /// `[disconnect, shutdown)` stays a gap, matching the Python
+    /// `_GapTracker._open` (SPEC-0008 RW-3).
+    #[test]
+    fn verify_keeps_a_shutdown_gap_closed_at_the_shutdown() {
+        let tmp = temp_dir("coverage-shutdown");
+        let dir = tmp.path();
+        let base = 1_767_227_400_000_000_000i64; // 2026-01-01T00:30:00Z
+        // A 40 s segment: a frame at the start, a `closed` gap at +20 s, then a
+        // `shutdown` gap at +40 s with no `gap_end`.
+        let envelopes = vec![
+            Envelope::frame(
+                &FixedEnvelopeClock::new(base, 0),
+                "hl-ws",
+                "hl-ws-01",
+                0,
+                "a",
+            ),
+            Envelope::gap_start_at(
+                "hl-ws",
+                "hl-ws-01",
+                1,
+                base + 20_000_000_000,
+                0,
+                "closed",
+                "server closed",
+            ),
+            Envelope::gap_start_at(
+                "hl-ws",
+                "hl-ws-01",
+                2,
+                base + 40_000_000_000,
+                0,
+                "shutdown",
+                "shutdown requested",
+            ),
+        ];
+        write_segment(
+            dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            base,
+            &envelopes,
+            false,
+        );
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert_eq!(report.coverage.len(), 1);
+        // Only [base, base+20 s) is covered; the whole [20 s, 40 s) is a gap.
+        assert_eq!(
+            report.coverage[0].covered_ms, 20_000,
+            "the [disconnect, shutdown) window was counted as covered"
+        );
     }
 
     #[test]
