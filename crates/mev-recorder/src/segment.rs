@@ -43,21 +43,34 @@ pub enum SegmentError {
 }
 
 /// Whether an I/O error means the segment's device or file vanished, which must
-/// stop the stream rather than be retried (R-14 §4).
+/// stop the stream rather than be retried (R-14 fix1 §5).
+///
+/// Errnos that a lost mount returns directly stop immediately. Any other write
+/// error also stops when the mount probe itself fails: the probe is the
+/// authority, so a fresh EACCES/ENOSPC on a vanished mount is caught too. The
+/// probe runs only on an actual write error, never per envelope.
 #[cfg(unix)]
-fn is_mount_io_error(err: &SegmentError) -> bool {
+fn is_lost_mount(err: &SegmentError, guard: &MountGuard) -> bool {
     let SegmentError::Io(io) = err else {
         return false;
     };
-    matches!(
+    if matches!(
         io.raw_os_error(),
-        Some(libc::EIO) | Some(libc::ENOENT) | Some(libc::ENODEV)
-    )
+        Some(libc::EIO)
+            | Some(libc::ENOENT)
+            | Some(libc::ENODEV)
+            | Some(libc::ENOTCONN)
+            | Some(libc::ESTALE)
+            | Some(libc::EACCES)
+    ) {
+        return true;
+    }
+    guard.check().is_err()
 }
 
 #[cfg(not(unix))]
-fn is_mount_io_error(_err: &SegmentError) -> bool {
-    false
+fn is_lost_mount(_err: &SegmentError, guard: &MountGuard) -> bool {
+    guard.check().is_err()
 }
 
 /// A source of free-disk-space measurements, injectable for tests.
@@ -344,13 +357,7 @@ impl WriterState {
             match OpenSegment::create(&self.config, &env, start_t_ns) {
                 Ok(seg) => self.current = Some(seg),
                 Err(SegmentError::Mount(err)) => {
-                    warn!(
-                        src = %self.config.src,
-                        conn = %self.config.conn,
-                        error = %err,
-                        "mount guard refused a new segment; stopping stream"
-                    );
-                    self.stop_for_mount();
+                    self.stop_for_mount(&err.to_string());
                     return Ok(());
                 }
                 Err(err) => return Err(err),
@@ -359,14 +366,8 @@ impl WriterState {
         if let Some(seg) = &mut self.current
             && let Err(err) = seg.write_raw(&line, &env)
         {
-            if is_mount_io_error(&err) {
-                warn!(
-                    src = %self.config.src,
-                    conn = %self.config.conn,
-                    error = %err,
-                    "write failed on the recording mount; stopping stream"
-                );
-                self.stop_for_mount();
+            if is_lost_mount(&err, &self.config.mount_guard) {
+                self.stop_for_mount(&err.to_string());
                 return Ok(());
             }
             return Err(err);
@@ -385,13 +386,7 @@ impl WriterState {
         {
             self.last_mount_check = Instant::now();
             if let Err(err) = self.config.mount_guard.check_or_trip() {
-                warn!(
-                    src = %self.config.src,
-                    conn = %self.config.conn,
-                    error = %err,
-                    "mount guard tripped; stopping stream"
-                );
-                self.stop_for_mount();
+                self.stop_for_mount(&err.to_string());
                 return;
             }
         }
@@ -412,14 +407,8 @@ impl WriterState {
         if self.last_flush.elapsed() >= self.config.flush_interval
             && let Err(err) = self.flush()
         {
-            if is_mount_io_error(&err) {
-                warn!(
-                    src = %self.config.src,
-                    conn = %self.config.conn,
-                    error = %err,
-                    "flush failed on the recording mount; stopping stream"
-                );
-                self.stop_for_mount();
+            if is_lost_mount(&err, &self.config.mount_guard) {
+                self.stop_for_mount(&err.to_string());
                 return;
             }
             error!(error = %err, "segment flush failed");
@@ -479,7 +468,7 @@ impl WriterState {
     /// The open segment is then dropped without finalizing: finalization is
     /// path-based (`fsync` + rename + manifest) and would risk the wrong disk,
     /// so the leftover `.partial` is left for crash recovery on the next start.
-    fn stop_for_mount(&mut self) {
+    fn stop_for_mount(&mut self, detail: &str) {
         if self.stopped {
             return;
         }
@@ -502,6 +491,14 @@ impl WriterState {
                 debug!(error = %err, "failed to write mount gap record");
             }
         }
+        // Exactly one warning per stream; later envelopes are dropped silently
+        // because `stopped` short-circuits `write` (R-14 fix1 §5).
+        warn!(
+            src = %self.config.src,
+            conn = %self.config.conn,
+            detail,
+            "mount guard tripped; stopping stream"
+        );
         self.current = None;
     }
 
@@ -1382,16 +1379,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mount_io_errors_are_recognized() {
-        for code in [libc::EIO, libc::ENOENT, libc::ENODEV] {
+    fn lost_mount_io_errors_are_recognized() {
+        let guard = MountGuard::unguarded();
+        for code in [
+            libc::EIO,
+            libc::ENOENT,
+            libc::ENODEV,
+            libc::ENOTCONN,
+            libc::ESTALE,
+            libc::EACCES,
+        ] {
             let err = SegmentError::Io(io::Error::from_raw_os_error(code));
-            assert!(is_mount_io_error(&err), "errno {code} not recognized");
+            assert!(is_lost_mount(&err, &guard), "errno {code} not recognized");
         }
+        // A non-mount error with a healthy (unguarded) probe is not a loss.
         let other = SegmentError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "no"));
-        assert!(!is_mount_io_error(&other));
-        let encode = SegmentError::Mount(MountError::Missing {
+        assert!(!is_lost_mount(&other, &guard));
+        let mount_err = SegmentError::Mount(MountError::Missing {
             mount: PathBuf::from("/mnt/e"),
         });
-        assert!(!is_mount_io_error(&encode));
+        assert!(!is_lost_mount(&mount_err, &guard));
+    }
+
+    #[test]
+    fn any_write_error_is_a_loss_when_the_probe_fails() {
+        let tmp = temp_dir("lost-probe");
+        let mount = tmp.path();
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let (probe, guard, _cfg) = guarded_config(mount, clock);
+        probe.set_mounted(false);
+        // An error that is not a lost-mount errno still trips when the probe
+        // says the mount is gone.
+        let other = SegmentError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "gone"));
+        assert!(is_lost_mount(&other, &guard));
     }
 }

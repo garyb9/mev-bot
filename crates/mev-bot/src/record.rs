@@ -68,6 +68,9 @@ const FUNDING_BACKFILL_DAYS: u64 = 30;
 const CANDLE_BACKFILL_DAYS: u64 = 7;
 /// Maximum `fundingHistory` items returned by one call (SPEC-0008 §8, V-1).
 const FUNDING_MAX_PAGE: u32 = 500;
+/// Upper bound on one mount probe run from the async watchdog (R-14 fix1 §4).
+/// A probe that exceeds it is a failed check and trips the guard.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Configuration (config/record.toml)
@@ -96,6 +99,9 @@ struct Profile {
     /// set, startup fails unless it is a real mount and `out_dir` is inside it,
     /// and the stream stops if the mount disappears. Unset = current behaviour.
     require_mount: Option<PathBuf>,
+    /// Optional mount source (e.g. `E:\`) that `require_mount` must also match,
+    /// case-insensitively (R-14 fix1 §7). Ignored unless `require_mount` is set.
+    require_mount_source: Option<String>,
     /// Local retention in days (applied by R-10 shipping, not yet here).
     #[allow(dead_code)]
     retain_days: u64,
@@ -125,6 +131,7 @@ impl Default for Profile {
             zstd_level: 3,
             min_free_gb: 20,
             require_mount: None,
+            require_mount_source: None,
             retain_days: 30,
             meta_refresh_secs: 300,
             http_port: 9091,
@@ -426,11 +433,12 @@ pub async fn run(
 
     // Fail fast, before any network access or directory creation, if the
     // required recording mount is not a real mount or `out_dir` escapes it
-    // (R-14 §1). `create_dir_all` below runs only after this passes.
-    let mount_guard = Arc::new(MountGuard::new(
-        profile.require_mount.clone(),
-        Arc::new(SystemMountProbe),
-    ));
+    // (R-14 §1). `out_dir` is not created until after the network metadata
+    // load, so it is re-validated immediately before creation (R-14 fix1 §3).
+    let mount_guard = Arc::new(
+        MountGuard::new(profile.require_mount.clone(), Arc::new(SystemMountProbe))
+            .with_source(profile.require_mount_source.clone()),
+    );
     mount_guard
         .validate_startup(&profile.out_dir)
         .context("validating the recording profile require_mount")?;
@@ -453,8 +461,10 @@ pub async fn run(
         Some(&universe.spot_meta),
     )?;
 
-    std::fs::create_dir_all(&profile.out_dir)
-        .with_context(|| format!("creating {}", profile.out_dir.display()))?;
+    // The mount was verified before the (seconds-long) network metadata load;
+    // re-check and create `out_dir` as a direct child of the verified mount,
+    // never `create_dir_all` along a path that may have become the root disk.
+    create_out_dir(&profile.out_dir, &mount_guard)?;
 
     let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
     let meta = SegmentOpenMeta {
@@ -535,7 +545,7 @@ pub async fn run(
             ))
             .context("spawning segment writer for hl-rest")?,
         );
-        let snapshotter = snapshotter_config(&profile, &plan, network)?;
+        let snapshotter = snapshotter_config(&profile, &plan, network, mount_guard.clone())?;
         tasks.push(tokio::spawn(run_rest(
             snapshotter,
             writer,
@@ -601,8 +611,6 @@ pub async fn run(
     if let Some(Ok(Err(err))) = serve_result {
         warn!(error = %err, "http server stopped with an error");
     }
-    // A writer may have tripped the guard just before the signal arrived.
-    let mount_tripped = mount_tripped || mount_guard.is_tripped();
 
     info!("shutdown requested; finalizing recorder");
     let _ = shutdown_tx.send(true);
@@ -612,21 +620,71 @@ pub async fn run(
         let _ = task.await;
     }
 
-    if mount_tripped {
-        // All writers have stopped; make the process exit non-zero rather than
-        // silently recording to a fallback location (there is none).
+    // Re-read the guard AFTER every task has stopped: a writer can trip inside
+    // its final `finish()` while a SIGTERM was racing, and that must still
+    // produce a non-zero exit (R-14 fix1 §2).
+    if let Err(err) = recorder_exit(mount_tripped, &mount_guard) {
         serve_task.abort();
-        let mount = mount_guard
-            .require_mount()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default();
-        bail!("require_mount `{mount}` is no longer a mount; recorder stopped");
+        return Err(err);
     }
     info!("recorder stopped");
     Ok(())
 }
 
+/// Final exit decision once every recorder task has stopped.
+///
+/// Non-zero when the mount guard tripped at any point, whether the async
+/// watchdog caught it or a writer tripped during its shutdown finalize.
+fn recorder_exit(mount_tripped: bool, guard: &MountGuard) -> Result<()> {
+    if mount_tripped || guard.is_tripped() {
+        let mount = guard
+            .require_mount()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        bail!("require_mount `{mount}` is no longer a mount; recorder stopped");
+    }
+    Ok(())
+}
+
+/// Create `out_dir`, taking exactly one guarded step (R-14 fix1 §3).
+///
+/// Unguarded: behaves as before (`create_dir_all`). Guarded: re-checks the
+/// mount immediately before creating and then makes `out_dir` as a direct child
+/// of the verified mount with `create_dir` — never `create_dir_all`, so a path
+/// that has become the root disk cannot have parents created along it. An
+/// existing `out_dir` is fine.
+fn create_out_dir(out_dir: &Path, guard: &MountGuard) -> Result<()> {
+    if !guard.is_guarded() {
+        return std::fs::create_dir_all(out_dir)
+            .with_context(|| format!("creating {}", out_dir.display()));
+    }
+    guard
+        .check_or_trip()
+        .context("re-checking require_mount before creating out_dir")?;
+    let mount = guard
+        .require_mount()
+        .context("require_mount missing after a successful check")?;
+    if out_dir.parent() != Some(mount) {
+        bail!(
+            "out_dir `{}` must be a direct child of require_mount `{}`",
+            out_dir.display(),
+            mount.display()
+        );
+    }
+    match std::fs::create_dir(out_dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("creating {}", out_dir.display())),
+    }
+}
+
 /// Wait until the mount guard trips, or forever when none is required.
+///
+/// The probe runs on a blocking thread under [`PROBE_TIMEOUT`]; a probe that
+/// fails or overruns is treated as a lost mount and trips the guard, so a hung
+/// filesystem cannot wedge this watchdog. The writer thread keeps a direct
+/// `stat` for its per-creation check (no per-check thread spawn there); only
+/// this async path is bounded.
 async fn wait_for_mount_stop(guard: Arc<MountGuard>) {
     if !guard.is_guarded() {
         std::future::pending::<()>().await;
@@ -636,9 +694,36 @@ async fn wait_for_mount_stop(guard: Arc<MountGuard>) {
     tick.tick().await; // consume the immediate first tick
     loop {
         tick.tick().await;
-        if guard.is_tripped() || guard.check().is_err() {
+        if guard.is_tripped() {
+            return;
+        }
+        if !probe_mount(guard.clone(), PROBE_TIMEOUT).await {
             guard.trip();
             return;
+        }
+    }
+}
+
+/// Run one mount probe on a blocking thread with a bounded wait.
+///
+/// Returns whether the mount is still healthy. A failed check or a timeout
+/// trips the guard. `timeout` is a parameter so tests can use a small bound.
+async fn probe_mount(guard: Arc<MountGuard>, timeout: Duration) -> bool {
+    let probe_guard = guard.clone();
+    let probe = tokio::task::spawn_blocking(move || probe_guard.check_or_trip().is_ok());
+    match tokio::time::timeout(timeout, probe).await {
+        Ok(Ok(healthy)) => healthy,
+        Ok(Err(_join)) => {
+            guard.trip();
+            false
+        }
+        Err(_elapsed) => {
+            warn!(
+                mount = ?guard.require_mount(),
+                "mount probe timed out; treating the mount as lost"
+            );
+            guard.trip();
+            false
         }
     }
 }
@@ -688,6 +773,7 @@ fn snapshotter_config(
     profile: &Profile,
     plan: &mev_recorder::Plan,
     network: Network,
+    mount_guard: Arc<MountGuard>,
 ) -> Result<SnapshotterConfig> {
     let now_ms = now_epoch_ms();
     let mut funding_coins = BTreeSet::new();
@@ -721,6 +807,9 @@ fn snapshotter_config(
         daily_interval: Duration::from_secs(24 * 60 * 60),
         funding_backfill_start_ms: now_ms.saturating_sub(FUNDING_BACKFILL_DAYS * 86_400_000),
         candle_backfill_start_ms: now_ms.saturating_sub(CANDLE_BACKFILL_DAYS * 86_400_000),
+        // Only guard the state file when the profile actually requires a mount;
+        // an unguarded profile keeps creating `out_dir` as before.
+        mount_guard: mount_guard.is_guarded().then_some(mount_guard),
     })
 }
 
@@ -1623,7 +1712,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mev_recorder::Subscription;
+    use mev_recorder::{MountProbe, Subscription};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use wiremock::{
@@ -1774,6 +1863,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn require_mount_source_defaults_to_unset() {
+        let config = parse_toml("[profile.default]\nnetwork = \"mainnet\"\n").unwrap();
+        assert_eq!(
+            config.profile.get("default").unwrap().require_mount_source,
+            None
+        );
+    }
+
+    #[test]
+    fn require_mount_source_parses_a_literal_windows_source() {
+        let config = parse_toml(
+            "[profile.default]\n\
+             require_mount = \"/mnt/e\"\n\
+             require_mount_source = 'E:\\'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .profile
+                .get("default")
+                .unwrap()
+                .require_mount_source
+                .as_deref(),
+            Some("E:\\")
+        );
+    }
+
     /// A tripped guard forces `/readyz` not-ready even while the connections
     /// look healthy (R-14 §2).
     #[tokio::test]
@@ -1845,6 +1962,167 @@ mod tests {
             guard.clone(),
         );
         assert!(Arc::ptr_eq(&config.mount_guard, &guard));
+    }
+
+    // -- R-14 fix1: startup, exit and probe hardening ------------------------
+
+    /// A probe whose mount device can be flipped, mirroring the recorder crate's
+    /// test fake (which is not visible from this crate).
+    struct FlipProbe {
+        mount: PathBuf,
+        mount_dev: u64,
+        host_dev: u64,
+        mounted: AtomicBool,
+    }
+
+    impl FlipProbe {
+        fn new(mount: &Path) -> Self {
+            Self {
+                mount: std::fs::canonicalize(mount).unwrap_or_else(|_| mount.to_path_buf()),
+                mount_dev: 7,
+                host_dev: 3,
+                mounted: AtomicBool::new(true),
+            }
+        }
+
+        fn set_mounted(&self, mounted: bool) {
+            self.mounted.store(mounted, Ordering::SeqCst);
+        }
+    }
+
+    impl MountProbe for FlipProbe {
+        fn stat(&self, path: &Path) -> std::io::Result<(u64, bool)> {
+            let meta = std::fs::metadata(path)?;
+            if !self.mounted.load(Ordering::SeqCst) {
+                return Ok((self.host_dev, meta.is_dir()));
+            }
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let device = if canonical.starts_with(&self.mount) {
+                self.mount_dev
+            } else {
+                self.host_dev
+            };
+            Ok((device, meta.is_dir()))
+        }
+    }
+
+    /// A probe that reports `mount` as a healthy mount but blocks on every
+    /// call, to exercise the bounded-wait path in isolation. If the timeout
+    /// were removed the probe would eventually report the mount as healthy.
+    struct SlowProbe {
+        mount: PathBuf,
+        delay: Duration,
+    }
+
+    impl MountProbe for SlowProbe {
+        fn stat(&self, path: &Path) -> std::io::Result<(u64, bool)> {
+            std::thread::sleep(self.delay);
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let device = if canonical.starts_with(&self.mount) {
+                7
+            } else {
+                3
+            };
+            Ok((device, true))
+        }
+    }
+
+    #[test]
+    fn guarded_create_out_dir_rechecks_and_creates_a_direct_child() {
+        let mount_tmp = temp_dir("create-ok");
+        let mount = mount_tmp.path().to_path_buf();
+        let out = mount.join("mev-rec");
+        let probe = Arc::new(FlipProbe::new(&mount));
+        let guard = MountGuard::new(Some(mount.clone()), probe);
+        guard.validate_startup(&out).unwrap();
+
+        create_out_dir(&out, &guard).unwrap();
+        assert!(out.is_dir(), "out_dir was not created");
+        // An existing directory is fine.
+        create_out_dir(&out, &guard).unwrap();
+        assert!(!guard.is_tripped());
+    }
+
+    #[test]
+    fn guarded_create_out_dir_refuses_when_the_mount_flips_after_validation() {
+        let mount_tmp = temp_dir("create-flip");
+        let mount = mount_tmp.path().to_path_buf();
+        let out = mount.join("mev-rec");
+        let probe = Arc::new(FlipProbe::new(&mount));
+        let guard = MountGuard::new(Some(mount.clone()), probe.clone());
+        guard.validate_startup(&out).unwrap();
+
+        // The mount disappears between the startup validation and the create.
+        probe.set_mounted(false);
+        let err = create_out_dir(&out, &guard).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("require_mount"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!out.exists(), "out_dir must not be created after a flip");
+        assert!(guard.is_tripped());
+    }
+
+    #[test]
+    fn guarded_create_out_dir_never_creates_parents() {
+        let mount_tmp = temp_dir("create-deep");
+        let mount = mount_tmp.path().to_path_buf();
+        let out = mount.join("a/b");
+        let probe = Arc::new(FlipProbe::new(&mount));
+        let guard = MountGuard::new(Some(mount.clone()), probe);
+        guard.validate_startup(&out).unwrap();
+
+        let err = create_out_dir(&out, &guard).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("direct child"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!mount.join("a").exists(), "parents must not be created");
+    }
+
+    #[test]
+    fn create_out_dir_is_unchanged_when_unguarded() {
+        let tmp = temp_dir("create-unguarded");
+        let out = tmp.path().join("nested/rec");
+        create_out_dir(&out, &MountGuard::unguarded()).unwrap();
+        assert!(out.is_dir());
+    }
+
+    /// Exit is non-zero whenever the guard tripped, including a write that
+    /// tripped it inside a writer's shutdown finalize (R-14 fix1 §2).
+    #[test]
+    fn exit_is_non_zero_when_the_guard_tripped_during_shutdown() {
+        let guard = MountGuard::unguarded();
+        assert!(recorder_exit(false, &guard).is_ok());
+        assert!(recorder_exit(true, &guard).is_err(), "explicit trip");
+
+        // A writer trips after the SIGTERM decision was taken: the post-join
+        // re-read must still fail the run.
+        guard.trip();
+        let err = recorder_exit(false, &guard).unwrap_err();
+        assert!(
+            err.to_string().contains("no longer a mount"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A probe that outruns its bound is a failed check and trips the guard
+    /// (R-14 fix1 §4).
+    #[tokio::test]
+    async fn probe_timeout_trips_the_guard() {
+        let tmp = temp_dir("probe-timeout");
+        let mount = std::fs::canonicalize(tmp.path()).unwrap();
+        let guard = Arc::new(MountGuard::new(
+            Some(mount.clone()),
+            Arc::new(SlowProbe {
+                mount,
+                delay: Duration::from_millis(150),
+            }),
+        ));
+        // The probe itself would report the mount healthy; only the bound makes
+        // this a failure.
+        assert!(!probe_mount(guard.clone(), Duration::from_millis(20)).await);
+        assert!(guard.is_tripped());
     }
 
     #[test]

@@ -23,6 +23,10 @@ min_free_gb = 20
 # re-checks it before every file/directory creation, and stops the stream (and
 # exits non-zero) if the mount disappears. Never falls back to another disk.
 # require_mount = "/mnt/e"
+# Optional: also require the mount's source (from /proc/self/mountinfo, e.g. a
+# Windows drive for WSL drvfs) to match, case-insensitively. Use a single-quoted
+# TOML literal so the backslash is not an escape: require_mount_source = 'E:\'
+# require_mount_source = 'E:\'
 retain_days = 30
 meta_refresh_secs = 300          # re-resolve universes, pick up new listings
 # Port for `/healthz`, `/readyz`, `/metrics` (SPEC-0008 §12.2). Kept separate

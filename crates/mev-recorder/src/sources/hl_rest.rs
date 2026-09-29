@@ -26,6 +26,7 @@ use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use crate::envelope::{Envelope, EnvelopeClock};
+use crate::mount_guard::MountGuard;
 use crate::segment::SegmentWriter;
 
 /// Default REST weight budget per minute (SPEC-0008 §8).
@@ -211,11 +212,37 @@ impl SnapshotterState {
 
     /// Atomically write state to `path` (temp file then rename).
     pub fn save(&self, path: &Path) -> Result<(), RestError> {
-        if let Some(parent) = path.parent() {
+        self.save_guarded(path, None)
+    }
+
+    /// Atomic save with an optional R-14 mount guard.
+    ///
+    /// When `guard` is set, nothing is written unless the required mount is
+    /// still present: a tripped guard or a failed check skips the save silently
+    /// (the failure also trips the guard). The directory is **never** created
+    /// under a guard — if it does not already exist the save is skipped, so a
+    /// disconnected drive can never recreate `out_dir` on the root disk. The
+    /// mount is checked again before the rename so a loss between the two steps
+    /// leaves the temp file on the old device instead of renaming it.
+    pub fn save_guarded(&self, path: &Path, guard: Option<&MountGuard>) -> Result<(), RestError> {
+        if let Some(guard) = guard {
+            if guard.is_tripped() || guard.check_or_trip().is_err() {
+                return Ok(());
+            }
+            match path.parent() {
+                Some(parent) if parent.is_dir() => {}
+                _ => return Ok(()),
+            }
+        } else if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let temp = path.with_extension("json.tmp");
         std::fs::write(&temp, serde_json::to_vec_pretty(self)?)?;
+        if let Some(guard) = guard
+            && (guard.is_tripped() || guard.check_or_trip().is_err())
+        {
+            return Ok(());
+        }
         std::fs::rename(&temp, path)?;
         Ok(())
     }
@@ -282,6 +309,10 @@ pub struct SnapshotterConfig {
     pub funding_backfill_start_ms: u64,
     /// `startTime` for a coin's first `candleSnapshot` fetch.
     pub candle_backfill_start_ms: u64,
+    /// Optional R-14 mount guard for the state file. When set, the state file
+    /// is only written while the required mount is present, and its directory
+    /// is never created (it must already exist).
+    pub mount_guard: Option<Arc<MountGuard>>,
 }
 
 impl Default for SnapshotterConfig {
@@ -301,6 +332,7 @@ impl Default for SnapshotterConfig {
             daily_interval: Duration::from_secs(24 * 60 * 60),
             funding_backfill_start_ms: 0,
             candle_backfill_start_ms: 0,
+            mount_guard: None,
         }
     }
 }
@@ -456,10 +488,23 @@ impl RestSnapshotter {
                 }
             }
         }
-        if let Err(err) = self.state.save(&self.config.state_path()) {
+        self.save_state();
+        debug!("rest snapshotter stopped");
+    }
+
+    /// Persist the paging state through the mount guard (R-14 fix1 §1).
+    ///
+    /// The guard is checked immediately before each file operation, and a save
+    /// that cannot be verified is skipped rather than written to a fallback
+    /// location. This is the same path used on exit, so a disconnect during
+    /// shutdown cannot recreate `out_dir` on the root disk.
+    fn save_state(&self) {
+        if let Err(err) = self.state.save_guarded(
+            &self.config.state_path(),
+            self.config.mount_guard.as_deref(),
+        ) {
             warn!(error = %err, "failed to save snapshotter state");
         }
-        debug!("rest snapshotter stopped");
     }
 
     fn initial_jobs(&self) -> Vec<Job> {
@@ -682,9 +727,7 @@ impl RestSnapshotter {
                 _ => {}
             }
             self.backoff.remove(key);
-            if let Err(err) = self.state.save(&self.config.state_path()) {
-                warn!(error = %err, "failed to save snapshotter state");
-            }
+            self.save_state();
             let caught_up = max.saturating_add(PAGE_TOLERANCE_MS) >= now_ms;
             if caught_up {
                 now + self.config.daily_interval
@@ -771,6 +814,7 @@ mod tests {
 
     use super::*;
     use crate::envelope::{Kind, SystemEnvelopeClock};
+    use crate::mount_guard::test_support::FakeMountProbe;
     use crate::reader::read_envelopes;
     use crate::segment::{SegmentConfig, SegmentWriter};
 
@@ -1069,5 +1113,90 @@ mod tests {
         assert!(state.funding_resume_ms.is_empty());
         assert!(state.candle_resume_ms.is_empty());
         assert_eq!(state.funding_start_ms("BTC", 7), 7);
+    }
+
+    // -- R-14 fix1: the state-file save must be mount-guarded ----------------
+
+    /// Guarded state-file writes must never create the directory, even when the
+    /// mount is healthy.
+    #[test]
+    fn guarded_save_never_creates_the_directory() {
+        let mount_tmp = temp_dir("save-mount-dir");
+        let out = temp_dir("save-out-dir");
+        let probe = Arc::new(FakeMountProbe::new(mount_tmp.path()));
+        let guard = MountGuard::new(Some(mount_tmp.path().to_path_buf()), probe);
+        let path = out.path().join("missing/sub/hl-rest-state.json");
+
+        SnapshotterState::default()
+            .save_guarded(&path, Some(&guard))
+            .unwrap();
+        assert!(
+            !out.path().join("missing").exists(),
+            "a guarded save must not create directories"
+        );
+    }
+
+    #[test]
+    fn guarded_save_writes_while_the_mount_is_present() {
+        let mount_tmp = temp_dir("save-mount-ok");
+        let out = temp_dir("save-out-ok");
+        let probe = Arc::new(FakeMountProbe::new(mount_tmp.path()));
+        let guard = MountGuard::new(Some(mount_tmp.path().to_path_buf()), probe);
+        let path = out.path().join("hl-rest-state.json");
+
+        SnapshotterState::default()
+            .save_guarded(&path, Some(&guard))
+            .unwrap();
+        assert!(
+            path.exists(),
+            "a guarded save must still write while mounted"
+        );
+    }
+
+    #[test]
+    fn guarded_save_creates_nothing_when_the_mount_is_gone() {
+        let mount_tmp = temp_dir("save-mount-gone");
+        let out = temp_dir("save-out-gone");
+        let probe = Arc::new(FakeMountProbe::new(mount_tmp.path()));
+        let guard = MountGuard::new(Some(mount_tmp.path().to_path_buf()), probe.clone());
+        probe.set_mounted(false);
+
+        let path = out.path().join("hl-rest-state.json");
+        SnapshotterState::default()
+            .save_guarded(&path, Some(&guard))
+            .unwrap();
+        assert!(!path.exists(), "state written while unmounted");
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+        assert!(
+            guard.is_tripped(),
+            "a failed save check must trip the guard"
+        );
+    }
+
+    /// The exit save uses the same guarded path, so a disconnect during
+    /// shutdown cannot recreate `out_dir` on the root disk.
+    #[test]
+    fn guarded_exit_save_creates_nothing_when_the_mount_is_gone() {
+        let mount_tmp = temp_dir("exit-mount");
+        let out = temp_dir("exit-out");
+        let probe = Arc::new(FakeMountProbe::new(mount_tmp.path()));
+        let guard = Arc::new(MountGuard::new(
+            Some(mount_tmp.path().to_path_buf()),
+            probe.clone(),
+        ));
+        probe.set_mounted(false);
+
+        let config = SnapshotterConfig {
+            out_dir: out.path().to_path_buf(),
+            mount_guard: Some(guard.clone()),
+            ..SnapshotterConfig::default()
+        };
+        let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
+        let snapshotter = RestSnapshotter::new(config, Arc::new(NoopSink), clock).unwrap();
+
+        snapshotter.save_state();
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+        assert!(!out.path().join("hl-rest-state.json").exists());
     }
 }

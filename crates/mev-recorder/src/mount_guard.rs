@@ -15,6 +15,7 @@
 //! braces against a same-device bind-like setup). No external commands and no
 //! `unsafe` beyond what the crate already relies on for `statvfs`.
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -26,6 +27,9 @@ use thiserror::Error;
 
 /// How often the writer re-checks a required mount while running (R-14 §4).
 pub const MOUNT_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Linux mount table read to verify `require_mount_source`.
+const MOUNTINFO: &str = "/proc/self/mountinfo";
 
 /// Errors raised by the mount guard.
 #[derive(Debug, Error)]
@@ -62,6 +66,12 @@ pub enum MountError {
         /// The configured `require_mount`.
         mount: PathBuf,
     },
+    /// `out_dir` is the mount root itself; it must be strictly inside.
+    #[error("out_dir `{mount}` is the require_mount root itself; it must be a child path")]
+    OutDirIsMount {
+        /// The configured `require_mount`, equal to `out_dir`.
+        mount: PathBuf,
+    },
     /// `out_dir` canonicalizes to a path outside `require_mount`.
     #[error("out_dir `{out_dir}` escapes require_mount `{mount}` (canonical path `{canonical}`)")]
     SymlinkEscape {
@@ -71,6 +81,27 @@ pub enum MountError {
         mount: PathBuf,
         /// The canonicalized path that left the mount.
         canonical: PathBuf,
+    },
+    /// `require_mount_source` was set but the mount table could not be read or
+    /// the mount point was not listed (a parse/read failure is a failed check).
+    #[error("require_mount_source `{expected}` could not be verified for `{mount}`: {detail}")]
+    SourceUnreadable {
+        /// The configured mount path.
+        mount: PathBuf,
+        /// The configured expected source.
+        expected: String,
+        /// Why the source could not be read.
+        detail: String,
+    },
+    /// The mount's source does not match `require_mount_source`.
+    #[error("require_mount `{mount}` source is `{actual}`, expected `{expected}`")]
+    SourceMismatch {
+        /// The configured mount path.
+        mount: PathBuf,
+        /// The configured expected source.
+        expected: String,
+        /// The source reported by the mount table.
+        actual: String,
     },
     /// A filesystem inspection failed.
     #[error("mount check i/o error at `{path}`: {source}")]
@@ -116,8 +147,19 @@ impl MountProbe for SystemMountProbe {
 /// exactly as before R-14.
 pub struct MountGuard {
     require_mount: Option<PathBuf>,
+    require_source: Option<String>,
     probe: Arc<dyn MountProbe>,
     tripped: AtomicBool,
+}
+
+impl fmt::Debug for MountGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MountGuard")
+            .field("require_mount", &self.require_mount)
+            .field("require_source", &self.require_source)
+            .field("tripped", &self.is_tripped())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MountGuard {
@@ -126,6 +168,7 @@ impl MountGuard {
     pub fn new(require_mount: Option<PathBuf>, probe: Arc<dyn MountProbe>) -> Self {
         Self {
             require_mount,
+            require_source: None,
             probe,
             tripped: AtomicBool::new(false),
         }
@@ -136,9 +179,23 @@ impl MountGuard {
         Self::new(None, Arc::new(SystemMountProbe))
     }
 
+    /// Also require the mount's source (from the mount table) to match,
+    /// case-insensitively and ignoring trailing separators (R-14 fix1 §7).
+    ///
+    /// Ignored unless `require_mount` is set.
+    pub fn with_source(mut self, source: Option<String>) -> Self {
+        self.require_source = source;
+        self
+    }
+
     /// The configured mount path, if any.
     pub fn require_mount(&self) -> Option<&Path> {
         self.require_mount.as_deref()
+    }
+
+    /// The configured mount source, if any.
+    pub fn require_source(&self) -> Option<&str> {
+        self.require_source.as_deref()
     }
 
     /// Whether this guard enforces a `require_mount`.
@@ -229,6 +286,20 @@ impl MountGuard {
                 mount: mount.to_path_buf(),
             });
         }
+        if let Some(expected) = &self.require_source {
+            let actual = mount_source(mount).map_err(|detail| MountError::SourceUnreadable {
+                mount: mount.to_path_buf(),
+                expected: expected.clone(),
+                detail,
+            })?;
+            if !source_matches(expected, &actual) {
+                return Err(MountError::SourceMismatch {
+                    mount: mount.to_path_buf(),
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -248,6 +319,11 @@ impl MountGuard {
             path: out_dir.to_path_buf(),
             source,
         })?;
+        if out_canon == mount_canon {
+            return Err(MountError::OutDirIsMount {
+                mount: mount.to_path_buf(),
+            });
+        }
         if !out_canon.starts_with(&mount_canon) {
             return Err(MountError::SymlinkEscape {
                 out_dir: out_dir.to_path_buf(),
@@ -294,6 +370,86 @@ fn normalize_join(base: &Path, tail: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// One parsed `/proc/self/mountinfo` line.
+struct MountInfo {
+    /// The mount point, octal escapes resolved.
+    mount_point: String,
+    /// The mount source, octal escapes resolved (e.g. `E:\` on WSL `drvfs`).
+    source: String,
+}
+
+/// The mount source for `mount`, from the mount table, or a human-readable
+/// reason it could not be determined (a failed check).
+#[cfg(target_os = "linux")]
+fn mount_source(mount: &Path) -> Result<String, String> {
+    let text = fs::read_to_string(MOUNTINFO).map_err(|err| format!("{MOUNTINFO}: {err}"))?;
+    let canonical = fs::canonicalize(mount).unwrap_or_else(|_| mount.to_path_buf());
+    for line in text.lines() {
+        let Some(entry) = parse_mountinfo_line(line) else {
+            return Err(format!("malformed mountinfo line: {line}"));
+        };
+        if Path::new(&entry.mount_point) == canonical {
+            return Ok(entry.source);
+        }
+    }
+    Err(format!(
+        "`{}` is not a mount point in {MOUNTINFO}",
+        canonical.display()
+    ))
+}
+
+/// Non-Linux hosts have no `/proc/self/mountinfo`, so a configured source
+/// cannot be verified and the check fails closed.
+#[cfg(not(target_os = "linux"))]
+fn mount_source(_mount: &Path) -> Result<String, String> {
+    Err(format!("{MOUNTINFO} is only available on Linux"))
+}
+
+/// Parse one mountinfo line into its mount point and source.
+///
+/// Format: `id parent major:minor root mount_point opts [optional…] - fstype
+/// source superopts`. Malformed lines yield `None`, which the caller treats as
+/// a failed check.
+fn parse_mountinfo_line(line: &str) -> Option<MountInfo> {
+    let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+    let separator = fields.iter().position(|field| *field == "-")?;
+    let mount_point = unescape_mountinfo(fields.get(4)?)?;
+    let source = unescape_mountinfo(fields.get(separator + 2)?)?;
+    Some(MountInfo {
+        mount_point,
+        source,
+    })
+}
+
+/// Resolve the octal escapes (`\040` space, `\011` tab, `\012` newline,
+/// `\134` backslash) mountinfo uses for special characters.
+fn unescape_mountinfo(field: &str) -> Option<String> {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            let octal = field.get(index + 1..index + 4)?;
+            out.push(u8::from_str_radix(octal, 8).ok()?);
+            index += 4;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Compare a configured source with the reported one, case-insensitively and
+/// ignoring trailing `/` or `\` so `E:` and `E:\` are equivalent.
+fn source_matches(expected: &str, actual: &str) -> bool {
+    normalize_source(expected).eq_ignore_ascii_case(&normalize_source(actual))
+}
+
+fn normalize_source(source: &str) -> String {
+    source.trim_end_matches(['/', '\\']).to_string()
 }
 
 #[cfg(test)]
@@ -450,6 +606,78 @@ mod tests {
         assert!(
             !outside.path().join("mev-rec").exists(),
             "escape path must not be created"
+        );
+    }
+
+    #[test]
+    fn out_dir_equal_to_the_mount_root_is_rejected() {
+        let mount_tmp = temp_dir("equal-mount");
+        let mount = mount_tmp.path();
+        let probe = Arc::new(FakeMountProbe::new(mount));
+        let guard = MountGuard::new(Some(mount.to_path_buf()), probe);
+
+        let before = tree(mount);
+        let err = guard.validate_startup(mount).unwrap_err();
+        assert!(
+            matches!(err, MountError::OutDirIsMount { .. }),
+            "unexpected error: {err}"
+        );
+        assert_eq!(tree(mount), before, "validate_startup created something");
+    }
+
+    #[test]
+    fn parses_a_mountinfo_line() {
+        let line = "36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue";
+        let info = parse_mountinfo_line(line).unwrap();
+        assert_eq!(info.mount_point, "/mnt2");
+        assert_eq!(info.source, "/dev/root");
+    }
+
+    #[test]
+    fn parses_mountinfo_octal_escapes() {
+        // Mount point `/mnt/my drive` (space is `\040`); source `E:\` (backslash
+        // is `\134`), as a WSL drvfs entry would render.
+        let line = "36 35 8:1 / /mnt/my\\040drive rw - drvfs E:\\134 rw";
+        let info = parse_mountinfo_line(line).unwrap();
+        assert_eq!(info.mount_point, "/mnt/my drive");
+        assert_eq!(info.source, "E:\\");
+        assert!(parse_mountinfo_line("too short").is_none());
+    }
+
+    #[test]
+    fn source_matching_ignores_case_and_trailing_separators() {
+        assert!(source_matches("E:\\", "e:"));
+        assert!(source_matches("e:", "E:\\"));
+        assert!(source_matches("/dev/sdb1", "/dev/sdb1"));
+        assert!(source_matches("E:", "E:\\"));
+        assert!(!source_matches("E:", "F:"));
+    }
+
+    #[test]
+    fn guarded_source_that_cannot_be_verified_is_rejected() {
+        // A plain tempdir is not a mount point in /proc/self/mountinfo, so an
+        // explicit source check fails closed.
+        let tmp = temp_dir("source");
+        let probe = Arc::new(FakeMountProbe::new(tmp.path()));
+        let guard = MountGuard::new(Some(tmp.path().to_path_buf()), probe)
+            .with_source(Some("E:\\".to_string()));
+        assert_eq!(guard.require_source(), Some("E:\\"));
+
+        let before = tree(tmp.path());
+        let err = guard
+            .validate_startup(&tmp.path().join("mev-rec"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MountError::SourceUnreadable { .. } | MountError::SourceMismatch { .. }
+            ),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            tree(tmp.path()),
+            before,
+            "validate_startup created something"
         );
     }
 

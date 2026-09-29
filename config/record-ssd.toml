@@ -20,6 +20,10 @@
 network = "mainnet"
 out_dir = "/mnt/e/mev-rec"
 require_mount = "/mnt/e"          # R-14: refuse to write unless /mnt/e is a real mount
+# R-14 fix1: also require the mount's source (from /proc/self/mountinfo) to be
+# the E: drive, so a different volume mounted at /mnt/e is rejected too.
+# Single-quoted TOML literal: the backslash is not an escape.
+require_mount_source = 'E:\'
 zstd_level = 3
 min_free_gb = 100
 retain_days = 30
