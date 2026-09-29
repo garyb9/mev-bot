@@ -64,7 +64,7 @@ USAGE
 check_mount() {
     local min_free="${1:-$MIN_FREE_GB}"
     CHECK_REASON=""
-    if [[ ! -d "$MOUNT" ]]; then
+    if ! timeout 3 test -d "$MOUNT"; then
         CHECK_REASON="$MOUNT does not exist"
         return 1
     fi
@@ -226,19 +226,21 @@ watchdog() {
             reason="$CHECK_REASON"
             break
         fi
-        if [[ ! -f "$SENTINEL" ]]; then
+        if ! timeout 3 test -f "$SENTINEL"; then
             reason="sentinel $SENTINEL is missing"
             break
         fi
         local cur sent
-        cur="$(findmnt -no SOURCE "$MOUNT" 2>/dev/null || true)"
-        sent="$(awk 'NR==1{print $1}' "$SENTINEL" 2>/dev/null || true)"
+        cur="$(timeout 3 findmnt -no SOURCE "$MOUNT" 2>/dev/null || true)"
+        sent="$(timeout 3 awk 'NR==1{print $1}' "$SENTINEL" 2>/dev/null || true)"
         if [[ "$cur" != "$sent" ]]; then
             reason="mount source '$cur' no longer matches sentinel '$sent'"
             break
         fi
         if ! is_alive "$rec_pid"; then
-            rm -f "$WD_PIDFILE" 2>/dev/null || true
+            # Recorder is gone: drop both pidfiles so a later `stop` cannot
+            # signal an unrelated process that reused the pid.
+            rm -f "$WD_PIDFILE" "$REC_PIDFILE" 2>/dev/null || true
             exit 0
         fi
         sleep 1
@@ -261,6 +263,11 @@ cmd_stop() {
     rec_pid="$(pid_from "$REC_PIDFILE")"
     wd_pid="$(pid_from "$WD_PIDFILE")"
 
+    # Only signal a pid that is really our recorder (guards against pid reuse).
+    if is_alive "$rec_pid" && ! tr '\0' ' ' <"/proc/$rec_pid/cmdline" 2>/dev/null | grep -q 'hl.* record'; then
+        echo "run-ssd.sh: pid $rec_pid is not the recorder; refusing to signal it, clearing pidfile" >&2
+        rec_pid=""
+    fi
     if is_alive "$rec_pid"; then
         echo "run-ssd.sh: stopping recorder (pid $rec_pid) ..."
         kill -TERM "$rec_pid" 2>/dev/null || true
