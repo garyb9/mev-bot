@@ -1181,7 +1181,8 @@ mod tests {
     fn verify_checks_manifest_against_disk() {
         let tmp = temp_dir("verify");
         let dir = tmp.path();
-        let clock = Arc::new(FixedEnvelopeClock::new(1_767_227_400_000_000_000, 0));
+        let base = 1_767_227_400_000_000_000i64;
+        let clock = Arc::new(FixedEnvelopeClock::new(base, 0));
         let config = SegmentConfig {
             out_dir: dir.to_path_buf(),
             network: "testnet".into(),
@@ -1192,9 +1193,31 @@ mod tests {
         };
         let writer = SegmentWriter::spawn(config).unwrap();
         for i in 0..20u64 {
-            clock.set_t_ns(1_767_227_400_000_000_000 + i as i64 * 1_000_000);
+            clock.set_t_ns(base + i as i64 * 1_000_000);
             assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", i, "data")));
         }
+        // A `gap_start` is stamped at the disconnect instant, which is earlier
+        // than the last frame's stamp (the frame was stamped when processed).
+        // The writer must accept the out-of-order `t_ns`, and verify must
+        // subtract the whole outage from coverage.
+        let gap_start_ns = base + 5_000_000;
+        let gap_end_ns = base + 30_000_000;
+        assert!(
+            gap_start_ns < base + 19_000_000,
+            "precondition: the gap must predate the last frame"
+        );
+        assert!(writer.try_send(Envelope::gap_start_at(
+            "hl-ws",
+            "hl-ws-01",
+            20,
+            gap_start_ns,
+            0,
+            "closed",
+            "server closed",
+        )));
+        assert!(writer.try_send(Envelope::gap_end_at(
+            "hl-ws", "hl-ws-01", 21, gap_end_ns, 0, 25,
+        )));
         writer.shutdown().unwrap();
 
         let report = verify(&VerifyConfig {
@@ -1209,9 +1232,21 @@ mod tests {
         assert!(file.size_ok);
         assert!(file.records_ok);
         assert!(!file.crashed);
-        assert_eq!(file.records_manifest, 22);
+        assert_eq!(file.records_manifest, 24);
         assert_eq!(report.coverage.len(), 1);
-        assert!(report.coverage[0].coverage_pct > 0.0);
+        // Only the 5 ms before the outage are covered.
+        assert_eq!(report.coverage[0].covered_ms, 5);
+        assert!(
+            report.coverage[0].coverage_pct < 100.0,
+            "the outage was counted as covered"
+        );
+
+        // `inspect` reports the recorded gap against the real timestamps.
+        let files = segments_for(dir, "testnet", "2026-01-01", "2026-01-01").unwrap();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let inspected = inspect(&files).unwrap();
+        assert_eq!(inspected.gap_count, 1);
+        assert_eq!(inspected.gap_total_ms, 25);
     }
 
     #[test]

@@ -942,11 +942,22 @@ async fn ingest(
                             if reason == "shutdown" {
                                 return;
                             }
-                            // Mark coins stale until fresh data arrives.
+                            // Mark coins stale until fresh data arrives. With the
+                            // R-8 fix2 `RawWsConn`, this arrives the moment the
+                            // drop is detected, before the reconnect.
                             let _ = handles.send_market(MarketUpdate::Gap {
                                 conn: ConnId(0),
                                 stamp: Stamp::default(),
                                 open: true,
+                            });
+                        }
+                        Ok(RawEvent::Opened { .. }) => {
+                            // The reconnect succeeded; close the gap so the engine
+                            // can clear stale coins once data flows again.
+                            let _ = handles.send_market(MarketUpdate::Gap {
+                                conn: ConnId(0),
+                                stamp: Stamp::default(),
+                                open: false,
                             });
                         }
                         Ok(_) => {}

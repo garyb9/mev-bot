@@ -110,18 +110,24 @@ pub enum RawEvent {
         attempt: u32,
     },
     /// The feed is not healthy: a watchdog timeout, socket close, error, or
-    /// shutdown. A reconnect follows `Gap` for everything but shutdown.
+    /// shutdown.
+    ///
+    /// A `Gap` is returned **immediately** when the drop is detected, before
+    /// any reconnect attempt, so callers can mark their state stale at the
+    /// moment of the outage. The **next** call to [`RawWsConn::next`] performs
+    /// the reconnect (with backoff and resubscribe retries) and yields
+    /// [`RawEvent::Opened`] once the feed is up again.
     Gap {
         /// Why the gap happened (`watchdog`, `closed`, `error`, `shutdown`).
         reason: String,
         /// Human-readable detail.
         detail: String,
         /// Process-monotonic nanoseconds ([`mono_ns`]) when the drop was
-        /// **detected**, before the reconnect. Callers use it to bracket the
-        /// real outage (the `Gap` is returned only after the reconnect has
-        /// completed, so `mono_ns()` at return would understate the downtime).
-        /// `0` when the gap is a clean shutdown.
+        /// detected. `0` for a clean shutdown.
         disconnect_ns: u64,
+        /// Wall-clock nanoseconds since the Unix epoch when the drop was
+        /// detected. `0` for a clean shutdown.
+        t_ns: i64,
     },
 }
 
@@ -142,8 +148,9 @@ pub struct RawWsConn {
     next_ping: Instant,
     attempt: u32,
     metrics_src: &'static str,
-    /// Set after a reconnect so the next `next()` yields `Opened`.
-    pending_opened: bool,
+    /// Set when a `Gap` has been returned: the next `next()` reconnects first
+    /// and then yields `Opened`.
+    pending_reconnect: bool,
 }
 
 impl RawWsConn {
@@ -180,7 +187,7 @@ impl RawWsConn {
             next_ping: now + ping_interval,
             attempt: 1,
             metrics_src: src,
-            pending_opened: false,
+            pending_reconnect: false,
         };
         conn.resubscribe().await?;
         metrics::counter!(names::WS_RECONNECTS, "src" => src, "reason" => "open").increment(1);
@@ -268,13 +275,18 @@ impl RawWsConn {
         }
     }
 
-    /// The next raw event, transparently reconnecting after gaps.
+    /// The next raw event.
     ///
-    /// Yields [`RawEvent::Opened`] after a successful (re)connect and
-    /// [`RawEvent::Gap`] when the feed breaks; on shutdown it returns `Err`.
+    /// Yields [`RawEvent::Gap`] **immediately** when the feed breaks (before
+    /// any reconnect attempt), then performs the reconnect on the following
+    /// call and yields [`RawEvent::Opened`] once it is back. On shutdown it
+    /// returns `Err`.
     pub async fn next(&mut self) -> Result<RawEvent> {
-        if self.pending_opened {
-            self.pending_opened = false;
+        if self.pending_reconnect {
+            // A `Gap` was returned by the previous call: reconnect now (with
+            // backoff, resubscribe retries, and shutdown interruption).
+            self.pending_reconnect = false;
+            self.reconnect().await?;
             return Ok(RawEvent::Opened {
                 attempt: self.attempt,
             });
@@ -282,10 +294,12 @@ impl RawWsConn {
         loop {
             tokio::select! {
                 _ = self.shutdown.notified() => {
+                    metrics::gauge!(names::WS_CONNECTED, "src" => self.metrics_src).set(0.0);
                     return Ok(RawEvent::Gap {
                         reason: "shutdown".into(),
                         detail: "cancellation requested".into(),
                         disconnect_ns: 0,
+                        t_ns: 0,
                     });
                 }
                 _ = tokio::time::sleep_until(self.next_ping) => {
@@ -296,22 +310,12 @@ impl RawWsConn {
                     if let Some(frame) = self.protocol.keepalive_frame()
                         && self.socket.send(Message::Text(frame.into())).await.is_err()
                     {
-                        if let Some(event) = self.handle_gap("error", "keepalive send failed").await? {
-                            return Ok(event);
-                        }
-                        continue;
+                        return Ok(self.gap_now("error", "keepalive send failed"));
                     }
                 }
                 _ = tokio::time::sleep_until(self.last_data + self.watchdog) => {
-                    if let Some(event) = self
-                        .handle_gap(
-                            "watchdog",
-                            &format!("no inbound frame for {}s", self.watchdog.as_secs()),
-                        )
-                        .await?
-                    {
-                        return Ok(event);
-                    }
+                    let detail = format!("no inbound frame for {}s", self.watchdog.as_secs());
+                    return Ok(self.gap_now("watchdog", &detail));
                 }
                 msg = self.socket.next() => {
                     match msg {
@@ -336,23 +340,14 @@ impl RawWsConn {
                             self.last_data = Instant::now();
                         }
                         Some(Ok(Message::Close(_))) => {
-                            if let Some(event) = self.handle_gap("closed", "server closed").await? {
-                                return Ok(event);
-                            }
-                            continue;
+                            return Ok(self.gap_now("closed", "server closed"));
                         }
                         Some(Ok(Message::Frame(_))) => {}
                         Some(Err(err)) => {
-                            if let Some(event) = self.handle_gap("error", &err.to_string()).await? {
-                                return Ok(event);
-                            }
-                            continue;
+                            return Ok(self.gap_now("error", &err.to_string()));
                         }
                         None => {
-                            if let Some(event) = self.handle_gap("closed", "stream ended").await? {
-                                return Ok(event);
-                            }
-                            continue;
+                            return Ok(self.gap_now("closed", "stream ended"));
                         }
                     }
                 }
@@ -360,30 +355,27 @@ impl RawWsConn {
         }
     }
 
-    /// Emit a `Gap`, reconnect, and arrange for the next `next()` to yield
-    /// `Opened`. On shutdown (cancellation during backoff) the gap is still
-    /// returned and the caller sees the shutdown on its next call.
-    ///
-    /// The `Gap` carries the [`mono_ns`] timestamp taken when the drop was
-    /// detected, **before** the (possibly long) reconnect, so callers can
-    /// bracket the real outage.
-    async fn handle_gap(&mut self, reason: &str, detail: &str) -> Result<Option<RawEvent>> {
+    /// Announce a `Gap` at the moment the drop is detected and arrange for the
+    /// next [`RawWsConn::next`] to reconnect. Carries both the monotonic and the
+    /// wall-clock disconnect timestamps so callers can bracket the outage.
+    fn gap_now(&mut self, reason: &str, detail: &str) -> RawEvent {
         metrics::counter!(
             names::WS_RECONNECTS,
             "src" => self.metrics_src,
             "reason" => reason.to_string(),
         )
         .increment(1);
-        let disconnect_ns = mono_ns();
-        let event = RawEvent::Gap {
+        // The socket is already down; reflect it immediately rather than when
+        // the reconnect starts on the next call.
+        metrics::gauge!(names::WS_CONNECTED, "src" => self.metrics_src).set(0.0);
+        self.pending_reconnect = true;
+        tracing::debug!(reason, detail, "websocket gap detected");
+        RawEvent::Gap {
             reason: reason.to_string(),
             detail: detail.to_string(),
-            disconnect_ns,
-        };
-        self.reconnect().await?;
-        self.pending_opened = true;
-        tracing::debug!(reason, detail, "websocket gap; reconnected");
-        Ok(Some(event))
+            disconnect_ns: mono_ns(),
+            t_ns: now_ns(),
+        }
     }
 }
 
@@ -440,6 +432,15 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Wall-clock nanoseconds since the Unix epoch, used to stamp gap disconnect
+/// times so the recorder can bracket an outage in its envelope timeline.
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
 }
 
@@ -732,20 +733,23 @@ mod tests {
         }
     }
 
-    /// `Gap` carries the detection time, so the measured outage covers the
-    /// reconnect even though the event is returned afterwards.
-    #[tokio::test(start_paused = true)]
-    async fn gap_carries_the_disconnect_time() {
+    /// A drop is announced at once, before any reconnect: with the server
+    /// refusing connections for 2 s, the `Gap` must arrive almost immediately
+    /// and `Opened` must be the later call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gap_is_immediate_and_opened_after_the_reconnect() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            // First connection: send a frame, close. Second: hold open.
+            // First connection: one frame, then close.
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
             ws.send(Message::Text("hello".into())).await.unwrap();
             ws.close(None).await.unwrap();
             drop(ws);
+            // Refuse the next reconnect for 2 s by delaying the handshake.
             let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
             let mut ws = accept_async(stream).await.unwrap();
             while let Some(Ok(_)) = ws.next().await {}
         });
@@ -757,25 +761,85 @@ mod tests {
         )
         .await
         .unwrap();
-        // Consume the hello, then the gap.
-        let _ = conn.next().await.unwrap();
-        let before = mono_ns();
-        let event = conn.next().await.unwrap();
-        let after = mono_ns();
-        match event {
-            RawEvent::Gap {
-                reason,
-                disconnect_ns,
-                ..
-            } => {
-                assert_eq!(reason, "closed");
-                assert!(
-                    disconnect_ns >= before && disconnect_ns <= after,
-                    "disconnect_ns {disconnect_ns} not in [{before}, {after}]"
-                );
-            }
+        let _ = conn.next().await.unwrap(); // the hello
+
+        let started = Instant::now();
+        let gap = conn.next().await.unwrap();
+        let gap_ms = started.elapsed();
+        match gap {
+            RawEvent::Gap { ref reason, .. } => assert_eq!(reason, "closed"),
             other => panic!("expected a gap, got {other:?}"),
         }
+        assert!(
+            gap_ms < Duration::from_millis(200),
+            "the gap took {gap_ms:?}; it must be announced at the drop, not after the reconnect"
+        );
+
+        // The reconnect happens on the next call, after the 2 s refusal.
+        let reopen_started = Instant::now();
+        let opened = conn.next().await.unwrap();
+        assert!(matches!(opened, RawEvent::Opened { .. }), "{opened:?}");
+        assert!(
+            reopen_started.elapsed() >= Duration::from_millis(1_500),
+            "Opened arrived before the server let the reconnect through"
+        );
+    }
+
+    /// `Gap` carries the disconnect wall-clock and monotonic times, taken
+    /// before the reconnect, so an outage can be bracketed by at least the
+    /// server's known downtime. This fails if the timestamp were taken after
+    /// the reconnect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gap_carries_the_disconnect_time() {
+        const DOWNTIME: Duration = Duration::from_millis(400);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            ws.send(Message::Text("hello".into())).await.unwrap();
+            ws.close(None).await.unwrap();
+            drop(ws);
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(DOWNTIME).await;
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        let mut conn = RawWsConn::connect_with(
+            protocol(format!("ws://{addr}")),
+            vec![],
+            Duration::from_secs(3_600),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        let _ = conn.next().await.unwrap(); // the hello
+
+        let gap = conn.next().await.unwrap();
+        let RawEvent::Gap {
+            reason,
+            disconnect_ns,
+            t_ns,
+            ..
+        } = gap
+        else {
+            panic!("expected a gap");
+        };
+        assert_eq!(reason, "closed");
+        assert!(disconnect_ns > 0);
+        let wall_gap_ns = t_ns;
+        assert!(wall_gap_ns > 0);
+
+        // The reconnect completes DOWNTIME later; `t_ns` must predate that by
+        // roughly the downtime (this fails if the stamp were taken after).
+        let opened = conn.next().await.unwrap();
+        assert!(matches!(opened, RawEvent::Opened { .. }));
+        let after_reconnect_ns = now_ns();
+        let measured = Duration::from_nanos((after_reconnect_ns - wall_gap_ns).max(0) as u64);
+        assert!(
+            measured >= DOWNTIME.mul_f64(0.6),
+            "gap t_ns was stamped too late: measured outage {measured:?}"
+        );
     }
 
     /// A host that accepts then resets every connection must not terminate the

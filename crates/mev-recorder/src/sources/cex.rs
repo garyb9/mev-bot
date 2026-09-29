@@ -357,12 +357,12 @@ impl CexSource {
     /// successful open (a matching `gap_end` closes it).
     pub async fn run(mut self, shutdown: Arc<Notify>) {
         let url = self.url();
-        // Process-monotonic ns at the start of the current outage. Set when the
-        // drop is detected (initial-dial failure or `RawEvent::Gap`), cleared by
-        // `gap_end`. The `Gap` event only arrives after the reconnect, so the
-        // timestamp is taken before it, keeping `gap_ms` equal to the real
-        // downtime.
-        let mut gap_started: Option<u64> = None;
+        // Wall-clock ns (envelope `t_ns`) at the start of the current outage.
+        // Set when the drop is detected (initial-dial failure or the immediate
+        // `RawEvent::Gap`, which now arrives before the reconnect), cleared by
+        // `gap_end`. `gap_ms` is `gap_end.t_ns - gap_start.t_ns`, so it measures
+        // the real outage.
+        let mut gap_started: Option<i64> = None;
 
         let mut raw = loop {
             match RawWsConn::connect_with(
@@ -381,8 +381,9 @@ impl CexSource {
                         "cex websocket connect failed; retrying"
                     );
                     if gap_started.is_none() {
-                        self.emit_gap_start("error", &err.to_string());
-                        gap_started = Some(raw_ws::mono_ns());
+                        let t_ns = self.clock.t_ns();
+                        self.emit_gap_start(t_ns, raw_ws::mono_ns(), "error", &err.to_string());
+                        gap_started = Some(t_ns);
                     }
                     tokio::select! {
                         _ = tokio::time::sleep(CEX_CONNECT_RETRY) => {}
@@ -404,7 +405,8 @@ impl CexSource {
         loop {
             tokio::select! {
                 _ = shutdown.notified() => {
-                    self.emit_gap_start("shutdown", "shutdown requested");
+                    let t_ns = self.clock.t_ns();
+                    self.emit_gap_start(t_ns, raw_ws::mono_ns(), "shutdown", "shutdown requested");
                     break;
                 }
                 event = raw.next() => match event {
@@ -430,17 +432,18 @@ impl CexSource {
                             self.emit_gap_end(started);
                         }
                     }
-                    Ok(RawEvent::Gap { reason, detail, disconnect_ns }) => {
-                        self.emit_gap_start(&reason, &detail);
-                        // `disconnect_ns` is the detection time, before the
-                        // reconnect, so `gap_ms` measures the real outage.
-                        gap_started = Some(disconnect_ns);
+                    Ok(RawEvent::Gap { reason, detail, disconnect_ns, t_ns }) => {
+                        // `t_ns`/`disconnect_ns` are the disconnect instant: the
+                        // next `next()` performs the reconnect.
+                        self.emit_gap_start(t_ns, disconnect_ns, &reason, &detail);
+                        gap_started = Some(t_ns);
                     }
                     Err(err) => {
                         // `RawWsConn` only returns `Err` on shutdown; a broken
                         // connection is retried internally.
                         warn!(src = self.src, error = %err, "cex source stopped");
-                        self.emit_gap_start("error", &err.to_string());
+                        let t_ns = self.clock.t_ns();
+                        self.emit_gap_start(t_ns, raw_ws::mono_ns(), "error", &err.to_string());
                         break;
                     }
                 },
@@ -486,16 +489,24 @@ impl CexSource {
         self.seq += 1;
     }
 
-    fn emit_gap_start(&mut self, reason: &str, detail: &str) {
-        let env = Envelope::gap_start(&*self.clock, self.src, self.conn, self.seq, reason, detail);
+    fn emit_gap_start(&mut self, t_ns: i64, mono_ns: u64, reason: &str, detail: &str) {
+        let env =
+            Envelope::gap_start_at(self.src, self.conn, self.seq, t_ns, mono_ns, reason, detail);
         self.emit(env);
         self.seq += 1;
     }
 
-    fn emit_gap_end(&mut self, started_ns: u64) {
-        let now = raw_ws::mono_ns();
-        let gap_ms = now.saturating_sub(started_ns) / 1_000_000;
-        let env = Envelope::gap_end(&*self.clock, self.src, self.conn, self.seq, gap_ms);
+    fn emit_gap_end(&mut self, started_t_ns: i64) {
+        let t_ns = self.clock.t_ns();
+        let gap_ms = t_ns.saturating_sub(started_t_ns).max(0) as u64 / 1_000_000;
+        let env = Envelope::gap_end_at(
+            self.src,
+            self.conn,
+            self.seq,
+            t_ns,
+            raw_ws::mono_ns(),
+            gap_ms,
+        );
         self.emit(env);
         self.seq += 1;
     }
@@ -969,13 +980,21 @@ mod tests {
         let shutdown = Arc::new(Notify::new());
         let handle = tokio::spawn(source.run(shutdown.clone()));
 
-        let _ = recv_until(&mut rx, Kind::GapStart).await;
+        let started = recv_until(&mut rx, Kind::GapStart).await;
         let ended = recv_until(&mut rx, Kind::GapEnd).await;
         let gap_ms = ended.meta.unwrap()["gap_ms"].as_u64().unwrap();
         assert!(
             gap_ms >= DOWNTIME.as_millis() as u64 * 3 / 4,
             "gap_ms {gap_ms} does not cover the {DOWNTIME:?} downtime"
         );
+        // The gap_start is stamped at the disconnect, so the two recorded
+        // wall-clock times differ by at least the real downtime.
+        let recorded_ns = ended.t_ns.saturating_sub(started.t_ns).max(0) as u64;
+        assert!(
+            recorded_ns >= DOWNTIME.as_nanos() as u64 * 3 / 4,
+            "recorded gap {recorded_ns} ns does not cover the {DOWNTIME:?} downtime"
+        );
+        assert_eq!(gap_ms, recorded_ns / 1_000_000, "gap_ms != t_ns difference");
 
         shutdown.notify_one();
         let _ = handle.await;

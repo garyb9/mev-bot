@@ -1081,25 +1081,36 @@ async fn run_ws_conn(
         .collect();
 
     // Retry the initial dial; `RawWsConn` handles reconnects after that.
-    let mut gap_started: Option<Instant> = None;
+    //
+    // A gap is stamped at the wall-clock/monotonic instant it began (the raw
+    // `Gap` carries the disconnect instant, `SPEC-0008 RW-2`) so
+    // `gap_end.t_ns - gap_start.t_ns` measures the real downtime. Only the
+    // first failure of an outage emits a `gap_start`.
+    let mut gap_started: Option<(i64, u64)> = None;
     let mut gap_reason = String::new();
     let mut raw = loop {
         match RawWsConn::connect(protocol(), subs.clone()).await {
             Ok(raw) => break raw,
             Err(err) => {
                 warn!(conn = %conn_id, error = %err, "websocket connect failed; retrying");
-                seq = emit_gap_start(
-                    &metrics,
-                    &writer,
-                    &state,
-                    &*clock,
-                    &conn_id,
-                    "error",
-                    &err.to_string(),
-                    seq,
-                );
+                if gap_started.is_none() {
+                    let t_ns = clock.t_ns();
+                    let mono_ns = clock.mono_ns();
+                    seq = emit_gap_start(
+                        &metrics,
+                        &writer,
+                        &state,
+                        &*clock,
+                        &conn_id,
+                        t_ns,
+                        mono_ns,
+                        "error",
+                        &err.to_string(),
+                        seq,
+                    );
+                    gap_started = Some((t_ns, mono_ns));
+                }
                 gap_reason = "error".to_string();
-                gap_started = Some(Instant::now());
                 tokio::select! {
                     _ = tokio::time::sleep(CONNECT_RETRY) => {}
                     _ = shutdown.changed() => {
@@ -1118,9 +1129,10 @@ async fn run_ws_conn(
         emit(&metrics, &writer, &state, &*clock, env);
         seq += 1;
     }
-    if let Some(started) = gap_started.take() {
-        let gap_ms = started.elapsed().as_millis() as u64;
-        let env = Envelope::gap_end(&*clock, src, conn_id.as_str(), seq, gap_ms);
+    if let Some((started_t_ns, _)) = gap_started.take() {
+        let t_ns = clock.t_ns();
+        let gap_ms = t_ns.saturating_sub(started_t_ns).max(0) as u64 / 1_000_000;
+        let env = Envelope::gap_end_at(src, conn_id.as_str(), seq, t_ns, clock.mono_ns(), gap_ms);
         emit(&metrics, &writer, &state, &*clock, env);
         seq += 1;
         record_gap_seconds(src, &conn_id, &gap_reason, gap_ms);
@@ -1132,7 +1144,9 @@ async fn run_ws_conn(
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
-                emit_gap_start(&metrics, &writer, &state, &*clock, &conn_id, "shutdown", "shutdown requested", seq);
+                let t_ns = clock.t_ns();
+                let mono_ns = clock.mono_ns();
+                emit_gap_start(&metrics, &writer, &state, &*clock, &conn_id, t_ns, mono_ns, "shutdown", "shutdown requested", seq);
                 break;
             }
             _ = clock_tick.tick() => {
@@ -1163,9 +1177,17 @@ async fn run_ws_conn(
                         emit(&metrics, &writer, &state, &*clock, env);
                         seq += 1;
                     }
-                    if let Some(started) = gap_started.take() {
-                        let gap_ms = started.elapsed().as_millis() as u64;
-                        let env = Envelope::gap_end(&*clock, src, conn_id.as_str(), seq, gap_ms);
+                    if let Some((started_t_ns, _)) = gap_started.take() {
+                        let t_ns = clock.t_ns();
+                        let gap_ms = t_ns.saturating_sub(started_t_ns).max(0) as u64 / 1_000_000;
+                        let env = Envelope::gap_end_at(
+                            src,
+                            conn_id.as_str(),
+                            seq,
+                            t_ns,
+                            clock.mono_ns(),
+                            gap_ms,
+                        );
                         emit(&metrics, &writer, &state, &*clock, env);
                         seq += 1;
                         record_gap_seconds(src, conn_id.as_str(), &gap_reason, gap_ms);
@@ -1174,16 +1196,30 @@ async fn run_ws_conn(
                 Ok(RawEvent::Gap {
                     reason,
                     detail,
-                    disconnect_ns: _,
+                    disconnect_ns,
+                    t_ns,
                 }) => {
                     state.set_connected(false);
-                    seq = emit_gap_start(&metrics, &writer, &state, &*clock, &conn_id, &reason, &detail, seq);
+                    seq = emit_gap_start(
+                        &metrics,
+                        &writer,
+                        &state,
+                        &*clock,
+                        &conn_id,
+                        t_ns,
+                        disconnect_ns,
+                        &reason,
+                        &detail,
+                        seq,
+                    );
                     gap_reason = reason;
-                    gap_started = Some(Instant::now());
+                    gap_started = Some((t_ns, disconnect_ns));
                 }
                 Err(err) => {
                     state.set_connected(false);
-                    emit_gap_start(&metrics, &writer, &state, &*clock, &conn_id, "error", &err.to_string(), seq);
+                    let t_ns = clock.t_ns();
+                    let mono_ns = clock.mono_ns();
+                    emit_gap_start(&metrics, &writer, &state, &*clock, &conn_id, t_ns, mono_ns, "error", &err.to_string(), seq);
                     break;
                 }
             }
@@ -1222,7 +1258,8 @@ fn write_conn_open(
     seq + 1
 }
 
-/// Write a `gap_start` envelope and return the next `seq`.
+/// Write a `gap_start` envelope stamped at `t_ns`/`mono_ns` and return the next
+/// `seq`.
 #[allow(clippy::too_many_arguments)]
 fn emit_gap_start(
     metrics: &ConnMetrics,
@@ -1230,11 +1267,13 @@ fn emit_gap_start(
     state: &ConnState,
     clock: &dyn EnvelopeClock,
     conn: &str,
+    t_ns: i64,
+    mono_ns: u64,
     reason: &str,
     detail: &str,
     seq: u64,
 ) -> u64 {
-    let env = Envelope::gap_start(clock, "hl-ws", conn, seq, reason, detail);
+    let env = Envelope::gap_start_at("hl-ws", conn, seq, t_ns, mono_ns, reason, detail);
     emit(metrics, writer, state, clock, env);
     seq + 1
 }
@@ -2673,5 +2712,119 @@ mod tests {
             );
         }
         assert!(report.records >= 4);
+    }
+
+    /// The HL path (`run_ws_conn`) stamps a `gap_start` at the disconnect and a
+    /// `gap_end` at the reopen, so the recorded pair covers the real outage
+    /// (SPEC-0008 RW-2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hl_ws_gap_covers_the_real_downtime() {
+        const DOWNTIME: Duration = Duration::from_millis(500);
+        let tmp = temp_dir("hl-gap");
+        let dir = tmp.path();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = listener.local_addr().unwrap();
+        let (reconnected_tx, mut reconnected_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let server = tokio::spawn(async move {
+            // Round 0: subscribe, one frame, then a clean close.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await; // subscribe
+            let _ = socket
+                .send(Message::Text(r#"{"channel":"bbo","data":{}}"#.into()))
+                .await;
+            let _ = socket.close(None).await;
+            drop(socket);
+            // Stay down for DOWNTIME before completing the next handshake.
+            tokio::time::sleep(DOWNTIME).await;
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await; // subscribe
+            let _ = reconnected_tx.send(());
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+
+        let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
+        let writer = SegmentWriter::spawn(segment_config(
+            &Profile {
+                out_dir: dir.to_path_buf(),
+                ..Profile::default()
+            },
+            Network::Testnet,
+            "hl-ws",
+            "hl-ws-01",
+            &SegmentOpenMeta::default(),
+            clock.clone(),
+            1,
+            Arc::new(MountGuard::unguarded()),
+        ))
+        .unwrap();
+        let conn = Connection {
+            id: "hl-ws-01".to_string(),
+            subs: vec![Subscription {
+                stream: Stream::Bbo,
+                coin: Some("BTC".to_string()),
+                dex: None,
+            }],
+        };
+        let ws_url = format!("ws://{ws_addr}");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ws_task = tokio::spawn(run_ws_conn(
+            conn,
+            Box::new(move || {
+                Box::new(TestProtocol {
+                    url: ws_url.clone(),
+                }) as Box<dyn Protocol>
+            }),
+            writer,
+            clock.clone(),
+            ConnState::new(),
+            shutdown_rx,
+            Duration::ZERO,
+        ));
+
+        // Wait for the reconnect to complete, let `gap_end` flush, then stop.
+        reconnected_rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = shutdown_tx.send(true);
+        let _ = ws_task.await;
+        server.abort();
+
+        let files = segment_files(dir);
+        assert!(!files.is_empty(), "no hl-ws segment was written");
+        let report = reader::inspect(&files).unwrap();
+        assert!(
+            report.gap_total_ms >= DOWNTIME.as_millis() as u64 * 3 / 4,
+            "gap_total_ms {} does not cover {DOWNTIME:?}",
+            report.gap_total_ms
+        );
+
+        let mut gap_start = None;
+        let mut gap_end = None;
+        for file in &files {
+            for env in reader::read_envelopes(file).unwrap() {
+                match env.kind {
+                    // The first `gap_start` is the outage; the shutdown one
+                    // follows it.
+                    Kind::GapStart if gap_start.is_none() => gap_start = Some(env),
+                    Kind::GapEnd => gap_end = Some(env),
+                    _ => {}
+                }
+            }
+        }
+        let (start, end) = (
+            gap_start.expect("an outage gap_start"),
+            gap_end.expect("an outage gap_end"),
+        );
+        let recorded_ns = end.t_ns.saturating_sub(start.t_ns).max(0) as u64;
+        assert!(
+            recorded_ns >= DOWNTIME.as_nanos() as u64 * 3 / 4,
+            "recorded gap {recorded_ns} ns does not cover {DOWNTIME:?}"
+        );
+        assert_eq!(
+            end.meta.unwrap()["gap_ms"].as_u64().unwrap(),
+            recorded_ns / 1_000_000
+        );
     }
 }

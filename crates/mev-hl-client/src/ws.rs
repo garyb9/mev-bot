@@ -168,6 +168,10 @@ impl MarketStream for WsMarketStream {
                     metrics::gauge!(names::WS_CONNECTED).set(1.0);
                 }
                 RawEvent::Gap { reason, detail, .. } => {
+                    // The gap is announced at the drop, before the reconnect
+                    // (R-8 fix2). This stream has no engine state to stale, so
+                    // it records the metric and lets the loop drive the
+                    // reconnect on the next call.
                     metrics::gauge!(names::WS_CONNECTED).set(0.0);
                     if reason == "shutdown" {
                         return Err(Error::Http(format!("websocket {reason}: {detail}")));

@@ -255,6 +255,81 @@ impl Envelope {
         )
     }
 
+    /// Build an envelope with **explicit** timestamps instead of reading the
+    /// clock (SPEC-0008 RW-2).
+    ///
+    /// Used to stamp a `gap_start` at the disconnect instant and a `gap_end` at
+    /// the reopen instant, so `gap_end.t_ns - gap_start.t_ns` (and the derived
+    /// `gap_ms`/coverage) measures the real outage rather than the moment the
+    /// recorder happened to write the line. Callers pass both the wall-clock
+    /// `t_ns` and the process-monotonic `mono_ns` for that same instant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_at(
+        src: impl Into<String>,
+        conn: impl Into<String>,
+        seq: u64,
+        kind: Kind,
+        t_ns: i64,
+        mono_ns: u64,
+        raw: Option<String>,
+        meta: Option<Value>,
+    ) -> Self {
+        Self {
+            v: SCHEMA_VERSION,
+            src: src.into(),
+            conn: conn.into(),
+            seq,
+            t_ns,
+            mono_ns,
+            kind,
+            raw,
+            meta,
+        }
+    }
+
+    /// The start of a data gap stamped at `t_ns`/`mono_ns` (`kind:"gap_start"`).
+    pub fn gap_start_at(
+        src: impl Into<String>,
+        conn: impl Into<String>,
+        seq: u64,
+        t_ns: i64,
+        mono_ns: u64,
+        reason: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::new_at(
+            src,
+            conn,
+            seq,
+            Kind::GapStart,
+            t_ns,
+            mono_ns,
+            None,
+            Some(json!({ "reason": reason.into(), "detail": detail.into() })),
+        )
+    }
+
+    /// The end of a data gap stamped at `t_ns`/`mono_ns` (`kind:"gap_end"`).
+    pub fn gap_end_at(
+        src: impl Into<String>,
+        conn: impl Into<String>,
+        seq: u64,
+        t_ns: i64,
+        mono_ns: u64,
+        gap_ms: u64,
+    ) -> Self {
+        Self::new_at(
+            src,
+            conn,
+            seq,
+            Kind::GapEnd,
+            t_ns,
+            mono_ns,
+            None,
+            Some(json!({ "gap_ms": gap_ms })),
+        )
+    }
+
     /// A periodic clock record (`kind:"clock"`).
     pub fn clock(
         clock: &dyn EnvelopeClock,
@@ -548,6 +623,30 @@ mod tests {
             serde_json::to_string(&env).unwrap(),
             r#"{"v":1,"src":"hl-ws","conn":"hl-ws-01","seq":10,"t_ns":1700000000000000000,"mono_ns":987654321098765,"kind":"gap_end","meta":{"gap_ms":1500}}"#
         );
+    }
+
+    #[test]
+    fn explicit_gap_timestamps_are_used() {
+        let start_ns = 1_700_000_000_000_000_000i64;
+        let end_ns = start_ns + 2_000_000_000;
+        let start = Envelope::gap_start_at(
+            "hl-ws",
+            "hl-ws-01",
+            4,
+            start_ns,
+            11,
+            "close",
+            "server closed",
+        );
+        let end = Envelope::gap_end_at("hl-ws", "hl-ws-01", 5, end_ns, 22, 2_000);
+        assert_eq!(start.t_ns, start_ns);
+        assert_eq!(start.mono_ns, 11);
+        assert_eq!(start.kind, Kind::GapStart);
+        assert_eq!(end.t_ns, end_ns);
+        assert_eq!(end.mono_ns, 22);
+        assert_eq!(end.kind, Kind::GapEnd);
+        assert_eq!(end.meta.unwrap()["gap_ms"], 2_000);
+        assert_eq!((end.t_ns - start.t_ns) as u64 / 1_000_000, 2_000);
     }
 
     #[test]
