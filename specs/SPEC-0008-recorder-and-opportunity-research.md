@@ -355,6 +355,18 @@ These feed studies **O9** and **O10**: options-informed trading of HIP-3 tokeniz
 | `deribit` | Deribit public API: `public/get_book_summary_by_currency` (`currency=BTC\|ETH`, `kind=option`) + `public/get_index_price`; add `public/get_instruments` and per-instrument `public/ticker` for the fields the summary lacks | every 60 s | **Verified 2026-09-28 (V-10).** Free, unauthenticated, reachable from this machine (~0.1 s/call). Summary fields: `instrument_name` (`BTC-<DDMMMYY>-<strike>-<C\|P>`), `mark_iv`, `open_interest`, `volume`, `underlying_price`, `mark_price`, `bid_price`/`ask_price`, `mid_price`, `last`, `high`/`low`, `volume_usd`. The summary has **no `bid_iv`/`ask_iv`, no greeks, no `index_price`**: those require `public/ticker` per instrument (or the `ticker.<instrument>` WS channel). Rate limit: non-matching default 20 req/s sustained, burst 100; `public/get_instruments` is capped at **1 req/s** sustained (burst 50); public non-authorized calls are per-IP. |
 | `equities` | Streaming real-time quotes (bid/ask/last) for the underlyings of HIP-3 stock perps (e.g. TSLA, NVDA, the index behind `XYZ100`) | streaming during US hours (+ pre/post market if the provider has it) | Provider chosen in **V-11** (free feeds cover only part of the volume; consolidated feeds are paid). Check the provider's terms allow storing the data. |
 
+**Crypto/other sources evaluated (2026-09-29, `docs/research/data-sources-2026-09-29.md` §1.3/§1.4).** Binance Vision (`data.binance.vision`) is free and usable for personal research only; its ToS text was not retrieved (**UNVERIFIED**). Deribit's public history API (all historical option/future trades, free, keyless) is the best free crypto-options backfill but its ToS was not read. Tardis costs 350–3,000 USD/mo and its ToS carries the ML-training clause (#27). CoinGecko, CoinAPI, Kaiko and CoinDesk Data were reviewed and are not needed now. Prices are 2026-09-29 list prices and change.
+
+### 9.2 News and alternative data (recommended minimal stack)
+
+Recommended minimal stack for news/alt data (T3; not before the gate), all free:
+
+1. **SEC EDGAR** — free, official, second-resolution acceptance timestamps for 8-K/Form 4/13F (https://www.sec.gov/search-filings/edgar-application-programming-interfaces). The cleanest source for claims that need sub-minute timing.
+2. **GDELT** — free, 15-minute files; post-2013 records are keyed by `DATEADDED` (when reported), i.e. ingest-side, so it is **not** usable for sub-minute lead/lag, only for hours-scale attention series (https://www.gdeltproject.org/data.html).
+3. **Our own forward-recorded RSS/exchange announcements** — store both `published_at` (source) and `first_seen_at` (our clock); score headline text offline with **FinBERT** (ProsusAI/finbert, Apache-2.0, https://huggingface.co/ProsusAI/finbert; https://arxiv.org/abs/1908.10063).
+
+**Timestamp discipline.** Never join on ingest time for a lead/lag claim; only sources whose `published_at` is set by the originator (EDGAR acceptance datetime, exchange feeds) can support sub-minute claims — aggregator/GDELT timestamps bias toward a false lead of price over news. Skip NewsAPI (449 USD/mo for production), CryptoPanic (paid only), X (pay-per-use) and Reddit (approval queue; no ML training on content without a separate licence) for cost/ToS reasons. Serves O10 Parts B/E and O6; T3, not before the gate. Sources and seen-dates: `docs/research/data-sources-2026-09-29.md` Part 2.
+
 ## 10. HyperEVM pool state (task R-9)
 
 Only needed for studies O4/O8. **Start R-9 only after V-5 and V-6 are ✅.**
@@ -868,6 +880,74 @@ Prior: in finsnap's backtests across its whole universe, **Bollinger Reversion**
 | Special checks | On-chain option spreads are wide and thin; hedging on HL is taker-heavy at short intervals and pays funding; HYPE options are not in the current recorder; needs SPEC-0004 directional risk limits (§17 Q7). **Could fail:** wide option spreads; taker-heavy hedges; gas; EVM key operational surface; no native HL options. |
 | Prereq | R-11/R-12, new EVM options source, P-6, V-10; T3 gate |
 
+### Classification-model studies (M-1…M-5) — PROPOSED
+
+These are **proposals, not yet in the work-breakdown table** (§14); no S-tasks are added for them. They come from `docs/research/data-sources-2026-09-29.md` §3.5 and are ranked by expected value over cost. A classifier is always part of a *study*, never strategy code first (§13). M-1/M-2 are T1-adjacent and cost nothing in data; M-3/M-4/M-5 are T3 and gated by [`docs/GOAL.md`](../docs/GOAL.md) §2.1. Two findings set expectations: after costs, deep LOB models and LLM-news alpha are weak out-of-sample and generally decay (https://arxiv.org/html/2308.01915, https://arxiv.org/abs/2304.07619); classifiers are **filters, not edge creators** (https://hudsonthames.org/does-meta-labeling-add-to-signal-efficacy-triple-barrier-method/).
+
+**Common protocol (all M-studies).** Pre-register the feature list and hyperparameter grid in the hypothesis registry (§13.13); always include a baseline (linear/logistic, or the base rule with no filter); purged walk-forward with embargo; block-bootstrap CIs on net PnL/episode and APR at the headline capital ($25k) and the §13.4 latency grid; **PASS = 95% CI lower bound > 0 net of costs AND uplift vs baseline CI > 0 AND ≥ 30 out-of-sample signals per variant**; MARGINAL/FAIL per the §13.6 APR floor/target thresholds; report the Deflated Sharpe with the true trial count.
+
+#### M-1 — Meta-labelled take/skip filter on arb episodes (proposal; T1-adjacent, rank 1)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | Among episodes that pass the base rule at latency L, a secondary classifier predicts which are net-positive, raising net PnL/episode and cutting the loss tail versus taking all. |
+| Features (known at detection) | net edge bps; spread and depth at both venues; time since last HL oracle/mark update; Binance-lead move size; recent volatility; hour; funding-settlement proximity. |
+| Label | 1 if episode net PnL after fees/slippage at latency L is > 0 (fixed horizon = episode life, triple-barrier style: profit target, stop, time). |
+| Split | Chronological purged walk-forward, ≥ 14 days recorded data (gate G1), last 30% untouched hold-out; models logistic (baseline) and GBT. |
+| Cost model | Reuse P-3 (fees/slippage/latency grid). |
+| Pass rule | Hold-out net PnL/episode of the filtered set exceeds the unfiltered set by CI lower bound > 0 with ≥ 30 signals; the filter must compile to a ≤ 20-parameter rule (hot-path-safe). |
+| Data cost / tier | 0 data cost, effort S/M; T1-adjacent — serves GOAL §2 items 1/3 (O5/O1/O12 after P-4). |
+
+#### M-2 — Microstructure GBT vs linear OFI for CEX-to-HL lead (proposal; T1-adjacent, rank 2)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | A GBT on multi-level OFI, trade imbalance, Binance-minus-HL mid basis, and depth ratios predicts the HL mid move over 100 ms–5 s beyond the linear OFI baseline (Cont, Kukanov, Stoikov 2014, https://arxiv.org/abs/1011.6402). |
+| Features | multi-level OFI, trade imbalance, CEX-minus-HL mid basis, depth ratios. |
+| Label | Ternary sign of HL mid change beyond (half-spread + fee) at horizon h ∈ {0.25, 1, 5} s; trade only when predicted class prob > threshold. |
+| Split | Walk-forward by day, embargo = h. |
+| Cost model | Taker fee tier + spread + latency grid (§13.2/§13.4). |
+| Pass rule | Net APR CI lower bound > floor at latency ≥ measured p50 tick-to-order + RTT, and uplift over the linear OFI baseline > 0; otherwise record FAIL (a useful negative result). |
+| Data cost / tier | 0 data cost, effort M; T1-adjacent — serves O5/O12. |
+
+#### M-3 — Options-positioning features → daily direction of HIP-3 stock perps / bluechips (proposal; T3, rank 3)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | Skew, put/call volume+OI ratio, OI-wall distance, and IV minus realized vol (IV from EODHD; Deribit `mark_iv` for BTC/ETH) predict next-1d/3d direction beyond a trailing-return baseline. |
+| Features | skew, put/call volume+OI ratio, OI-wall distance, IV − RV. |
+| Label | Triple barrier on the daily close of the real stock (proxy) with vol-scaled barriers; then O9b forward on HL perps. |
+| Split | Purged walk-forward on the EODHD window (~2.9 yr ≈ 700 days), last 6 months hold-out; underlying-clustered bootstrap. |
+| Cost model | HL stock-perp fees + funding + open-to-open gap in off-hours. |
+| Pass rule | Hold-out net APR CI lower bound > floor, and IC CI > 0 across ≥ 60% of tickers. |
+| Data cost / tier | 29.99 USD once (V-13 EODHD add-on); power warning — few days × tickers, so pre-register ≤ 6 features and 1 label, expect MARGINAL/inconclusive unless effects are large; T3 (gated, O9a/O9b). |
+
+#### M-4 — News/filing event study with classifier tagging (proposal; T3, rank 4)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | For HIP-3 stock perps, 8-K/news events arriving while the stock is closed are priced by the perp within X minutes, and the FinBERT sign (or a fine-tuned classifier) predicts the perp's 5–60 min drift beyond the initial jump. |
+| Features | FinBERT sentiment sign/score, 8-K item type, event age, closed-session flag. |
+| Label | Sign/size of perp return over [t+1 min, t+60 min] net of costs. |
+| Split | Forward-only, chronological; ≥ 60 trading days and ≥ 30 events/variant. |
+| Cost model | HL fees + spread (event study, §13.8). |
+| Pass rule | Event-study CAR CI excludes 0 net of costs at latency 1 s and 30 s; baseline = keyword/8-K-item-type rules without ML. |
+| Data cost / tier | 0 data cost (EDGAR + forward RSS) but forward calendar time; T3 (gated, O10 B/E and O6). |
+
+#### M-5 — Typed-classifier regime gate benchmark (Jev/Laya) as an off-path arm (proposal; T3, rank 5, optional)
+
+| Item | Detail |
+|---|---|
+| Hypothesis | A Laya (open, local) regime tag (trend/chop/high-vol) from a compact text description of state adds value over a plain vol/volume rule as a gate on M-1/M-2 or on the O11 Bollinger reversion. |
+| Features | typed text description of state (regime); plain vol/volume gate as the baseline. |
+| Label | Regime-conditional net PnL of the base strategy; compare with a GBT/logistic gate and no gate. |
+| Split | Offline on recorded data only; same purged walk-forward as the parent study. |
+| Cost model | Local GPU/CPU only; Jev excluded (closed, per-call cost, no reproducibility). |
+| Pass rule | Uplift CI > 0 over the simplest non-ML gate; if it fails (the likely outcome), close it and delete the idea — expected to fail per the literature above. |
+| Data cost / tier | 0 data cost; T3 (gated, optional, low EV). |
+
+**Jev/Laya identification (secondary sources).** TypeSafe AI's closed, hosted **Jev** (70–500 ms per call; independently measured 264–276 ms) and the open **Laya** (Apache-2.0 encoder classifier on ModernBERT-large/mmBERT-base; 7–40 ms per call; ~7 ms/question batched on a T4) are typed-decision text classifiers released Sept 2026; community `jev-trade`/`jev-hyperliquid` repos run Jev on Hyperliquid perps. No published after-cost out-of-sample evidence exists (a survey of Jev finance projects found only dry-run/paper results). Latency is 70×–5,000× above the 100–250 µs tick-to-order budget ([`docs/GOAL.md`](../docs/GOAL.md) §5.2), so these can only ever be an off-path benchmark arm (M-5). The identification comes from **secondary sources** (blog posts and GitHub repos), not a paper or published weights: https://akmaier.substack.com/p/laya-jev-and-the-return-of-the-discriminative, https://gist.github.com/drillan/6916b16e8ea31a8ec36c8f59d6483150.
+
 ### 13.10 Rigor for episode studies
 
 Fast (episode) studies (§13.3–13.6) are easy to fool: a point estimate over all days, with parameters (`buffer_bps`, `stale_ms`, `merge_ms`, pairs, grid cells) chosen while looking at the whole sample, no uncertainty, and no competition model. §13.8 already has the slow-signal equivalents (pre-registration, OOS, baselines). These rules are required for every study whose verdict rests on episodes.
@@ -1106,11 +1186,13 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
   - **Stage 2 (paid, when O10 Part A or O11 Part A needs full-market prices):** a consolidated (SIP) real-time feed, e.g. Alpaca's paid tier, Polygon.io, or Databento. Prices and tiers ⚠ verify.
 - **Do:** For each candidate, check coverage (IEX-only vs consolidated), real-time vs delayed, pre/post-market and overnight-session coverage, WebSocket support, historical minute bars (years available: needed by O9a/O11 stock-proxy checks), cost, and whether the terms allow storing data for research. Recommend a Stage 1 choice and a Stage 2 choice.
 - **Done when:** §15 has the comparison; the owner has approved the Stage 1 choice (record the approval date).
+- **Research finding (2026-09-29, `docs/research/data-sources-2026-09-29.md` §1.2/§1.5).** Start with **Alpaca free** (IEX-only, 15-min delayed via API, real-time WS capped at 30 symbols) for the O10 Part A pre-check; only if O10 Parts A/D shows edge consider **Massive Stocks Advanced 199 USD/mo** (real-time consolidated) or **Alpaca Algo Trader Plus 99 USD/mo**. No real-time equity feed exists at ~20 USD/mo. Sources: https://alpaca.markets/data, https://massive.com/pricing. Prices are 2026-09-29 list prices and change; re-check before buying. The Do/Done-when above are unchanged.
 
 #### V-13 — Historical options data
 - **Why:** O9a can test options signals on years of history instead of waiting months for forward collection. That requires past option chains (per strike: open interest, volume, and ideally IV) that neither Yahoo nor finsnap has before finsnap's start date.
 - **Do:** (1) Measure what finsnap already has: date range and symbols in its `option_snapshots` table. (2) Compare ≥ 3 vendors (e.g. ThetaData, ORATS, CBOE DataShop, Polygon.io options, Databento OPRA, historicaloptiondata.com) on: symbols (the HIP-3 underlyings + SPY/QQQ), depth of history, daily vs intraday, fields (OI, volume, IV, greeks), format, and price. (3) Recommend buy / don't buy with a cost.
 - **Done when:** §15 has the finsnap coverage and the vendor table; the owner's decision is recorded.
+- **Research finding (2026-09-29, `docs/research/data-sources-2026-09-29.md` §1.2/§1.5).** The cheapest route to the ≥ 2-year daily US options positioning target is the **EODHD US Options add-on at 29.99 USD/mo** (39.99 first 3 months): 6,600+ US underlyings, EOD since Q4 2023 (≈ 2.9 years today), with OI, volume, bid/ask, IV and five greeks (https://eodhd.com/lp/us-stock-options-api), plus **EODHD EOD 19.99 USD/mo** for stock bars (https://eodhd.com/pricing). Longer-history options: HistoricalData.net 199–590 USD, ThetaData 40 USD/mo (6 years). Personal-use licence; the storage/automation clause is **UNVERIFIED** and must be read before pulling. **Buying is an owner decision — no purchase has been made or authorised.** Bought data goes under `research/data/` and is never committed (§17 #27). Prices are 2026-09-29 list prices and change; re-check before buying. The Do/Done-when above are unchanged.
 
 #### V-12 — HIP-3 stock-perp mechanics
 - **Do:** For each HIP-3 dex listing stock/index perps: how the oracle/mark is set during US regular hours, pre/post market, overnight, and weekends; funding formula and cadence; fees (links to V-3); max leverage; trading halts and behavior around corporate actions (splits, dividends, earnings). Sources required.
@@ -1342,7 +1424,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 3. **HyperEVM RPC provider** for R-9 (commercial provider vs own node), and budget.
 4. **Should O5's CEX hedge ever be built?** Holding CEX accounts is a new operational surface (keys, KYC, transfers). Measured only for now.
 5. **Maker-leg variants** (fill-probability modeling) are deferred until a taker-taker study looks promising.
-6. **Historical options data** (V-13). Buying past option chains lets O9a test years of history now. The owner decides after V-13 shows finsnap's existing coverage and vendor prices. **V-9 (2026-09-28):** finsnap retains only the **last 30 days** and stores only volume/OI/underlying price (no IV/bid/ask), so its coverage is far below O9a's ≥ 2-year target; V-13 vendors are the only route to real history.
+6. **Historical options data** (V-13). Buying past option chains lets O9a test years of history now. The owner decides after V-13 shows finsnap's existing coverage and vendor prices. **V-9 (2026-09-28):** finsnap retains only the **last 30 days** and stores only volume/OI/underlying price (no IV/bid/ask), so its coverage is far below O9a's ≥ 2-year target; V-13 vendors are the only route to real history. **Research note (2026-09-29, `docs/research/data-sources-2026-09-29.md`):** the same 30-day limit (and the Yahoo ToS risk in #31) is what makes the paid route attractive — the cheapest licensed ≥ 2-year daily history is the EODHD US Options add-on at 29.99 USD/mo (EOD since Q4 2023). Buying is an owner decision; no purchase has been made or authorised. Details in V-13's §14.2 finding.
 7. **Directional risk limits.** O9/O10 Part B strategies carry market risk that the arb strategies don't; if one passes, SPEC-0004 needs per-strategy stop-loss and volatility-scaled sizing before it goes live.
 8. **Writer-originated `seq` (R-1/R-2).** §5.1 defines `seq` as the per-`conn` data counter, but `segment_open`/`segment_close` are produced by the writer, not the caller. The writer currently stamps `segment_open.seq` from the first data envelope and `segment_close.seq` from the last, so a naive hole detector sees no downward jump. Confirm this is the intended reading.
 9. **`records`/`bytes_raw` scope (R-2).** §6 lists `records`/`bytes_raw` without saying whether they include the `segment_close` line. Current choice: `segment_close.meta` counts lines **before** close; the manifest's `records` counts **total file lines including close** (so `records` equals the decoded line count).
@@ -1363,7 +1445,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 24. **How a `drop` gap ends (R-2/R-7).** `gap_start{reason:"drop"}` is emitted after a bounded-channel overflow but never gets a matching `gap_end`, so a naive coverage calculation would mark the rest of the stream missing. `verify` currently treats an unpaired `gap_start` as running to the last record on the stream (the conservative reading). Define when a drop gap ends, and whether `verify` should instead bound it (for example, one flush interval) or ignore it.
 25. **AWS account for requester-pays buckets (owner).** B-5/B-6 and the V-8 sample download need an AWS account. Expected cost is a few dollars per month of fills, ~$100+ for a full year. The owner must create and hold the credentials; agents never should.
 26. **Tardis subscription (owner).** Only if the preliminary HIST-PRELIM results look promising. The cheapest route to "every day" HL `bbo` for 4 months is a monthly Academic/Solo Perpetuals plan (~$350–1,200/mo; minimum $300); otherwise rely on our own recorder.
-27. **Data licenses.** Tardis, Hydromancer and the HL S3 terms for storing data for research are unstated; only SonarX publishes an explicit (CC0) license. Keep everything under `research/data/` (never committed).
+27. **Data licenses.** Tardis, Hydromancer and the HL S3 terms for storing data for research are unstated; only SonarX publishes an explicit (CC0) license. Keep everything under `research/data/` (never committed). **Research note (2026-09-29, `docs/research/data-sources-2026-09-29.md` §1.4):** Tardis's ToS (https://docs.tardis.dev/legal/terms-of-service) prohibits using the data to train or validate ML models without a separate agreement, which directly affects the classifier studies (M-1…M-5); internal/research/personal use and task-specific statistical models are allowed per the report, but the ML clause is the one to read. Deribit's ToS was not read (**UNVERIFIED**).
 28. ~~**June-2026 `l2Book` throttling.**~~ **Resolved 2026-09-28 (V-1):** §15's `l2Book` row records the default 20-level push at 2.4–6.6 s (now ~5 s) and `fast:true` 5 levels at ~0.5 s; no re-check needed.
 29. **Claims to verify (ideas review).** Not applied to spec facts unless the claim cites an official docs URL; those are in §15 tagged "(ideas review, verify)". Remaining bullets:
     - HIP-4 outcome-market launch date and the BTC/ETH/HYPE/SOL extension are third-party ⚠ verify (the docs describe the primitive, not the date); gates O17.
@@ -1374,7 +1456,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
     - The docs state HyperCore order sequencing but not an explicit EVM block ordering rule; keep O8 Q2 open (source: `hyperliquid.gitbook.io/hyperliquid-docs/hypercore/order-book`).
     - §B claims already settled by V-1 (trades.users, `l2Book` fast mode, `candleSnapshot` retention, spot ctx channel, WS idle close, `chronyc` columns): no action; see §15.
 30. **`markets.asset_id` convention (B-3).** §13.1 does not say how `asset_id` is numbered across universes. B-3 (`research/hlr/backfill/hl_rest.py`, `build_markets`) stores the index **within the universe it was read from** (main perp dex, each HIP-3 dex, or spot), so `asset_id` is unique only together with the dex/kind. Studies must join on the market name, not `asset_id`. If a global id is ever needed, adopt HL's own asset-id offsets (verify against the docs first).
-31. **Yahoo options ToS, delay and reliability (V-9).** Yahoo's ToS forbids automated collection ("access or collect data … using any automated means … without our express, prior permission") and reproduction/redistribution without written permission, so storing Yahoo option chains for research/trading is a legal risk; the endpoint is also unofficial (cookie+crumb session, 15-min delayed, can change without notice). Before R-11 collects for O9b, either confirm with the owner that personal research storage is acceptable or replace Yahoo with a licensed source (ties into V-11/V-13). Sources: https://legal.yahoo.com/us/en/yahoo/terms/otos/index.html, https://finance.yahoo.com/quote/QQQ/options.
+31. **Yahoo options ToS, delay and reliability (V-9).** Yahoo's ToS forbids automated collection ("access or collect data … using any automated means … without our express, prior permission") and reproduction/redistribution without written permission, so storing Yahoo option chains for research/trading is a legal risk; the endpoint is also unofficial (cookie+crumb session, 15-min delayed, can change without notice). Before R-11 collects for O9b, either confirm with the owner that personal research storage is acceptable or replace Yahoo with a licensed source (ties into V-11/V-13). Sources: https://legal.yahoo.com/us/en/yahoo/terms/otos/index.html, https://finance.yahoo.com/quote/QQQ/options. **Research note (2026-09-29, secondary sources):** Cboe's delayed-quotes page states automated download is prohibited and IPs are blocked (secondary), and Yahoo's ToS forbids automated access (secondary); both push away from free web endpoints for R-11/O9b. A licensed alternative at ~30 USD/mo (EODHD Options add-on) is recorded in V-13's §14.2 finding and #6.
 32. **Uncertain `underlyings.toml` entries and index proxies (V-9).** The file marks 33 active HIP-3 underlyings `no-chain` because their identity or optionability is unconfirmed (ANSEM, ANTH, BIRD, BOT, CBRS, CXMT, DRAM, GIGADEV, HYUNDAI, JP225, KIOXIA, KR200, LYTE, MINIMAX, NCLD, OAI, OURA, PURRDAT, QNT, SHAZ, SHEIN, SKHX, SKHY, SMSN, SNXX, SOFTBANK, SPCX, STRC, TREAD, UNITREE, USBOND, XYZ100, ZHIPU). The index-ETF proxies (SP500/US500→SPY, USTECH→QQQ, SMALL2000→IWM) and the foreign-name identifications should be reviewed by the owner; a wrong mapping silently biases O9/O10.
 33. **R-12 Deribit field sources (V-10).** `get_book_summary_by_currency` omits `bid_iv`/`ask_iv`, greeks and `index_price`, so R-12 cannot fill §13.1's `deribit_options` row from it alone: add `get_instruments` (expiry/strike/cp, capped at 1 req/s) and per-instrument `ticker` (or the `ticker.<instrument>` WS channel). Deribit's terms for storing market data are unstated (see #27).
 34. **Grading edge cases (P-5 review, 2026-09-28).** Chosen readings, all conservative: coverage below `min_coverage_pct` grades **FAIL** (a failed `[quality]` gate), not INCONCLUSIVE; a missing, failed or non-positive buffered-cost re-run (`robustness_buffer_multiplier`) grades **FAIL**; a `preliminary` result is capped at **MARGINAL**; the headline latency rounds **up** to the next grid value (above the grid → INCONCLUSIVE) and the headline capital must match a run exactly; a report without the `adj_jitter` variant is INCONCLUSIVE; `data_source` is derived from the input tables' `source` column (anything but pure recorder data → HIST-PRELIM).
