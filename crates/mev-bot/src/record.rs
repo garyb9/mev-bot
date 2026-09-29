@@ -40,6 +40,7 @@ use mev_recorder::{
     planner::{Stream, plan as build_plan},
     reader,
     sources::{
+        cex::{CexConfig, CexKind, CexSource},
         deribit::{DEFAULT_BASE_URL, DeribitConfig, DeribitSource},
         hl_rest::{RestSnapshotter, SnapshotterConfig},
     },
@@ -115,8 +116,7 @@ struct Profile {
     rest: RestSection,
     /// Deribit public options summaries (R-12).
     deribit: DeribitSection,
-    /// Reference CEX symbols (R-8, not started yet).
-    #[allow(dead_code)]
+    /// Reference CEX symbols (R-8).
     cex: CexSection,
     /// HyperEVM pool source (R-9, not started yet).
     #[allow(dead_code)]
@@ -449,9 +449,6 @@ pub async fn run(
     if profile.hyperevm.enabled {
         warn!("hyperevm recording is R-9 and not wired; ignoring");
     }
-    if !profile.cex.binance_usdm.is_empty() {
-        debug!("cex sources are R-8 and not wired; ignoring");
-    }
 
     let universe = Universe::load(network, profile.hl.wants_hip3()).await?;
     let plan = build_plan(
@@ -486,6 +483,7 @@ pub async fn run(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let rest_shutdown = Arc::new(Notify::new());
     let deribit_shutdown = Arc::new(Notify::new());
+    let cex_shutdown = Arc::new(Notify::new());
 
     // Register connection health before spawning the readiness monitor.
     let mut states: Vec<(String, Arc<ConnState>)> = plan
@@ -583,6 +581,41 @@ pub async fn run(
         debug!("deribit source disabled by profile");
     }
 
+    // Binance/Bybit reference sources (SPEC-0008 §9, R-8). One connection per
+    // exchange stream, each with its own `(src, src)` SegmentWriter so the
+    // R-14 mount guard applies unchanged. Only spawned when the profile has a
+    // non-empty symbol list for that venue.
+    for (kind, symbols) in cex_venues(&profile) {
+        if symbols.is_empty() {
+            continue;
+        }
+        let src = kind.src();
+        let writer = Arc::new(
+            SegmentWriter::spawn(segment_config(
+                &profile,
+                network,
+                src,
+                src,
+                &meta,
+                clock.clone(),
+                1,
+                mount_guard.clone(),
+            ))
+            .with_context(|| format!("spawning segment writer for {src}"))?,
+        );
+        let sink = Arc::new(CountingSink {
+            writer: writer.clone(),
+            clock: clock.clone(),
+            health: RecorderHealth::new(Vec::new()),
+            metrics: ConnMetrics::new(src, src),
+            state: ConnState::new(),
+            account_hl_rest: false,
+        });
+        let source = CexSource::new(CexConfig::new(kind, symbols.clone()), sink, clock.clone());
+        info!(src, symbols = symbols.len(), "starting cex source");
+        tasks.push(tokio::spawn(run_cex(source, cex_shutdown.clone())));
+    }
+
     tasks.push(tokio::spawn(disk_monitor(
         profile.out_dir.clone(),
         shutdown_rx.clone(),
@@ -616,6 +649,7 @@ pub async fn run(
     let _ = shutdown_tx.send(true);
     rest_shutdown.notify_one();
     deribit_shutdown.notify_one();
+    cex_shutdown.notify_one();
     for task in tasks {
         let _ = task.await;
     }
@@ -821,6 +855,15 @@ fn deribit_config(profile: &Profile) -> DeribitConfig {
         currencies: profile.deribit.currencies.clone(),
         ..DeribitConfig::default()
     }
+}
+
+/// The configured CEX venues and their symbol lists (SPEC-0008 §9, R-8).
+fn cex_venues(profile: &Profile) -> [(CexKind, &Vec<String>); 3] {
+    [
+        (CexKind::BinanceUsdm, &profile.cex.binance_usdm),
+        (CexKind::BinanceSpot, &profile.cex.binance_spot),
+        (CexKind::BybitLinear, &profile.cex.bybit_linear),
+    ]
 }
 
 /// Wall-clock milliseconds since the epoch.
@@ -1290,6 +1333,12 @@ async fn run_deribit(
     DeribitSource::new(config, sink, clock).run(shutdown).await;
     // Dropping the last `Arc` finalizes the segment (SegmentWriter::drop).
     drop(writer);
+}
+
+/// Run one CEX reference source (SPEC-0008 §9, R-8) until shutdown, then
+/// finalize its segment.
+async fn run_cex(source: CexSource, shutdown: Arc<Notify>) {
+    source.run(shutdown).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2257,6 +2306,137 @@ mod tests {
         assert!(
             report.by_kind.get("rest").copied().unwrap_or(0) >= 2,
             "expected rest envelopes: {:#?}",
+            report.by_kind
+        );
+        assert!(
+            report.by_kind.get("segment_close").copied().unwrap_or(0) == 1,
+            "segment did not finalize: {:#?}",
+            report.by_kind
+        );
+    }
+
+    /// `cex_venues` maps the three `[cex]` lists to their source ids.
+    #[test]
+    fn cex_venues_map_to_the_spec_srcs() {
+        let profile = Profile {
+            cex: CexSection {
+                binance_usdm: vec!["BTCUSDT".to_string()],
+                binance_spot: vec![],
+                bybit_linear: vec!["ETHUSDT".to_string()],
+            },
+            ..Profile::default()
+        };
+        let venues = cex_venues(&profile);
+        assert_eq!(venues[0].0.src(), "binance-usdm");
+        assert_eq!(venues[1].0.src(), "binance-spot");
+        assert_eq!(venues[2].0.src(), "bybit-linear");
+        assert_eq!(venues[0].1, &vec!["BTCUSDT".to_string()]);
+        assert!(venues[1].1.is_empty());
+        assert_eq!(venues[2].1, &vec!["ETHUSDT".to_string()]);
+    }
+
+    /// The default profile enables all three CEX venues (SPEC-0008 §7.3).
+    #[test]
+    fn default_profile_has_non_empty_cex_lists() {
+        // `Profile::default()` has empty lists; the §7.3 symbols live in the
+        // repository's `config/record.toml`. Parse that file to prove the
+        // wiring sees them (guards against a silent rename of the `[cex]` keys).
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("config/record.toml");
+        let config = parse_toml(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let default = config.profile.get("default").unwrap();
+        assert!(!default.cex.binance_usdm.is_empty());
+        assert!(!default.cex.binance_spot.is_empty());
+        assert!(!default.cex.bybit_linear.is_empty());
+    }
+
+    /// A CEX source pointed at a mock server writes a finalized `bybit-linear`
+    /// segment with `frame` envelopes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cex_source_writes_a_bybit_linear_segment() {
+        let tmp = temp_dir("cex-bybit");
+        let dir = tmp.path();
+
+        // Mock WS server: accept one connection, push frames, and read the
+        // subscribe message.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await; // the subscribe frame
+            let frame = r#"{"topic":"orderbook.1.BTCUSDT","data":{"b":[["1","1"]]}}"#;
+            loop {
+                if socket.send(Message::Text(frame.into())).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
+        let writer = Arc::new(
+            SegmentWriter::spawn(segment_config(
+                &Profile {
+                    out_dir: dir.to_path_buf(),
+                    ..Profile::default()
+                },
+                Network::Testnet,
+                "bybit-linear",
+                "bybit-linear",
+                &SegmentOpenMeta::default(),
+                clock.clone(),
+                1,
+                Arc::new(MountGuard::unguarded()),
+            ))
+            .unwrap(),
+        );
+        let sink = Arc::new(CountingSink {
+            writer: writer.clone(),
+            clock: clock.clone(),
+            health: RecorderHealth::new(Vec::new()),
+            metrics: ConnMetrics::new("bybit-linear", "bybit-linear"),
+            state: ConnState::new(),
+            account_hl_rest: false,
+        });
+        let config = CexConfig {
+            base_url: format!("ws://{addr}"),
+            ..CexConfig::new(CexKind::BybitLinear, vec!["BTCUSDT".to_string()])
+        };
+        let source = CexSource::new(config, sink, clock);
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(run_cex(source, shutdown.clone()));
+
+        // Wait for at least one frame to reach the segment writer.
+        for _ in 0..400 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let has_bytes = segment_files(dir)
+                .first()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+                > 0;
+            if has_bytes {
+                break;
+            }
+        }
+        shutdown.notify_one();
+        task.await.unwrap();
+        server.abort();
+        drop(writer);
+
+        let files = segment_files(dir);
+        assert!(!files.is_empty(), "no bybit-linear segment was written");
+        let report = reader::inspect(&files).unwrap();
+        assert!(
+            report.by_src.get("bybit-linear").copied().unwrap_or(0) > 0,
+            "segment has no bybit-linear records: {:#?}",
+            report.by_src
+        );
+        assert!(
+            report.by_kind.get("frame").copied().unwrap_or(0) > 0,
+            "expected frame envelopes: {:#?}",
             report.by_kind
         );
         assert!(

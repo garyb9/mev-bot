@@ -32,6 +32,7 @@ pub use reader::{
 pub use segment::{
     DiskSpace, ManifestEntry, SegmentConfig, SegmentError, SegmentWriter, SystemDiskSpace,
 };
+pub use sources::cex::{BinanceProtocol, BybitProtocol, CexConfig, CexKind, CexSource};
 pub use sources::hl_rest::{
     DEFAULT_WEIGHT_PER_MIN, EnvelopeSink, RawInfoClient, RawResponse, RestError, RestSnapshotter,
     SnapshotterConfig, SnapshotterState, WeightBucket,

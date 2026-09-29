@@ -2471,6 +2471,7 @@ name = "mev-recorder"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "futures-util",
  "libc",
  "mev-core",
  "mev-hl-client",
@@ -2481,6 +2482,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "wiremock",
  "zstd",

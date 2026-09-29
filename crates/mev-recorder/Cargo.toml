@@ -23,6 +23,8 @@ tokio.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
 wiremock.workspace = true
 criterion.workspace = true
 tempfile.workspace = true
