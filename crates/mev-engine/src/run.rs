@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, select};
 
-use crate::channels::Inputs;
+use crate::channels::{Inputs, MarketControl};
 use crate::clock::{LiveClock, SharedClock};
 use crate::dispatch::StrategyDispatcher;
 use crate::instrument::{LatencyRecorder, Metric};
@@ -262,14 +262,33 @@ impl<D: Dispatcher> EngineLoop<D> {
         // 2b. Lossless feed-control signals (gap opens). Drained after the
         // market updates so a pre-gap snapshot still queued cannot restore a
         // coin, and so any order dispatched later this iteration is gated by
-        // the stale flag. `control_failed` is the fail-closed fallback a
-        // producer sets when it could not enqueue the signal.
-        let mut gap = self.inputs.control_failed.swap(false, Ordering::AcqRel);
-        while self.inputs.control.try_recv().is_ok() {
-            gap = true;
+        // the stale flag.
+        //
+        // The gap's timestamp is the moment the drop was **detected**, carried
+        // on the control message (`disconnect_ns`, on the shared frame clock),
+        // not this iteration's start (`now_mono_ns`). The market drain above can
+        // still be pulling pre-gap frames queued while the socket was alive, so
+        // an iteration start taken before the drain would predate them and let a
+        // pre-gap book clear staleness.
+        let mut gap_detect: Option<u64> = None;
+        while let Ok(control) = self.inputs.control.try_recv() {
+            match control {
+                MarketControl::GapOpen { disconnect_ns } => {
+                    gap_detect = Some(gap_detect.map_or(disconnect_ns, |g| g.max(disconnect_ns)));
+                }
+            }
         }
-        if gap {
-            self.state.mark_all_stale(now_mono_ns);
+        // `control_failed` is the fail-closed fallback a producer sets when it
+        // could not enqueue the signal. It carries no timestamp, so fall back to
+        // the drain time: this is read after the producer set it, so it is never
+        // earlier than the detection and only a book received after the drain
+        // can clear staleness (fail closed).
+        if self.inputs.control_failed.swap(false, Ordering::AcqRel) {
+            let drain_ns = self.clock.mono_ns();
+            gap_detect = Some(gap_detect.map_or(drain_ns, |g| g.max(drain_ns)));
+        }
+        if let Some(gap_mono_ns) = gap_detect {
+            self.state.mark_all_stale(gap_mono_ns);
         }
 
         // 3. Timers. The wall-clock half of the stamp comes from the clock, so
@@ -572,6 +591,55 @@ mod tests {
         }
     }
 
+    /// Whether the risk gate rejects a non-reduce-only place on `slot` as stale.
+    ///
+    /// Built with default limits: the stale check (#3) fires before any notional
+    /// or margin check, so this isolates the staleness decision.
+    fn risk_gate_rejects_non_reduce_only(slot: &crate::state::MarketSlot) -> bool {
+        use rust_decimal::Decimal;
+
+        use mev_strategy::{OrderIntent, Side, StrategyId, TimeInForce};
+
+        use crate::builder::AssetMeta;
+        use crate::orders::OrderManager;
+        use crate::risk::{RateBudget, RateBudgetConfig, RiskCtx, RiskGate, RiskReason};
+        use crate::state::AccountState;
+        use crate::strategy::Action;
+
+        let orders = OrderManager::new(1);
+        let account = AccountState::new(1);
+        let rate = RateBudget::new(RateBudgetConfig::default());
+        let meta = AssetMeta {
+            asset_id: 0,
+            sz_decimals: 0,
+            is_spot: false,
+            tick_size: None,
+        };
+        let ctx = RiskCtx {
+            coin: CoinId(0),
+            orders: &orders,
+            account: &account,
+            slot,
+            meta: &meta,
+            rate: &rate,
+            now_ms: 0,
+        };
+        let intent = OrderIntent {
+            strategy: StrategyId::from("t"),
+            coin: "BTC".into(),
+            side: Side::Buy,
+            limit_px: Some(Decimal::from(100)),
+            size: Decimal::ONE,
+            tif: TimeInForce::Alo,
+            reduce_only: false,
+            rationale: "test".into(),
+            cloid: None,
+            signal_ms: 0,
+            decision_ms: 0,
+        };
+        RiskGate::default().evaluate(&Action::Place(intent), &ctx) == Err(RiskReason::StaleCoin)
+    }
+
     type TestLoop = (
         EngineLoop<Recorder>,
         InputHandles,
@@ -622,7 +690,7 @@ mod tests {
         let (mut engine, handles, _stop) = loop_with(record, 2, 0);
 
         // A gap via the lossless control signal marks every coin stale.
-        handles.signal_gap();
+        handles.signal_gap(1_000);
         engine.iterate(1_000);
         assert!(engine.state().slot(CoinId(0)).unwrap().stale);
         assert!(engine.state().slot(CoinId(1)).unwrap().stale);
@@ -654,7 +722,7 @@ mod tests {
         // The gap is observed first, then a book that was received *before* the
         // gap drains late (the receive stamp, 500, predates the gap at 1000).
         // It must not clear the flag: its data is pre-gap.
-        handles.signal_gap();
+        handles.signal_gap(1_000);
         engine.iterate(1_000);
         assert!(engine.state().slot(CoinId(0)).unwrap().stale);
 
@@ -665,6 +733,47 @@ mod tests {
         // A book received after the gap does clear it.
         handles.send_market(book_update(0, 1_001));
         engine.iterate(1_002);
+        assert!(!engine.state().slot(CoinId(0)).unwrap().stale);
+    }
+
+    #[test]
+    fn a_book_received_between_iteration_start_and_the_drop_cannot_clear_staleness() {
+        let record = Arc::new(Mutex::new(Record::default()));
+        let (mut engine, handles, _stop) = loop_with(record, 1, 0);
+
+        // The engine iteration starts at 500, but the drop was detected at
+        // 1000. A pre-gap book (700) is still queued and delivered after the
+        // gap signal: it is newer than the iteration start but older than the
+        // drop, so it must not clear the flag.
+        handles.signal_gap(1_000);
+        engine.iterate(500);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+
+        handles.send_market(book_update(0, 700));
+        engine.iterate(700);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+
+        // The risk gate keys on that flag, so a non-reduce-only order priced on
+        // the pre-gap book is still rejected.
+        let slot = engine.state().slot(CoinId(0)).unwrap();
+        assert!(
+            risk_gate_rejects_non_reduce_only(slot),
+            "stale pre-gap book must keep non-reduce-only orders rejected"
+        );
+    }
+
+    #[test]
+    fn a_book_received_after_the_drop_clears_staleness() {
+        let record = Arc::new(Mutex::new(Record::default()));
+        let (mut engine, handles, _stop) = loop_with(record, 1, 0);
+
+        handles.signal_gap(1_000);
+        engine.iterate(500);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+
+        // A book received strictly after the drop (1001) is post-gap and clears.
+        handles.send_market(book_update(0, 1_001));
+        engine.iterate(1_001);
         assert!(!engine.state().slot(CoinId(0)).unwrap().stale);
     }
 
@@ -710,28 +819,56 @@ mod tests {
         assert_eq!(handles.send_market(bbo(0, 1)), MarketSend::Queued);
         assert_eq!(handles.send_market(bbo(0, 2)), MarketSend::Dropped);
         // The gap still reaches the engine on the independent control channel.
-        assert_eq!(handles.signal_gap(), crate::channels::GapSignal::Queued);
+        assert_eq!(
+            handles.signal_gap(1_000),
+            crate::channels::GapSignal::Queued
+        );
         engine.iterate(1_000);
         assert!(engine.state().slot(CoinId(0)).unwrap().stale);
     }
 
     #[test]
-    fn an_undeliverable_gap_signal_fails_closed() {
+    fn an_undeliverable_gap_signal_fails_closed_at_the_drain_time() {
         let record = Arc::new(Mutex::new(Record::default()));
-        let (mut engine, handles, _stop) = loop_with(record, 2, 0);
+        let (handles, inputs) = inputs(64, 64);
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let dispatcher = Recorder {
+            record,
+            interests: vec![Interests::coins([CoinId(0), CoinId(1)])],
+        };
+        // The fail-closed latch has no timestamp, so the engine uses the drain
+        // time. Pin the clock so the cut is deterministic: drain time 500.
+        let clock = Arc::new(crate::clock::ReplayClock::new());
+        clock.set_ms(0, 500);
+        let mut engine = EngineLoop::new(
+            inputs,
+            dispatcher,
+            LoopConfig {
+                spin_us: 0,
+                coin_count: 2,
+            },
+            stop_rx,
+        )
+        .with_clock(clock);
 
-        // Simulate a producer that could not enqueue the control signal (the
-        // control queue was full / the engine was unreachable): it set the
-        // shared latch, so the engine must treat every coin stale, not assume
-        // the feed is fine.
+        // A producer that could not enqueue the control signal (the control
+        // queue was full / the engine was unreachable) set the shared latch, so
+        // the engine must treat every coin stale despite the later iteration
+        // time (9_999).
         handles.force_control_failure();
-        engine.iterate(1_000);
+        engine.iterate(9_999);
         assert!(engine.state().slot(CoinId(0)).unwrap().stale);
         assert!(engine.state().slot(CoinId(1)).unwrap().stale);
 
-        // Fail-closed is not permanent: a post-gap book snapshot still clears.
-        handles.send_market(book_update(0, 1_001));
-        engine.iterate(1_001);
+        // A book received before the drain time (400) stays stale.
+        handles.send_market(book_update(0, 400));
+        engine.iterate(400);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+
+        // A book received after the drain time (700) clears it: the latch used
+        // the drain time (500), not the iteration time (9_999).
+        handles.send_market(book_update(0, 700));
+        engine.iterate(700);
         assert!(!engine.state().slot(CoinId(0)).unwrap().stale);
     }
 

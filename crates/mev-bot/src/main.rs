@@ -865,6 +865,33 @@ struct SideFrame {
 /// Bounded queue from the ingest task to the health/SQLite sidecar.
 const SIDE_CHANNEL_CAP: usize = 16_384;
 
+/// Apply a raw market-stream gap to the engine, returning `true` when the
+/// ingest task should stop (clean shutdown).
+///
+/// The gap's stale cut must be the moment the drop was detected, so this carries
+/// [`mev_hl_client::RawEvent::Gap::disconnect_ns`] (process-monotonic, the same
+/// clock that stamps frames) into the engine's control channel. Discarding it
+/// and letting the engine use its iteration start would let a pre-gap book that
+/// was still queued when the socket died clear staleness and pass the risk gate
+/// on pre-disconnect depth.
+fn signal_raw_gap(handles: &InputHandles, event: &RawEvent) -> bool {
+    let RawEvent::Gap {
+        reason,
+        detail,
+        disconnect_ns,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    tracing::warn!(reason, detail, "market feed gap");
+    if reason == "shutdown" {
+        return true;
+    }
+    let _ = handles.signal_gap(*disconnect_ns);
+    false
+}
+
 /// Ingest market data into the v2 engine.
 ///
 /// The typed decode and the hand-off to the engine happen **first**, so the
@@ -933,17 +960,16 @@ async fn ingest(
                                 metrics::counter!(mev_metrics::names::SIDECAR_DROPS).increment(1);
                             }
                         }
-                        Ok(RawEvent::Gap { reason, detail, .. }) => {
-                            tracing::warn!(reason, detail, "market feed gap");
-                            if reason == "shutdown" {
+                        Ok(gap @ RawEvent::Gap { .. }) => {
+                            // Mark coins stale until a fresh book arrives, using
+                            // the drop's detection time. With the R-8 fix2
+                            // `RawWsConn`, this arrives the moment the drop is
+                            // detected, before the reconnect. The signal uses
+                            // the lossless control channel so a saturated market
+                            // queue cannot swallow it.
+                            if signal_raw_gap(&handles, &gap) {
                                 return;
                             }
-                            // Mark coins stale until a fresh book arrives. With
-                            // the R-8 fix2 `RawWsConn`, this arrives the moment
-                            // the drop is detected, before the reconnect. The
-                            // signal uses the lossless control channel so a
-                            // saturated market queue cannot swallow it.
-                            let _ = handles.signal_gap();
                         }
                         Ok(RawEvent::Opened { .. }) => {
                             // The reconnect succeeded; the engine clears each
@@ -952,7 +978,9 @@ async fn ingest(
                         Ok(_) => {}
                         Err(err) => {
                             tracing::warn!(error = %err, "market stream ended");
-                            let _ = handles.signal_gap();
+                            // No `RawEvent::Gap` carried a timestamp here: read
+                            // the detection time on the shared frame clock.
+                            let _ = handles.signal_gap(mev_hl_client::raw_ws::mono_ns());
                             return;
                         }
                     }
@@ -1542,6 +1570,26 @@ mod tests {
         assert!(
             rewritten >= now && rewritten <= now + DEFAULT_NONCE_LEASE_MS + 60_000,
             "{rewritten} should be the new lease, not the corrupt value"
+        );
+    }
+
+    #[test]
+    fn raw_gap_carries_its_disconnect_time_to_the_engine() {
+        use mev_engine::channels::{MarketControl, inputs};
+
+        let (handles, channel_inputs) = inputs(4, 4);
+        let event = RawEvent::Gap {
+            reason: "closed".into(),
+            detail: "server closed".into(),
+            disconnect_ns: 4_242,
+            t_ns: 0,
+        };
+        assert!(!signal_raw_gap(&handles, &event));
+        assert_eq!(
+            channel_inputs.control.try_recv(),
+            Ok(MarketControl::GapOpen {
+                disconnect_ns: 4_242
+            })
         );
     }
 

@@ -282,6 +282,17 @@ impl FundingBasis {
         if self.config.rebalance_drift_bps <= Decimal::ZERO {
             return None;
         }
+        // Sizing the spot order uses the perp mid, and the risk gate only checks
+        // the order's own (spot) coin, so a stale perp would size from pre-gap
+        // depth. Fail closed: skip the rebalance until both legs are fresh.
+        if ctx.is_stale(self.config.perp_coin) || ctx.is_stale(self.config.spot_coin) {
+            tracing::debug!(
+                perp = ctx.coin_name(self.config.perp_coin),
+                spot = ctx.coin_name(self.config.spot_coin),
+                "funding rebalance skipped: stale leg"
+            );
+            return None;
+        }
         let perp_px = ctx.mid(self.config.perp_coin)?;
         let perp_abs = account.position_szi(self.config.perp_coin).abs();
         let spot = account.spot_balance(&self.config.spot_token);
@@ -609,6 +620,35 @@ mod tests {
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].coin, "@1");
         assert_eq!(intents[0].side, Side::Sell);
+    }
+
+    #[test]
+    fn skips_rebalance_when_the_perp_pricing_leg_is_stale() {
+        let mut strategy = strategy();
+        let rich = market_btc_spot("0.001", "59990", "60010");
+        let account = AccountState::new(2);
+        let ctx = ctx_with(&rich, &account, 0);
+        let _ = run(&mut strategy, &ctx);
+        let mut out = Actions::new();
+        strategy.on_order(&fill(CoinId(1)), &ctx, &mut out);
+        strategy.on_order(&fill(CoinId(1)), &ctx, &mut out);
+        assert_eq!(strategy.state(), "hedged");
+
+        // The spot book is fresh, but the perp mid used to size the spot
+        // rebalance is stale: the action must be skipped, not sized off pre-gap
+        // perp depth. The risk gate would not catch it (it checks the spot
+        // coin).
+        let mut account = AccountState::new(2);
+        account.set_position_szi(CoinId(0), ds("-0.16"));
+        account.spot.insert("UBTC".into(), ds("0.20"));
+        let mut market = market_btc_spot("0.001", "59990", "60010");
+        market[0].stale = true;
+        let ctx = ctx_with(&market, &account, 0);
+        assert!(places_of(run(&mut strategy, &ctx)).is_empty());
+
+        // A fresh perp lets the same drift rebalance as before.
+        let ctx = ctx_with(&rich, &account, 0);
+        assert_eq!(places_of(run(&mut strategy, &ctx)).len(), 1);
     }
 
     #[test]

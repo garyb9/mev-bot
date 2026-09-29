@@ -151,6 +151,26 @@ impl EngineState {
     /// opened on a shared connection, so we cannot attribute it to one coin —
     /// SPEC-0010 §16). The time is retained: only a book snapshot received
     /// strictly after the latest gap may clear a coin's staleness.
+    ///
+    /// `mono_ns` must be the time the drop was **detected**, not the engine's
+    /// iteration start. The market drain can still be pulling frames that were
+    /// queued on the socket before it died, so an iteration-start reading could
+    /// predate them and let a pre-gap book clear the flag. The live caller
+    /// passes the `RawEvent::Gap::disconnect_ns` the ingest task received
+    /// (stamped by [`mev_hl_client::raw_ws::mono_ns`], the same clock as frame
+    /// stamps: `raw_ws.rs:388` and `raw_ws.rs:331`; the engine's
+    /// [`crate::clock::LiveClock`] maps its monotonic lane to that clock at
+    /// `clock.rs:65`). When only the untimestamped fail-closed latch fired, the
+    /// caller passes the control-drain time instead; see
+    /// [`crate::run::EngineLoop`]'s control drain.
+    ///
+    /// A book received just after the drop on a not-yet-closed socket cannot
+    /// exist: [`mev_hl_client::RawEvent::Gap`] is yielded the moment the socket
+    /// breaks, before any reconnect, and a single ingest task processes frames
+    /// in order, so no frame from the dead socket is read after the drop. Any
+    /// frame after the drop comes from the reconnected socket and is stamped at
+    /// its new receive time (`> disconnect_ns`), so it correctly clears
+    /// staleness.
     pub fn mark_all_stale(&mut self, mono_ns: u64) {
         self.gap_mono_ns = self.gap_mono_ns.max(mono_ns);
         for slot in &mut self.slots {
@@ -170,9 +190,14 @@ impl EngineState {
     /// older `bbo` in [`MarketSlot::best_bid`]/[`MarketSlot::best_ask`] by
     /// timestamp, so every strategy read is then post-gap.
     ///
-    /// `mono_ns` is the book snapshot's receive time; a snapshot stamped at or
-    /// before the gap is ignored, closing the race where a pre-gap snapshot is
-    /// still queued when the gap is observed.
+    /// `mono_ns` is the book snapshot's receive time. The rule is: after a gap,
+    /// only a book whose receive stamp is **strictly greater** than the gap's
+    /// detection time may clear staleness. A book queued before the drop always
+    /// has a stamp `<=` the detection time on the same monotonic clock, so it
+    /// is ignored here even if the engine only drains it after the gap signal.
+    /// A book received after the drop comes from the reconnected socket and is
+    /// stamped later, so it clears. See [`Self::mark_all_stale`] for the clock
+    /// domain and the fail-closed drain-time fallback.
     pub fn mark_fresh(&mut self, coin: CoinId, mono_ns: u64) {
         if mono_ns <= self.gap_mono_ns {
             return;

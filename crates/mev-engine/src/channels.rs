@@ -30,7 +30,14 @@ pub const CONTROL_CHANNEL_CAP: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketControl {
     /// A feed gap opened: every coin is stale until a fresh book snapshot.
-    GapOpen,
+    GapOpen {
+        /// Process-monotonic nanoseconds when the drop was detected, on the
+        /// same clock the market frames are stamped with
+        /// ([`mev_hl_client::raw_ws::mono_ns`]). This is the cut a book
+        /// snapshot must be strictly newer than to clear staleness; see
+        /// [`crate::state::EngineState::mark_all_stale`].
+        disconnect_ns: u64,
+    },
 }
 
 /// Outcome of [`InputHandles::signal_gap`].
@@ -124,12 +131,18 @@ impl InputHandles {
 
     /// Signal that a market feed gap opened. Never silent.
     ///
-    /// The signal goes on the dedicated control channel. If that queue is full
-    /// (the engine is behind) or the engine is gone, the shared fail-closed
-    /// latch is set instead, so the engine still treats every coin stale. The
-    /// caller must not treat [`GapSignal::FailClosed`] as "nothing to do".
-    pub fn signal_gap(&self) -> GapSignal {
-        match self.control.try_send(MarketControl::GapOpen) {
+    /// The signal goes on the dedicated control channel, carrying
+    /// `disconnect_ns` (the process-monotonic time the drop was detected, from
+    /// the same clock that stamps market frames) so the engine can cut off
+    /// pre-gap books. If the control queue is full (the engine is behind) or
+    /// the engine is gone, the shared fail-closed latch is set instead, so the
+    /// engine still treats every coin stale. The caller must not treat
+    /// [`GapSignal::FailClosed`] as "nothing to do".
+    pub fn signal_gap(&self, disconnect_ns: u64) -> GapSignal {
+        match self
+            .control
+            .try_send(MarketControl::GapOpen { disconnect_ns })
+        {
             Ok(()) => GapSignal::Queued,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.control_failed.store(true, Ordering::Release);
@@ -214,8 +227,13 @@ mod tests {
         let (handles, inputs) = inputs(1, 1);
         assert_eq!(handles.send_market(bbo()), MarketSend::Queued);
         assert_eq!(handles.send_market(bbo()), MarketSend::Dropped);
-        assert_eq!(handles.signal_gap(), GapSignal::Queued);
-        assert_eq!(inputs.control.try_recv(), Ok(MarketControl::GapOpen));
+        assert_eq!(handles.signal_gap(1234), GapSignal::Queued);
+        assert_eq!(
+            inputs.control.try_recv(),
+            Ok(MarketControl::GapOpen {
+                disconnect_ns: 1234
+            })
+        );
         assert!(!inputs.control_failed.load(Ordering::Acquire));
     }
 
@@ -223,11 +241,11 @@ mod tests {
     fn a_full_control_channel_sets_the_fail_closed_latch() {
         let (handles, inputs) = inputs(1, 1);
         for _ in 0..CONTROL_CHANNEL_CAP {
-            assert_eq!(handles.signal_gap(), GapSignal::Queued);
+            assert_eq!(handles.signal_gap(1), GapSignal::Queued);
         }
         // The next signal cannot be queued: the latch makes the engine treat
         // every coin stale instead of pretending the feed is fine.
-        assert_eq!(handles.signal_gap(), GapSignal::FailClosed);
+        assert_eq!(handles.signal_gap(1), GapSignal::FailClosed);
         assert!(inputs.control_failed.load(Ordering::Acquire));
     }
 }
