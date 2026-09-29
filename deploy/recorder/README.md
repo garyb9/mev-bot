@@ -38,7 +38,8 @@ working directory, `run-ssd.sh` runs the binary from a state-dir shim whose
   3 s later if still alive, and appends the UTC time and reason to
   `recorder-ssd.stopped`. It exits when the recorder is gone.
 * The script never writes, creates, or redirects anywhere under `/mnt` except
-  `/mnt/e/mev-rec`, never runs `rm -rf`, and never reads `.env` or keys.
+  `/mnt/e/mev-rec`, never recursively force-deletes anything, and never reads
+  `.env` or keys.
 
 Log, pidfiles, and the stopped-reason file live in
 `/home/gb/projects/.orchestrator/mev-bot/logs/`.

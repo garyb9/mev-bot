@@ -7,7 +7,8 @@
 #   * The ONLY path this script ever creates, writes, touches, or redirects
 #     into under /mnt is /mnt/e/mev-rec. The drive also holds unrelated
 #     personal files; nothing else under /mnt/e is ever touched.
-#   * It never runs `rm -rf`, never reads .env, and never touches key material.
+#   * It never recursively force-deletes anything, never reads .env, and never
+#     touches key material.
 #   * The recorder starts ONLY when /mnt/e is a verified real E: drvfs/9p
 #     mount (see check_mount), and a 1 s watchdog kills it if the mount drops.
 #   * If the drive disconnects, /mnt/e becomes an empty directory on the ROOT
