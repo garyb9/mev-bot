@@ -66,12 +66,14 @@ check_mount() {
         CHECK_REASON="$MOUNT does not exist"
         return 1
     fi
-    if ! mountpoint -q "$MOUNT"; then
+    # `timeout` bounds every probe: a stale 9p mount can hang stat/findmnt, and
+    # a hung probe must count as a failed check, not stall the watchdog.
+    if ! timeout 3 mountpoint -q "$MOUNT"; then
         CHECK_REASON="$MOUNT is not a mount point (drive disconnected?)"
         return 1
     fi
     local fstype source dev_mount dev_root avail
-    fstype="$(findmnt -no FSTYPE "$MOUNT" 2>/dev/null || true)"
+    fstype="$(timeout 3 findmnt -no FSTYPE "$MOUNT" 2>/dev/null || true)"
     case "$fstype" in
         9p | drvfs) ;;
         *)
@@ -79,18 +81,22 @@ check_mount() {
             return 1
             ;;
     esac
-    source="$(findmnt -no SOURCE "$MOUNT" 2>/dev/null || true)"
+    source="$(timeout 3 findmnt -no SOURCE "$MOUNT" 2>/dev/null || true)"
     if [[ "${source,,}" != "e:" ]]; then
         CHECK_REASON="$MOUNT source '$source' is not E:"
         return 1
     fi
-    dev_mount="$(stat -c %d "$MOUNT")"
-    dev_root="$(stat -c %d /)"
+    dev_mount="$(timeout 3 stat -c %d "$MOUNT" 2>/dev/null || true)"
+    dev_root="$(stat -c %d / 2>/dev/null || true)"
+    if [[ ! "$dev_mount" =~ ^[0-9]+$ || ! "$dev_root" =~ ^[0-9]+$ ]]; then
+        CHECK_REASON="could not stat $MOUNT or / (device ids '$dev_mount' '$dev_root')"
+        return 1
+    fi
     if [[ "$dev_mount" == "$dev_root" ]]; then
         CHECK_REASON="$MOUNT is on the same device as / (not the external SSD)"
         return 1
     fi
-    avail="$(df --output=avail -B1G "$MOUNT" 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+    avail="$(timeout 3 df --output=avail -B1G "$MOUNT" 2>/dev/null | tail -n1 | tr -d '[:space:]')"
     if [[ ! "$avail" =~ ^[0-9]+$ ]]; then
         CHECK_REASON="could not read free space for $MOUNT"
         return 1
@@ -240,8 +246,7 @@ watchdog() {
 }
 
 cmd_stop() {
-    preflight
-
+    # No preflight: stop must work when the drive is already gone.
     local rec_pid wd_pid
     rec_pid="$(pid_from "$REC_PIDFILE")"
     wd_pid="$(pid_from "$WD_PIDFILE")"
