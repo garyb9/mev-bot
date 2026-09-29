@@ -23,6 +23,17 @@ pub struct MarketSlot {
     pub ctx: Option<(AssetCtxLite, Stamp)>,
     /// Whether the coin's inputs are stale or inside a feed gap.
     pub stale: bool,
+    /// Whether the coin's asset context (funding rate, mark) is stale: set by a
+    /// feed gap and cleared only by a `Ctx` update received strictly after the
+    /// gap.
+    ///
+    /// Kept separate from [`MarketSlot::stale`] because a fresh book snapshot
+    /// (which clears book staleness and gates orders in the risk gate) does not
+    /// refresh the `Ctx`. A strategy that reads the ctx (the funding rate) must
+    /// treat a stale ctx as "no data", while strategies that never read it
+    /// (market making) and the risk gate stay unaffected (SPEC-0010 §23
+    /// Q-Gap-Edge (c)).
+    pub ctx_stale: bool,
 }
 
 impl MarketSlot {
@@ -175,6 +186,25 @@ impl EngineState {
         self.gap_mono_ns = self.gap_mono_ns.max(mono_ns);
         for slot in &mut self.slots {
             slot.stale = true;
+            slot.ctx_stale = true;
+        }
+    }
+
+    /// Clear a coin's ctx-stale flag when an asset-context update is received
+    /// strictly after the latest gap.
+    ///
+    /// `Ctx` carries the funding rate and mark price. Unlike a book snapshot it
+    /// neither prices nor sizes an order, so it does **not** clear
+    /// [`MarketSlot::stale`]; but a strategy that reads it must not decide on a
+    /// pre-gap rate while the book looks fresh, so the ctx gets its own
+    /// freshness cut with the same strict-greater rule as [`Self::mark_fresh`].
+    /// See `MarketSlot::ctx_stale`.
+    pub fn mark_ctx_fresh(&mut self, coin: CoinId, mono_ns: u64) {
+        if mono_ns <= self.gap_mono_ns {
+            return;
+        }
+        if let Some(slot) = self.slots.get_mut(coin.index()) {
+            slot.ctx_stale = false;
         }
     }
 
@@ -491,6 +521,31 @@ mod tests {
         let mut state = EngineState::new(1);
         state.mark_dirty(CoinId(9));
         assert!(!state.has_dirty());
+    }
+
+    #[test]
+    fn ctx_staleness_is_separate_from_book_staleness() {
+        let mut state = EngineState::new(1);
+        state.mark_all_stale(1_000);
+        assert!(state.slot(CoinId(0)).unwrap().stale);
+        assert!(state.slot(CoinId(0)).unwrap().ctx_stale);
+
+        // A post-gap book clears book staleness, not the ctx's.
+        state.mark_fresh(CoinId(0), 1_001);
+        assert!(!state.slot(CoinId(0)).unwrap().stale);
+        assert!(state.slot(CoinId(0)).unwrap().ctx_stale);
+
+        // A post-gap ctx clears the ctx flag and does not touch book staleness.
+        state.mark_ctx_fresh(CoinId(0), 1_002);
+        assert!(!state.slot(CoinId(0)).unwrap().ctx_stale);
+        assert!(!state.slot(CoinId(0)).unwrap().stale);
+
+        // A pre-gap ctx is ignored; a post-gap one clears.
+        state.mark_all_stale(2_000);
+        state.mark_ctx_fresh(CoinId(0), 1_999);
+        assert!(state.slot(CoinId(0)).unwrap().ctx_stale);
+        state.mark_ctx_fresh(CoinId(0), 2_001);
+        assert!(!state.slot(CoinId(0)).unwrap().ctx_stale);
     }
 
     #[test]

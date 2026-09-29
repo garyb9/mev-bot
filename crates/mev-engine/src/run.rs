@@ -247,6 +247,17 @@ impl<D: Dispatcher> EngineLoop<D> {
         let iteration_start = std::time::Instant::now();
         let mut n = 0;
 
+        // 0. Lossless feed-control signals (gap opens) first, before any
+        // account or market processing. `apply_account` runs an account event's
+        // actions immediately (`dispatch.rs` `run_actions`), so a gap already
+        // queued when that event lands must gate those actions in the same
+        // iteration; draining it only after the account drain would let a fill
+        // or post-ack place a non-reduce-only order on pre-gap state
+        // (SPEC-0010 §23 Q-Gap-Edge (a)).
+        if let Some(gap_mono_ns) = self.drain_gap_control() {
+            self.state.mark_all_stale(gap_mono_ns);
+        }
+
         // 1. Lossless account/control/exec updates first.
         while let Ok(update) = self.inputs.account.try_recv() {
             self.dispatcher.on_account_state(&update, &self.state);
@@ -259,35 +270,17 @@ impl<D: Dispatcher> EngineLoop<D> {
             n += 1;
         }
 
-        // 2b. Lossless feed-control signals (gap opens). Drained after the
-        // market updates so a pre-gap snapshot still queued cannot restore a
-        // coin, and so any order dispatched later this iteration is gated by
-        // the stale flag.
-        //
-        // The gap's timestamp is the moment the drop was **detected**, carried
-        // on the control message (`disconnect_ns`, on the shared frame clock),
-        // not this iteration's start (`now_mono_ns`). The market drain above can
-        // still be pulling pre-gap frames queued while the socket was alive, so
-        // an iteration start taken before the drain would predate them and let a
-        // pre-gap book clear staleness.
-        let mut gap_detect: Option<u64> = None;
-        while let Ok(control) = self.inputs.control.try_recv() {
-            match control {
-                MarketControl::GapOpen { disconnect_ns } => {
-                    gap_detect = Some(gap_detect.map_or(disconnect_ns, |g| g.max(disconnect_ns)));
-                }
-            }
-        }
-        // `control_failed` is the fail-closed fallback a producer sets when it
-        // could not enqueue the signal. It carries no timestamp, so fall back to
-        // the drain time: this is read after the producer set it, so it is never
-        // earlier than the detection and only a book received after the drain
-        // can clear staleness (fail closed).
-        if self.inputs.control_failed.swap(false, Ordering::AcqRel) {
-            let drain_ns = self.clock.mono_ns();
-            gap_detect = Some(gap_detect.map_or(drain_ns, |g| g.max(drain_ns)));
-        }
-        if let Some(gap_mono_ns) = gap_detect {
+        // 2b. Drain control again. A gap the producer detects **during** this
+        // iteration's account/market processing, or the mid-iteration
+        // fail-closed latch, is not visible to the early drain; without this
+        // second drain it would only gate the *next* iteration's dispatch, so
+        // this iteration's dirty coins could be decided on pre-gap state. The
+        // market drain above still runs before this so a pre-gap snapshot
+        // already queued cannot restore a coin, and any order dispatched later
+        // this iteration is gated by the stale flag. Re-draining is cheap on the
+        // idle path: one empty `try_recv` plus one acquire load (the latch swap
+        // only runs when the load sees true).
+        if let Some(gap_mono_ns) = self.drain_gap_control() {
             self.state.mark_all_stale(gap_mono_ns);
         }
 
@@ -330,6 +323,46 @@ impl<D: Dispatcher> EngineLoop<D> {
         n
     }
 
+    /// Drain the lossless feed-control channel and the fail-closed latch,
+    /// returning the latest gap-detection time (monotonic ns) if any.
+    ///
+    /// The gap's timestamp is the moment the drop was **detected**, carried on
+    /// the control message (`disconnect_ns`, on the shared frame clock) as
+    /// [`mev_hl_client::raw_ws::mono_ns`], not the iteration start
+    /// (`now_mono_ns`). The market drain can still be pulling pre-gap frames
+    /// queued while the socket was alive, so an iteration start taken before the
+    /// drain would predate them and let a pre-gap book clear staleness. The
+    /// fail-closed latch carries no timestamp, so it falls back to the read
+    /// time, which is never earlier than detection (fail closed). See
+    /// [`crate::state::EngineState::mark_all_stale`].
+    ///
+    /// The latch is probed with an `Acquire` load first; the `swap` — a locked
+    /// read-modify-write that invalidates the shared cache line — runs only when
+    /// the load sees `true`. This is correct: the producer's `Release` store
+    /// (`channels.rs` `signal_gap`) happens-before an acquire load that observes
+    /// it, and the only place that clears the latch is this single engine
+    /// thread, so a load that sees `true` implies the swap returns `true`. If
+    /// the producer sets the latch concurrently after the load, the swap may
+    /// miss it, but the latch stays set and the next iteration observes it: no
+    /// signal is lost, and an idle iteration pays only a plain load.
+    fn drain_gap_control(&mut self) -> Option<u64> {
+        let mut gap_detect: Option<u64> = None;
+        while let Ok(control) = self.inputs.control.try_recv() {
+            match control {
+                MarketControl::GapOpen { disconnect_ns } => {
+                    gap_detect = Some(gap_detect.map_or(disconnect_ns, |g| g.max(disconnect_ns)));
+                }
+            }
+        }
+        if self.inputs.control_failed.load(Ordering::Acquire)
+            && self.inputs.control_failed.swap(false, Ordering::AcqRel)
+        {
+            let drain_ns = self.clock.mono_ns();
+            gap_detect = Some(gap_detect.map_or(drain_ns, |g| g.max(drain_ns)));
+        }
+        gap_detect
+    }
+
     fn apply_market(&mut self, update: &MarketUpdate) {
         let stamp = match update {
             MarketUpdate::Bbo { stamp, .. }
@@ -363,6 +396,11 @@ impl<D: Dispatcher> EngineLoop<D> {
                 if let Some(slot) = self.state.slot_mut(*coin) {
                     slot.ctx = Some((*ctx, stamp));
                 }
+                // A `Ctx` is not a book snapshot, so it does not clear the
+                // coin's book staleness. It clears only the separate ctx-stale
+                // flag, and only when it is stamped strictly after the latest
+                // gap (SPEC-0010 §23 Q-Gap-Edge (c)).
+                self.state.mark_ctx_fresh(*coin, stamp.mono_ns);
             }
             // A gap on a shared connection cannot be attributed to one coin, so
             // mark every coin stale until a fresh book arrives (SPEC-0010 §16).
@@ -870,6 +908,147 @@ mod tests {
         handles.send_market(book_update(0, 700));
         engine.iterate(700);
         assert!(!engine.state().slot(CoinId(0)).unwrap().stale);
+    }
+
+    /// Records, for every account update, whether the coin was already stale and
+    /// whether the risk gate would reject a non-reduce-only place at that point.
+    struct AccountGateProbe {
+        coin: CoinId,
+        seen: Arc<Mutex<Vec<(bool, bool)>>>,
+    }
+
+    impl Dispatcher for AccountGateProbe {
+        fn interests(&self) -> Vec<Interests> {
+            vec![Interests::coins([self.coin])]
+        }
+        fn on_account_state(&mut self, _update: &AccountUpdate, state: &EngineState) {
+            let slot = state.slot(self.coin).expect("slot in range");
+            self.seen
+                .lock()
+                .unwrap()
+                .push((slot.stale, risk_gate_rejects_non_reduce_only(slot)));
+        }
+    }
+
+    #[test]
+    fn a_gap_queued_with_an_account_update_gates_that_iterations_order() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (handles, inputs) = inputs(64, 64);
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let mut engine = EngineLoop::new(
+            inputs,
+            AccountGateProbe {
+                coin: CoinId(0),
+                seen: seen.clone(),
+            },
+            LoopConfig {
+                spin_us: 0,
+                coin_count: 1,
+            },
+            stop_rx,
+        );
+
+        // Both are queued before the iteration. Draining the gap only after the
+        // account drain (as the E-9 code did) would gate the account-driven
+        // action on pre-gap state; the early drain must mark the coin stale
+        // first, so a non-reduce-only order is rejected in the same iteration.
+        handles.send_account(AccountUpdate::Control(crate::types::Control::Resume));
+        handles.signal_gap(1_000);
+        engine.iterate(1_000);
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(true, true)],
+            "a non-reduce-only order from an account update must be rejected as stale"
+        );
+    }
+
+    /// Signals a gap from inside market processing, so only the second
+    /// (post-market) control drain can see it, then records whether the coin was
+    /// stale when it was dispatched.
+    struct MidIterationGap {
+        handles: InputHandles,
+        seen: Arc<Mutex<Vec<bool>>>,
+        signaled: bool,
+    }
+
+    impl Dispatcher for MidIterationGap {
+        fn interests(&self) -> Vec<Interests> {
+            vec![Interests::coins([CoinId(0)])]
+        }
+        fn on_market(&mut self, _update: &MarketUpdate) {
+            if !self.signaled {
+                self.signaled = true;
+                let _ = self.handles.signal_gap(1_000);
+            }
+        }
+        fn on_coin_state(&mut self, _coin: CoinId, _stamp: Stamp, state: &EngineState) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(state.slot(CoinId(0)).unwrap().stale);
+        }
+    }
+
+    #[test]
+    fn a_gap_signaled_during_market_processing_gates_that_iterations_dispatch() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (handles, inputs) = inputs(64, 64);
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let mut engine = EngineLoop::new(
+            inputs,
+            MidIterationGap {
+                handles: handles.clone(),
+                seen: seen.clone(),
+                signaled: false,
+            },
+            LoopConfig {
+                spin_us: 0,
+                coin_count: 1,
+            },
+            stop_rx,
+        );
+
+        // A market frame arrives; the dispatcher's `on_market` signals a gap
+        // while that frame is applied. The early drain ran before the market
+        // drain, so only the post-market drain can gate this iteration's
+        // dispatch.
+        handles.send_market(bbo(0, 500));
+        engine.iterate(500);
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![true],
+            "a gap detected mid-iteration must still gate this iteration's dispatch"
+        );
+    }
+
+    #[test]
+    fn a_fresh_book_does_not_clear_a_stale_ctx_and_a_post_gap_ctx_does() {
+        let record = Arc::new(Mutex::new(Record::default()));
+        let (mut engine, handles, _stop) = loop_with(record, 1, 0);
+
+        handles.signal_gap(1_000);
+        engine.iterate(1_000);
+        assert!(engine.state().slot(CoinId(0)).unwrap().stale);
+        assert!(engine.state().slot(CoinId(0)).unwrap().ctx_stale);
+
+        // A post-gap book clears book staleness but not the ctx's: the ctx may
+        // still be pre-gap (SPEC-0010 §23 Q-Gap-Edge (c)).
+        handles.send_market(book_update(0, 1_001));
+        engine.iterate(1_001);
+        assert!(!engine.state().slot(CoinId(0)).unwrap().stale);
+        assert!(engine.state().slot(CoinId(0)).unwrap().ctx_stale);
+
+        // A ctx stamped before the gap is ignored.
+        handles.send_market(ctx_update(0, 900));
+        engine.iterate(900);
+        assert!(engine.state().slot(CoinId(0)).unwrap().ctx_stale);
+
+        // Only a ctx stamped strictly after the gap clears it.
+        handles.send_market(ctx_update(0, 1_002));
+        engine.iterate(1_002);
+        assert!(!engine.state().slot(CoinId(0)).unwrap().ctx_stale);
     }
 
     #[test]

@@ -29,3 +29,7 @@ metrics-util.workspace = true
 [[bench]]
 name = "ingest"
 harness = false
+
+[[bench]]
+name = "iterate"
+harness = false

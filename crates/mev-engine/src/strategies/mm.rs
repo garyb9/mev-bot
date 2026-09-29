@@ -413,6 +413,17 @@ mod tests {
     }
 
     #[test]
+    fn quotes_even_when_the_asset_context_is_stale() {
+        // MM reads the book, never the per-coin ctx (funding/mark), so a stale
+        // ctx must not pull or block its quotes (SPEC-0010 §23 Q-Gap-Edge (c)).
+        let mut strategy = MarketMaker::new(config());
+        let mut market = market_one_bbo("100", "100");
+        market[0].ctx_stale = true;
+        let actions = run_once(&mut strategy, &market);
+        assert_eq!(places(&actions).len(), 4);
+    }
+
+    #[test]
     fn modifies_in_place_when_mid_moves() {
         let mut strategy = MarketMaker::new(config());
         let first = run_once(&mut strategy, &market_one_bbo("100", "100"));

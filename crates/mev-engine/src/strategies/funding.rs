@@ -109,6 +109,17 @@ impl FundingBasis {
     /// Projected net edge in bps for the current market, or `None` when the
     /// books needed to price the trade are missing.
     pub fn edge_bps(&self, ctx: &Ctx<'_>) -> Option<Decimal> {
+        // A pre-gap ctx (funding rate) would let the strategy enter on a rate
+        // from before the drop: a fresh book clears book staleness but does not
+        // refresh the ctx. Treat a stale ctx as no data (fail closed; SPEC-0010
+        // §23 Q-Gap-Edge (c)).
+        if !Self::ctx_fresh(ctx, self.config.perp_coin) {
+            tracing::debug!(
+                coin = ctx.coin_name(self.config.perp_coin),
+                "funding edge skipped: stale asset context"
+            );
+            return None;
+        }
         let perp_px = ctx.mid(self.config.perp_coin)?;
         let spot_px = ctx.mid(self.config.spot_coin)?;
         let rate = ctx.funding(self.config.perp_coin)?;
@@ -144,6 +155,16 @@ impl FundingBasis {
             0
         };
         book_view(slot, sz_decimals)
+    }
+
+    /// Whether `coin`'s asset context is safe to decide on: present and not
+    /// stale since the latest feed gap.
+    ///
+    /// A coin with no ctx at all is not "fresh", but every ctx read already
+    /// yields `None` when the ctx is absent, so this only has to reject the
+    /// post-gap-pre-ctx case.
+    fn ctx_fresh(ctx: &Ctx<'_>, coin: CoinId) -> bool {
+        !ctx.slot(coin).is_some_and(|slot| slot.ctx_stale)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -352,24 +373,39 @@ impl FundingBasis {
             }
             State::Entering | State::Exiting => {}
             State::Hedged => {
-                let rate_bps = ctx
-                    .funding(self.config.perp_coin)
-                    .map(|rate| rate * Decimal::from(10_000))
-                    .unwrap_or(Decimal::ZERO);
-                if self.settlement_below_threshold(rate_bps, now_ms) {
-                    let intents = self.exit_intents(ctx, ctx.account, now_ms);
-                    if intents.is_empty() {
-                        // Nothing to close (e.g. paper account not wired); reset.
-                        self.state = State::Flat;
-                        self.below_streak = 0;
+                // The funding-rate read drives the exit decision. A stale ctx is
+                // no data: skip the settlement decision rather than treating it
+                // as zero funding and exiting on pre-gap information. The
+                // rebalance below is priced off the (fresh) perp book and does
+                // not read the ctx, so it stays allowed (SPEC-0010 §23
+                // Q-Gap-Edge (c)).
+                if Self::ctx_fresh(ctx, self.config.perp_coin) {
+                    let rate_bps = ctx
+                        .funding(self.config.perp_coin)
+                        .map(|rate| rate * Decimal::from(10_000))
+                        .unwrap_or(Decimal::ZERO);
+                    if self.settlement_below_threshold(rate_bps, now_ms) {
+                        let intents = self.exit_intents(ctx, ctx.account, now_ms);
+                        if intents.is_empty() {
+                            // Nothing to close (e.g. paper account not wired); reset.
+                            self.state = State::Flat;
+                            self.below_streak = 0;
+                            return;
+                        }
+                        self.state = State::Exiting;
+                        self.exit_fills = 0;
+                        for intent in intents {
+                            out.place(intent);
+                        }
                         return;
                     }
-                    self.state = State::Exiting;
-                    self.exit_fills = 0;
-                    for intent in intents {
-                        out.place(intent);
-                    }
-                } else if let Some(intent) = self.rebalance_intent(ctx, ctx.account, now_ms) {
+                } else {
+                    tracing::debug!(
+                        coin = ctx.coin_name(self.config.perp_coin),
+                        "funding settlement skipped: stale asset context"
+                    );
+                }
+                if let Some(intent) = self.rebalance_intent(ctx, ctx.account, now_ms) {
                     out.place(intent);
                 }
             }
@@ -660,6 +696,57 @@ mod tests {
         let ctx = ctx_with(&market, &account, 0);
         assert!(run(&mut strategy, &ctx).is_empty());
         assert_eq!(strategy.state(), "flat");
+    }
+
+    #[test]
+    fn stays_flat_when_the_asset_context_is_stale() {
+        // A fresh book clears book staleness, but the post-gap ctx (funding) may
+        // still be pre-gap. It must be treated as no data, not entered on.
+        let mut strategy = strategy();
+        let mut market = market_btc_spot("0.001", "59990", "60010");
+        market[0].ctx_stale = true;
+        let account = AccountState::new(2);
+        let ctx = ctx_with(&market, &account, 0);
+        assert!(run(&mut strategy, &ctx).is_empty());
+        assert_eq!(strategy.state(), "flat");
+
+        // The same book with a post-gap ctx refresh enters.
+        market[0].ctx_stale = false;
+        let ctx = ctx_with(&market, &account, 0);
+        assert_eq!(places_of(run(&mut strategy, &ctx)).len(), 2);
+    }
+
+    #[test]
+    fn a_stale_ctx_does_not_advance_the_funding_exit_streak() {
+        let mut strategy = strategy();
+        let rich = market_btc_spot("0.001", "59990", "60010");
+        let account = AccountState::new(2);
+        let ctx = ctx_with(&rich, &account, 0);
+        let _ = run(&mut strategy, &ctx);
+        let mut out = Actions::new();
+        strategy.on_order(&fill(CoinId(1)), &ctx, &mut out);
+        strategy.on_order(&fill(CoinId(1)), &ctx, &mut out);
+        assert_eq!(strategy.state(), "hedged");
+
+        // Hedged with spot drift and funding at the exit threshold. One fresh
+        // hour advances the below-threshold streak once (no exit yet).
+        let mut account = AccountState::new(2);
+        account.set_position_szi(CoinId(0), ds("-0.16"));
+        account.spot.insert("UBTC".into(), ds("0.20"));
+        let flat = market_btc_spot("0", "59990", "60010");
+        let fresh = ctx_with(&flat, &account, MS_PER_HOUR);
+        assert_eq!(places_of(run(&mut strategy, &fresh)).len(), 1);
+        assert_eq!(strategy.state(), "hedged");
+
+        // A stale ctx at the next hour must not be read as zero funding and
+        // advance the streak again: no exit, the ctx-independent rebalance only.
+        let mut stale_market = market_btc_spot("0", "59990", "60010");
+        stale_market[0].ctx_stale = true;
+        let stale = ctx_with(&stale_market, &account, 2 * MS_PER_HOUR);
+        let intents = places_of(run(&mut strategy, &stale));
+        assert_eq!(intents.len(), 1, "stale ctx is no data: no exit decision");
+        assert!(!intents[0].reduce_only);
+        assert_eq!(strategy.state(), "hedged");
     }
 
     #[test]
