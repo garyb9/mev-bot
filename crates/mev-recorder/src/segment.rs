@@ -11,10 +11,12 @@
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel,
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -28,6 +30,18 @@ use crate::mount_guard::{MOUNT_RECHECK_INTERVAL, MountError, MountGuard};
 /// At most one "queue full" warning per this interval.
 const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// At most one per-stream recording-error warning per this interval after the
+/// first; the rest are counted and reported with the next line (R-14 fix2 §1).
+const ERROR_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How many consecutive I/O errors a guarded stream tolerates before it is
+/// treated as a lost mount and stops (R-14 fix2 §1). An unknown errno must not
+/// produce an unbounded retry loop.
+const MAX_CONSECUTIVE_ERRORS: u32 = 3;
+
+/// Default bounded wait for the writer thread to finish during shutdown.
+const DEFAULT_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Errors raised by the segment writer.
 #[derive(Debug, Error)]
 pub enum SegmentError {
@@ -40,6 +54,13 @@ pub enum SegmentError {
     /// The `require_mount` guard refused a directory or file creation.
     #[error("mount guard: {0}")]
     Mount(#[from] MountError),
+    /// The writer thread did not stop within the shutdown join timeout; it was
+    /// abandoned and the mount guard was tripped (R-14 fix2 §2).
+    #[error("segment writer did not stop within {timeout:?}")]
+    ShutdownTimeout {
+        /// The bounded join timeout that elapsed.
+        timeout: Duration,
+    },
 }
 
 /// Whether an I/O error means the segment's device or file vanished, which must
@@ -134,6 +155,8 @@ pub struct SegmentConfig {
     pub priority: u8,
     /// Optional `require_mount` guard (R-14). Defaults to unguarded.
     pub mount_guard: Arc<MountGuard>,
+    /// Bounded wait for the writer thread during shutdown (R-14 fix2 §2).
+    pub shutdown_join_timeout: Duration,
 }
 
 impl Default for SegmentConfig {
@@ -153,6 +176,7 @@ impl Default for SegmentConfig {
             disk: Arc::new(SystemDiskSpace),
             priority: 0,
             mount_guard: Arc::new(MountGuard::unguarded()),
+            shutdown_join_timeout: DEFAULT_SHUTDOWN_JOIN_TIMEOUT,
         }
     }
 }
@@ -202,6 +226,49 @@ impl DropLog {
     }
 }
 
+/// Rate-limits the per-stream recording-error warning. The first error logs
+/// immediately; later ones are suppressed for `ERROR_WARN_INTERVAL` and their
+/// count is reported with the next line that is allowed through.
+struct StreamErrorLog {
+    last_log: Option<Instant>,
+    suppressed: u64,
+}
+
+impl StreamErrorLog {
+    fn new() -> Self {
+        Self {
+            last_log: None,
+            suppressed: 0,
+        }
+    }
+
+    /// Record an error. Returns `Some(suppressed)` when a line is due now (the
+    /// value is how many were suppressed since the previous line), else `None`.
+    fn record(&mut self) -> Option<u64> {
+        let now = Instant::now();
+        match self.last_log {
+            None => {
+                self.last_log = Some(now);
+                Some(0)
+            }
+            Some(last) if now.saturating_duration_since(last) >= ERROR_WARN_INTERVAL => {
+                self.last_log = Some(now);
+                Some(std::mem::take(&mut self.suppressed))
+            }
+            Some(_) => {
+                self.suppressed = self.suppressed.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    /// Backdate the last log so the next `record` is due (test hook).
+    #[cfg(test)]
+    fn force_due(&mut self) {
+        self.last_log = Instant::now().checked_sub(ERROR_WARN_INTERVAL + Duration::from_secs(1));
+    }
+}
+
 /// Handle to the segment writer thread.
 ///
 /// Dropping the handle does not stop the thread; call
@@ -212,6 +279,8 @@ pub struct SegmentWriter {
     src: String,
     conn: String,
     drop_log: DropLog,
+    mount_guard: Arc<MountGuard>,
+    shutdown_join_timeout: Duration,
 }
 
 impl SegmentWriter {
@@ -225,6 +294,8 @@ impl SegmentWriter {
         let (tx, rx) = sync_channel(config.channel_capacity.max(1));
         let src = config.src.clone();
         let conn = config.conn.clone();
+        let mount_guard = config.mount_guard.clone();
+        let shutdown_join_timeout = config.shutdown_join_timeout;
         let name = format!("rec-seg-{src}-{conn}");
         let handle = thread::Builder::new()
             .name(name)
@@ -236,6 +307,8 @@ impl SegmentWriter {
             src,
             conn,
             drop_log: DropLog::new(),
+            mount_guard,
+            shutdown_join_timeout,
         })
     }
 
@@ -264,23 +337,64 @@ impl SegmentWriter {
         }
     }
 
-    /// Drain the queue, finalize the current segment, stop the thread, and join
-    /// it.
-    pub fn shutdown(mut self) {
+    /// Drain the queue, finalize the current segment, and stop the thread.
+    ///
+    /// The join is bounded by [`SegmentConfig::shutdown_join_timeout`]: a hung
+    /// mount must not keep the process from exiting. On timeout the thread is
+    /// abandoned, the guard is tripped, and [`SegmentError::ShutdownTimeout`]
+    /// is returned so the recorder can exit non-zero without waiting (R-14
+    /// fix2 §2).
+    pub fn shutdown(mut self) -> Result<(), SegmentError> {
+        self.stop_bounded()
+    }
+
+    fn stop_bounded(&mut self) -> Result<(), SegmentError> {
         let _ = self.tx.send(Msg::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        // Join from a helper thread so a hung writer cannot block us.
+        let (done_tx, done_rx) = channel();
+        let joiner = thread::Builder::new()
+            .name(format!("rec-join-{}-{}", self.src, self.conn))
+            .spawn(move || {
+                let _ = handle.join();
+                let _ = done_tx.send(());
+            });
+        let finished = match joiner {
+            Ok(joiner) => match done_rx.recv_timeout(self.shutdown_join_timeout) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    let _ = joiner.join();
+                    true
+                }
+                Err(RecvTimeoutError::Timeout) => false,
+            },
+            // Could not spawn the helper: fall back to a direct join.
+            Err(_) => {
+                let _ = done_rx.recv_timeout(self.shutdown_join_timeout);
+                false
+            }
+        };
+        if finished {
+            return Ok(());
         }
+        self.mount_guard.trip();
+        warn!(
+            src = %self.src,
+            conn = %self.conn,
+            timeout = ?self.shutdown_join_timeout,
+            "segment writer did not stop within the join timeout; abandoning the thread"
+        );
+        Err(SegmentError::ShutdownTimeout {
+            timeout: self.shutdown_join_timeout,
+        })
     }
 }
 
 impl Drop for SegmentWriter {
     fn drop(&mut self) {
-        // Best-effort: request shutdown and join if the caller forgot.
-        let _ = self.tx.send(Msg::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // Best-effort: request shutdown and bound the join if the caller forgot.
+        let _ = self.stop_bounded();
     }
 }
 
@@ -318,6 +432,10 @@ struct WriterState {
     last_mount_check: Instant,
     last_start_t_ns: i64,
     stopped: bool,
+    /// Consecutive I/O errors on this stream; reset by any success.
+    consecutive_errors: u32,
+    /// Rate limiter for the recording-error warning.
+    error_log: StreamErrorLog,
 }
 
 impl WriterState {
@@ -331,7 +449,49 @@ impl WriterState {
             last_mount_check: now,
             last_start_t_ns: i64::MIN,
             stopped: false,
+            consecutive_errors: 0,
+            error_log: StreamErrorLog::new(),
         }
+    }
+
+    /// Handle an I/O error from any create/open/write/flush/finish/rename/
+    /// manifest operation (R-14 fix2 §1).
+    ///
+    /// Returns `true` when the error was handled here (guarded stream), `false`
+    /// when the caller should propagate it (unguarded stream, unchanged
+    /// behaviour). Under a guard: the first error logs immediately and later
+    /// ones at most once per [`ERROR_WARN_INTERVAL`] with a suppressed count; the
+    /// mount probe is re-run on every error; the guard trips when the errno is a
+    /// lost-mount errno, when the probe fails, or when the error repeats more
+    /// than [`MAX_CONSECUTIVE_ERRORS`] times. Tripping stops the stream and
+    /// returns `true`.
+    fn on_stream_error(&mut self, err: &SegmentError) -> bool {
+        if !self.config.mount_guard.is_guarded() {
+            return false;
+        }
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        // `is_lost_mount` re-runs the probe only for non-lost errnos.
+        let lost = is_lost_mount(err, &self.config.mount_guard)
+            || self.consecutive_errors > MAX_CONSECUTIVE_ERRORS;
+        if lost {
+            self.stop_for_mount(&err.to_string());
+            return true;
+        }
+        if let Some(suppressed) = self.error_log.record() {
+            warn!(
+                src = %self.config.src,
+                conn = %self.config.conn,
+                suppressed,
+                error = %err,
+                "recording i/o error under require_mount; retrying"
+            );
+        }
+        true
+    }
+
+    /// Clear the consecutive-error state after a successful operation.
+    fn clear_errors(&mut self) {
+        self.consecutive_errors = 0;
     }
 
     fn write(&mut self, env: Envelope) -> Result<(), SegmentError> {
@@ -355,22 +515,32 @@ impl WriterState {
             }
             self.last_start_t_ns = start_t_ns;
             match OpenSegment::create(&self.config, &env, start_t_ns) {
-                Ok(seg) => self.current = Some(seg),
+                Ok(seg) => {
+                    self.current = Some(seg);
+                    self.clear_errors();
+                }
                 Err(SegmentError::Mount(err)) => {
                     self.stop_for_mount(&err.to_string());
                     return Ok(());
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    if self.on_stream_error(&err) {
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
             }
         }
-        if let Some(seg) = &mut self.current
-            && let Err(err) = seg.write_raw(&line, &env)
-        {
-            if is_lost_mount(&err, &self.config.mount_guard) {
-                self.stop_for_mount(&err.to_string());
-                return Ok(());
+        if let Some(seg) = &mut self.current {
+            match seg.write_raw(&line, &env) {
+                Ok(()) => self.clear_errors(),
+                Err(err) => {
+                    if self.on_stream_error(&err) {
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
             }
-            return Err(err);
         }
         Ok(())
     }
@@ -404,14 +574,15 @@ impl WriterState {
                 return;
             }
         }
-        if self.last_flush.elapsed() >= self.config.flush_interval
-            && let Err(err) = self.flush()
-        {
-            if is_lost_mount(&err, &self.config.mount_guard) {
-                self.stop_for_mount(&err.to_string());
-                return;
+        if self.last_flush.elapsed() >= self.config.flush_interval {
+            match self.flush() {
+                Ok(()) => self.clear_errors(),
+                Err(err) => {
+                    if !self.on_stream_error(&err) {
+                        error!(error = %err, "segment flush failed");
+                    }
+                }
             }
-            error!(error = %err, "segment flush failed");
         }
     }
 
@@ -490,6 +661,12 @@ impl WriterState {
             if let Err(err) = seg.write_raw(&line, &gap) {
                 debug!(error = %err, "failed to write mount gap record");
             }
+            // Best effort: push the buffered compressed bytes to the existing
+            // file handle so the gap can reach the (detached) file. This
+            // creates nothing new and errors are ignored (R-14 fix2 §5).
+            if let Err(err) = seg.flush_buffer() {
+                debug!(error = %err, "failed to flush mount gap record");
+            }
         }
         // Exactly one warning per stream; later envelopes are dropped silently
         // because `stopped` short-circuits `write` (R-14 fix1 §5).
@@ -508,6 +685,7 @@ impl WriterState {
         };
         match seg.finish(&self.config) {
             Ok(finished) => {
+                self.clear_errors();
                 let entry = ManifestEntry {
                     file: rel_path(&self.config.out_dir, &finished.final_path),
                     src: self.config.src.clone(),
@@ -520,11 +698,17 @@ impl WriterState {
                     crashed: false,
                 };
                 let path = manifest_path_for_t_ns(&self.config, finished.first_t_ns);
-                if let Err(err) = append_manifest_line(&path, &entry, &self.config.mount_guard) {
+                if let Err(err) = append_manifest_line(&path, &entry, &self.config)
+                    && !self.on_stream_error(&err)
+                {
                     error!(error = %err, "manifest append failed");
                 }
             }
-            Err(err) => error!(error = %err, "segment finalize failed"),
+            Err(err) => {
+                if !self.on_stream_error(&err) {
+                    error!(error = %err, "segment finalize failed");
+                }
+            }
         }
     }
 }
@@ -547,8 +731,6 @@ impl OpenSegment {
         first_env: &Envelope,
         start_t_ns: i64,
     ) -> Result<Self, SegmentError> {
-        // Re-check immediately before `create_dir_all` (R-14 §2).
-        config.mount_guard.check_or_trip()?;
         let (year, month, day, hour) = utc_parts(start_t_ns);
         let dir = config
             .out_dir
@@ -556,7 +738,9 @@ impl OpenSegment {
             .join(&config.src)
             .join(format!("{year:04}-{month:02}-{day:02}"))
             .join(format!("{hour:02}"));
-        fs::create_dir_all(&dir)?;
+        // Re-check the mount and create the level(s) without ever creating
+        // `out_dir` itself (R-14 fix2 §3).
+        create_dir_below(&config.out_dir, &dir, &config.mount_guard)?;
         let name = format!("{}-{start_t_ns}.jsonl.zst", config.conn);
         let final_path = dir.join(&name);
         let partial_path = dir.join(format!("{name}.partial"));
@@ -601,6 +785,12 @@ impl OpenSegment {
         self.encoder.flush()?;
         self.encoder.get_ref().sync_data()?;
         Ok(())
+    }
+
+    /// Flush the compressor to the underlying file without an `fsync`. Used to
+    /// try to land the final gap record on a lost mount; best effort only.
+    fn flush_buffer(&mut self) -> io::Result<()> {
+        self.encoder.flush()
     }
 
     fn finish(self, config: &SegmentConfig) -> Result<FinishedSegment, SegmentError> {
@@ -724,7 +914,7 @@ fn recover_crashed(config: &SegmentConfig) -> Result<(), SegmentError> {
             .and_then(Path::parent)
             .map(|day| day.join("manifest.jsonl"))
             .unwrap_or_else(|| manifest_path_for_t_ns(config, start_t_ns));
-        append_manifest_line(&manifest, &entry, &config.mount_guard)?;
+        append_manifest_line(&manifest, &entry, config)?;
     }
     Ok(())
 }
@@ -757,18 +947,57 @@ fn parse_partial_name(name: &str) -> Option<(String, i64)> {
 fn append_manifest_line(
     path: &Path,
     entry: &ManifestEntry,
-    guard: &MountGuard,
+    config: &SegmentConfig,
 ) -> Result<(), SegmentError> {
-    // Re-check immediately before `create_dir_all`/open (R-14 §2).
-    guard.check_or_trip()?;
+    // Re-check immediately before creating/opening (R-14 §2).
+    config.mount_guard.check_or_trip()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        create_dir_below(&config.out_dir, parent, &config.mount_guard)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let mut line = serde_json::to_vec(entry)?;
     line.push(b'\n');
     file.write_all(&line)?;
     file.sync_data()?;
+    Ok(())
+}
+
+/// Create `dir` below `out_dir`, never creating `out_dir` itself (R-14 fix2 §3).
+///
+/// Unguarded this is `create_dir_all` (unchanged). Under a guard: re-check the
+/// mount, fail closed (trip, create nothing) if `out_dir` itself is missing,
+/// then create each level below it one at a time with `create_dir`.
+fn create_dir_below(out_dir: &Path, dir: &Path, guard: &MountGuard) -> Result<(), SegmentError> {
+    if !guard.is_guarded() {
+        fs::create_dir_all(dir)?;
+        return Ok(());
+    }
+    guard.check_or_trip()?;
+    if !out_dir.is_dir() {
+        // `out_dir` vanished (or was never created): never recreate it.
+        guard.trip();
+        return Err(SegmentError::Mount(MountError::Missing {
+            mount: out_dir.to_path_buf(),
+        }));
+    }
+    let relative = dir.strip_prefix(out_dir).map_err(|_| {
+        SegmentError::Mount(MountError::OutDirOutside {
+            out_dir: dir.to_path_buf(),
+            mount: out_dir.to_path_buf(),
+        })
+    })?;
+    let mut level = out_dir.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        level.push(part);
+        match fs::create_dir(&level) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(SegmentError::Io(err)),
+        }
+    }
     Ok(())
 }
 
@@ -906,7 +1135,7 @@ mod tests {
         assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 0, "a")));
         clock.set_t_ns(H2);
         assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 1, "b")));
-        writer.shutdown();
+        writer.shutdown().unwrap();
 
         let files = files_with_ext(&dir.join("testnet/hl-ws"), "zst");
         assert_eq!(files.len(), 2);
@@ -954,7 +1183,7 @@ mod tests {
             );
             assert!(writer.try_send(env));
         }
-        writer.shutdown();
+        writer.shutdown().unwrap();
 
         let files = files_with_ext(&dir.join("testnet/hl-ws"), "zst");
         assert!(
@@ -982,7 +1211,7 @@ mod tests {
             clock.set_t_ns(H1 + i as i64);
             assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", i, "abcdef")));
         }
-        writer.shutdown();
+        writer.shutdown().unwrap();
 
         let files = files_with_ext(&dir.join("testnet/hl-ws"), "zst");
         let manifest = read_manifest(&dir.join("testnet/hl-ws/2026-01-01/manifest.jsonl"));
@@ -1020,7 +1249,7 @@ mod tests {
 
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
         let writer = SegmentWriter::spawn(config(dir, clock, "hl-ws", "hl-ws-01")).unwrap();
-        writer.shutdown();
+        writer.shutdown().unwrap();
 
         assert!(!partial.exists());
         let crashed = hour_dir.join("hl-ws-01-1700000000000000000.jsonl.zst.crashed");
@@ -1051,7 +1280,7 @@ mod tests {
 
         let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
         let writer = SegmentWriter::spawn(config(dir, clock, "hl-ws", "hl-ws")).unwrap();
-        writer.shutdown();
+        writer.shutdown().unwrap();
 
         assert!(!mine.exists());
         assert!(
@@ -1077,7 +1306,7 @@ mod tests {
             clock.set_t_ns(H1 + i as i64);
             assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", i, "payload")));
         }
-        writer.shutdown();
+        writer.shutdown().unwrap();
 
         let files = files_with_ext(&dir.join("testnet/hl-ws"), "zst");
         assert_eq!(files.len(), 1);
@@ -1104,7 +1333,7 @@ mod tests {
 
         assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 0, "x")));
         assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 1, "y")));
-        writer.shutdown();
+        writer.shutdown().unwrap();
 
         let files = files_with_ext(&dir.join("testnet/hl-ws"), "zst");
         assert_eq!(files.len(), 1);
@@ -1202,7 +1431,7 @@ mod tests {
                 std::hint::spin_loop();
             }
         }
-        writer.shutdown();
+        writer.shutdown().unwrap();
 
         let frames: usize = files_with_ext(&dir.join("testnet/hl-ws"), "zst")
             .iter()
@@ -1359,7 +1588,7 @@ mod tests {
             clock.set_t_ns(H1 + i as i64);
             assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", i, "x")));
         }
-        writer.shutdown();
+        writer.shutdown().unwrap();
 
         assert!(!guard.is_tripped());
         let files = files_with_ext(&out.join("testnet/hl-ws"), "zst");
@@ -1412,5 +1641,159 @@ mod tests {
         // says the mount is gone.
         let other = SegmentError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "gone"));
         assert!(is_lost_mount(&other, &guard));
+    }
+
+    // -- R-14 fix2 ----------------------------------------------------------
+
+    fn manifest_entry() -> ManifestEntry {
+        ManifestEntry {
+            file: "testnet/hl-ws/2026-01-01/00/hl-ws-01-1.jsonl.zst".to_string(),
+            src: "hl-ws".to_string(),
+            conn: "hl-ws-01".to_string(),
+            first_t_ns: H1,
+            last_t_ns: H1,
+            records: 2,
+            bytes_raw: 10,
+            bytes_zst: 5,
+            crashed: false,
+        }
+    }
+
+    /// Item 1: an unknown errno repeated more than 3 times on a guarded stream
+    /// trips the mount guard, and the warning is rate-limited (one line for the
+    /// first three errors).
+    #[test]
+    fn repeated_unknown_errors_trip_the_guard_and_log_once() {
+        let tmp = temp_dir("repeat-errors");
+        let mount = tmp.path();
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let (_probe, guard, cfg) = guarded_config(mount, clock);
+        let mut state = WriterState::new(cfg);
+        let err = || SegmentError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "x"));
+
+        for _ in 0..3 {
+            assert!(state.on_stream_error(&err()), "guarded error not handled");
+        }
+        assert!(!state.stopped, "three errors must not stop the stream yet");
+        assert!(!guard.is_tripped());
+        assert_eq!(state.consecutive_errors, 3);
+        assert_eq!(
+            state.error_log.suppressed, 2,
+            "only the first of three errors should have logged a line"
+        );
+
+        // The fourth consecutive error fails closed.
+        assert!(state.on_stream_error(&err()));
+        assert!(state.stopped);
+        assert!(guard.is_tripped());
+    }
+
+    #[test]
+    fn error_log_rate_limits_suppressed_lines() {
+        let mut log = StreamErrorLog::new();
+        assert_eq!(log.record(), Some(0), "first error logs immediately");
+        assert_eq!(log.record(), None);
+        assert_eq!(log.record(), None);
+        assert_eq!(log.suppressed, 2);
+        log.force_due();
+        assert_eq!(log.record(), Some(2), "next window reports the suppressed");
+        assert_eq!(log.suppressed, 0);
+    }
+
+    /// Item 3: `out_dir` must never be recreated by the writer; if it is
+    /// missing the stream fails closed and trips the guard.
+    #[test]
+    fn writer_never_recreates_out_dir() {
+        let tmp = temp_dir("no-recreate");
+        let mount = tmp.path();
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let (_probe, guard, cfg) = guarded_config(mount, clock.clone());
+        let out = mount.join("mev-rec");
+        // Simulate `out_dir` vanishing between the check and the create.
+        fs::remove_dir(&out).unwrap();
+        let mut state = WriterState::new(cfg);
+
+        state
+            .write(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 0, "a"))
+            .unwrap();
+
+        assert!(state.stopped);
+        assert!(guard.is_tripped());
+        assert!(
+            !out.exists(),
+            "out_dir must never be recreated by the writer"
+        );
+    }
+
+    /// Item 6: removing the guard before the manifest append would create the
+    /// day directory and the manifest file.
+    #[test]
+    fn manifest_append_is_guarded_when_the_mount_is_gone() {
+        let tmp = temp_dir("manifest-guard");
+        let mount = tmp.path();
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let (probe, guard, cfg) = guarded_config(mount, clock);
+        probe.set_mounted(false);
+
+        let before = path_set(mount);
+        let path = cfg.out_dir.join("testnet/hl-ws/2026-01-01/manifest.jsonl");
+        let err = append_manifest_line(&path, &manifest_entry(), &cfg).unwrap_err();
+
+        assert!(matches!(err, SegmentError::Mount(_)), "{err}");
+        assert!(guard.is_tripped());
+        assert_eq!(path_set(mount), before, "manifest append created something");
+    }
+
+    /// Item 6: removing the guard before recovery would rename the `.partial`
+    /// and create a manifest on the lost mount.
+    #[test]
+    fn recover_crashed_is_guarded_when_the_mount_is_gone() {
+        let tmp = temp_dir("recover-guard");
+        let mount = tmp.path();
+        let out = mount.join("mev-rec");
+        let hour_dir = out.join("testnet/hl-ws/2023-11-14/22");
+        fs::create_dir_all(&hour_dir).unwrap();
+        let partial = hour_dir.join("hl-ws-01-1700000000000000000.jsonl.zst.partial");
+        fs::write(&partial, b"truncated").unwrap();
+
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let probe = Arc::new(FakeMountProbe::new(mount));
+        let guard = Arc::new(MountGuard::new(Some(mount.to_path_buf()), probe.clone()));
+        guard.validate_startup(&out).unwrap();
+        let mut cfg = config(&out, clock, "hl-ws", "hl-ws-01");
+        cfg.mount_guard = guard.clone();
+
+        probe.set_mounted(false);
+        let before = path_set(mount);
+        let err = recover_crashed(&cfg).unwrap_err();
+
+        assert!(matches!(err, SegmentError::Mount(_)), "{err}");
+        assert!(guard.is_tripped());
+        assert!(partial.exists(), "partial must not be renamed");
+        assert_eq!(path_set(mount), before, "recovery wrote something");
+    }
+
+    /// Item 2: a writer thread that hangs in a mount probe must not block
+    /// shutdown; the join times out, the guard trips and a typed error returns.
+    #[test]
+    fn shutdown_times_out_and_trips_the_guard() {
+        let tmp = temp_dir("shutdown-timeout");
+        let mount = tmp.path();
+        let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+        let (probe, guard, mut cfg) = guarded_config(mount, clock.clone());
+        cfg.shutdown_join_timeout = Duration::from_millis(50);
+        let writer = SegmentWriter::spawn(cfg).unwrap();
+
+        // Block the writer thread inside its next mount probe.
+        probe.set_blocking(true);
+        assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", 0, "a")));
+        std::thread::sleep(Duration::from_millis(50));
+
+        let err = writer.shutdown().unwrap_err();
+        assert!(matches!(err, SegmentError::ShutdownTimeout { .. }), "{err}");
+        assert!(guard.is_tripped());
+
+        // Release the abandoned thread so it can finish.
+        probe.set_blocking(false);
     }
 }

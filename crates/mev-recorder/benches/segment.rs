@@ -66,7 +66,7 @@ fn assert_throughput_floor() {
         }
     }
     let elapsed = start.elapsed();
-    writer.shutdown();
+    writer.shutdown().unwrap();
 
     let rate = total as f64 / elapsed.as_secs_f64();
     println!("segment writer throughput: {total} envelopes in {elapsed:?} ({rate:.0}/s)");
@@ -91,7 +91,7 @@ fn segment_writer(c: &mut Criterion) {
             black_box(writer.try_send(env));
         })
     });
-    writer.shutdown();
+    writer.shutdown().unwrap();
 }
 
 criterion_group!(benches, segment_writer);

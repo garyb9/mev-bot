@@ -386,18 +386,24 @@ struct MountInfo {
 fn mount_source(mount: &Path) -> Result<String, String> {
     let text = fs::read_to_string(MOUNTINFO).map_err(|err| format!("{MOUNTINFO}: {err}"))?;
     let canonical = fs::canonicalize(mount).unwrap_or_else(|_| mount.to_path_buf());
+    source_from_mountinfo(&text, &canonical)
+}
+
+/// The source of the mount at `mount` in a mountinfo body.
+///
+/// The **last** matching line wins: with stacked mounts on one mount point the
+/// last entry is the one actually in use. A malformed line is a failed check.
+fn source_from_mountinfo(text: &str, mount: &Path) -> Result<String, String> {
+    let mut found: Option<String> = None;
     for line in text.lines() {
         let Some(entry) = parse_mountinfo_line(line) else {
             return Err(format!("malformed mountinfo line: {line}"));
         };
-        if Path::new(&entry.mount_point) == canonical {
-            return Ok(entry.source);
+        if Path::new(&entry.mount_point) == mount {
+            found = Some(entry.source);
         }
     }
-    Err(format!(
-        "`{}` is not a mount point in {MOUNTINFO}",
-        canonical.display()
-    ))
+    found.ok_or_else(|| format!("`{}` is not a mount point in {MOUNTINFO}", mount.display()))
 }
 
 /// Non-Linux hosts have no `/proc/self/mountinfo`, so a configured source
@@ -466,6 +472,7 @@ pub(crate) mod test_support {
         mount_dev: u64,
         host_dev: u64,
         mounted: AtomicBool,
+        blocking: AtomicBool,
     }
 
     impl FakeMountProbe {
@@ -476,6 +483,7 @@ pub(crate) mod test_support {
                 mount_dev: 7,
                 host_dev: 3,
                 mounted: AtomicBool::new(true),
+                blocking: AtomicBool::new(false),
             }
         }
 
@@ -483,10 +491,18 @@ pub(crate) mod test_support {
         pub(crate) fn set_mounted(&self, mounted: bool) {
             self.mounted.store(mounted, Ordering::SeqCst);
         }
+
+        /// Make `stat` block until cleared, to simulate a hung filesystem.
+        pub(crate) fn set_blocking(&self, blocking: bool) {
+            self.blocking.store(blocking, Ordering::SeqCst);
+        }
     }
 
     impl MountProbe for FakeMountProbe {
         fn stat(&self, path: &Path) -> io::Result<(u64, bool)> {
+            while self.blocking.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let meta = fs::metadata(path)?;
             if !self.mounted.load(Ordering::SeqCst) {
                 return Ok((self.host_dev, meta.is_dir()));
@@ -642,6 +658,21 @@ mod tests {
         assert_eq!(info.mount_point, "/mnt/my drive");
         assert_eq!(info.source, "E:\\");
         assert!(parse_mountinfo_line("too short").is_none());
+    }
+
+    #[test]
+    fn stacked_mounts_use_the_last_line() {
+        // Two mounts on the same mount point; the last is the one in use.
+        let text = "\
+36 35 8:1 / /mnt/e rw - drvfs E:\\134 rw\n\
+37 36 8:2 / /mnt/e rw - ext4 /dev/sdb1 rw\n";
+        let source = source_from_mountinfo(text, Path::new("/mnt/e")).unwrap();
+        assert_eq!(source, "/dev/sdb1", "the last stacked line must win");
+        assert!(
+            !source_matches("E:", &source),
+            "a different device at the mount point must be rejected"
+        );
+        assert!(source_matches("E:", "E:\\"));
     }
 
     #[test]

@@ -329,7 +329,7 @@ mod tests {
                 book_frame(bid, ask),
             )));
         }
-        writer.shutdown();
+        writer.shutdown().unwrap();
         "2023-11-14".to_string()
     }
 

@@ -765,6 +765,7 @@ fn segment_config(
         disk: Arc::new(SystemDiskSpace),
         priority,
         mount_guard,
+        shutdown_join_timeout: Duration::from_secs(10),
     }
 }
 
@@ -985,7 +986,7 @@ async fn run_ws_conn(
         tokio::select! {
             _ = tokio::time::sleep(start_delay) => {}
             _ = shutdown.changed() => {
-                writer.shutdown();
+                shutdown_writer(writer);
                 return;
             }
         }
@@ -1020,7 +1021,7 @@ async fn run_ws_conn(
                 tokio::select! {
                     _ = tokio::time::sleep(CONNECT_RETRY) => {}
                     _ = shutdown.changed() => {
-                        writer.shutdown();
+                        shutdown_writer(writer);
                         return;
                     }
                 }
@@ -1104,7 +1105,18 @@ async fn run_ws_conn(
     }
 
     state.set_connected(false);
-    writer.shutdown();
+    shutdown_writer(writer);
+}
+
+/// Stop a segment writer, surfacing a bounded-join timeout.
+///
+/// `SegmentWriter::shutdown` returns [`SegmentError::ShutdownTimeout`] and trips
+/// the mount guard when the writer thread did not stop in time, so `run` exits
+/// non-zero without waiting for the hung thread (R-14 fix2 §2).
+fn shutdown_writer(writer: SegmentWriter) {
+    if let Err(err) = writer.shutdown() {
+        warn!(error = %err, "segment writer shutdown timed out; mount guard tripped");
+    }
 }
 
 /// Write a `conn_open` envelope and return the next `seq`.

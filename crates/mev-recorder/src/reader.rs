@@ -1195,7 +1195,7 @@ mod tests {
             clock.set_t_ns(1_767_227_400_000_000_000 + i as i64 * 1_000_000);
             assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", i, "data")));
         }
-        writer.shutdown();
+        writer.shutdown().unwrap();
 
         let report = verify(&VerifyConfig {
             out_dir: dir.to_path_buf(),
