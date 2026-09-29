@@ -84,6 +84,7 @@ check_mount() {
             ;;
     esac
     source="$(timeout 3 findmnt -no SOURCE "$MOUNT" 2>/dev/null || true)"
+    source="${source%\\}"   # tolerate a trailing backslash: E:\ == E:
     if [[ "${source,,}" != "e:" ]]; then
         CHECK_REASON="$MOUNT source '$source' is not E:"
         return 1
