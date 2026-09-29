@@ -8,15 +8,16 @@
 //! One writer owns one `(src, conn)` stream. Segments rotate at the top of a
 //! UTC hour or when the uncompressed size passes [`SegmentConfig::max_raw_bytes`].
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel,
 };
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -944,11 +945,36 @@ fn parse_partial_name(name: &str) -> Option<(String, i64)> {
     Some((conn.to_string(), t_ns))
 }
 
+/// Serializes manifest appends for one manifest path across every writer in the
+/// process (R-2b).
+///
+/// Every `SegmentWriter` for a `(src, day)` appends to the same
+/// `manifest.jsonl`, each with its own freshly-opened `O_APPEND` handle. On the
+/// recorder's real output filesystem — a WSL 9p `drvfs` mount of the external
+/// SSD — `O_APPEND` across independently-opened handles is **not** atomic: the
+/// 9p client caches the file size, so two writers that open at the same instant
+/// append at the same offset and one line is silently lost with no error.
+/// Serializing the whole open→write→fsync→close per path means at most one
+/// handle is appending at a time, which removes the race.
+fn manifest_append_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let registry = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = registry.lock().unwrap_or_else(|poison| poison.into_inner());
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
 fn append_manifest_line(
     path: &Path,
     entry: &ManifestEntry,
     config: &SegmentConfig,
 ) -> Result<(), SegmentError> {
+    // Hold one append at a time per manifest so concurrent writers cannot race
+    // the 9p/drvfs append (R-2b). The lock is held across the guard check and
+    // every create/open/write below, so the guard behaviour itself is unchanged.
+    let lock = manifest_append_lock(path);
+    let _append_guard = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+    #[cfg(test)]
+    let _probe = append_probe::enter(path);
     // Re-check immediately before creating/opening (R-14 §2).
     config.mount_guard.check_or_trip()?;
     if let Some(parent) = path.parent() {
@@ -1043,6 +1069,82 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
     (year as i32, month as u32, day as u32)
+}
+
+/// Test-only instrumentation that records how many `append_manifest_line` calls
+/// for one armed path overlap in time. Production code always sees a no-op.
+///
+/// The R-2b regression cannot be reproduced as lost bytes on the repository's
+/// test filesystem (ext4 `O_APPEND` is atomic); instead the test proves the
+/// invariant that prevents the 9p loss: appends for one manifest never overlap.
+#[cfg(test)]
+mod append_probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    static HOLD_MS: AtomicUsize = AtomicUsize::new(0);
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    static ARMED_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+    fn armed_path() -> &'static Mutex<Option<PathBuf>> {
+        ARMED_PATH.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Arm the probe for `path`, holding each matching append for `hold_ms`.
+    pub(super) fn arm(path: &Path, hold_ms: u64) {
+        *armed_path()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(path.to_path_buf());
+        HOLD_MS.store(hold_ms as usize, Ordering::SeqCst);
+        IN_FLIGHT.store(0, Ordering::SeqCst);
+        MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
+    }
+
+    /// Stop recording and remove the artificial hold.
+    pub(super) fn disarm() {
+        *armed_path()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        HOLD_MS.store(0, Ordering::SeqCst);
+    }
+
+    /// Peak number of overlapping appends observed while armed.
+    pub(super) fn max_in_flight() -> usize {
+        MAX_IN_FLIGHT.load(Ordering::SeqCst)
+    }
+
+    /// A recorded append in progress; dropping it records the departure.
+    pub(super) struct Guard;
+
+    /// Record entry into an append for `path`, returning a guard that records
+    /// departure. Only active while armed for exactly this path.
+    pub(super) fn enter(path: &Path) -> Option<Guard> {
+        let armed = {
+            let armed = armed_path()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            armed.as_deref() == Some(path)
+        };
+        if !armed {
+            return None;
+        }
+        let concurrent = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_IN_FLIGHT.fetch_max(concurrent, Ordering::SeqCst);
+        let hold = HOLD_MS.load(Ordering::SeqCst);
+        if hold > 0 {
+            std::thread::sleep(Duration::from_millis(hold as u64));
+        }
+        Some(Guard)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1795,5 +1897,100 @@ mod tests {
 
         // Release the abandoned thread so it can finish.
         probe.set_blocking(false);
+    }
+
+    // -- R-2b: manifest append concurrency ----------------------------------
+
+    /// Concurrent appends to one manifest must not overlap. On the recorder's
+    /// 9p/drvfs SSD mount, overlapping `O_APPEND` handles silently drop lines
+    /// (R-2b); this test fails before the per-path append lock because the
+    /// probe observes several appends in flight at once.
+    #[test]
+    fn concurrent_manifest_appends_are_serialized() {
+        let tmp = temp_dir("manifest-race");
+        let dir = tmp.path().to_path_buf();
+        let path = dir.join("testnet/hl-ws/2026-01-01/manifest.jsonl");
+        let entry = manifest_entry();
+        let threads = 8;
+        append_probe::arm(&path, 25);
+
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let path = path.clone();
+                let entry = entry.clone();
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let cfg = config(
+                        &dir,
+                        Arc::new(FixedEnvelopeClock::new(H1, 0)),
+                        "hl-ws",
+                        "hl-ws-01",
+                    );
+                    barrier.wait();
+                    append_manifest_line(&path, &entry, &cfg).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        append_probe::disarm();
+
+        assert_eq!(
+            append_probe::max_in_flight(),
+            1,
+            "manifest appends for one path overlapped; concurrent 9p appends can drop lines (R-2b)"
+        );
+        assert_eq!(read_manifest(&path).len(), threads);
+    }
+
+    /// Eight writers for one `(src, day)` finalize at once through independent
+    /// `SegmentWriter`s; every finalized segment must have a manifest line.
+    #[test]
+    fn every_finalized_segment_gets_a_manifest_line_under_concurrency() {
+        let tmp = temp_dir("manifest-concurrent");
+        let dir = tmp.path().to_path_buf();
+        let threads = 8u64;
+        let barrier = Arc::new(std::sync::Barrier::new(threads as usize));
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                let conn = format!("hl-ws-{i:02}");
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let clock = Arc::new(FixedEnvelopeClock::new(H1, 0));
+                    let writer = SegmentWriter::spawn(config(&dir, clock.clone(), "hl-ws", &conn))
+                        .expect("spawn writer");
+                    barrier.wait();
+                    for seq in 0..20u64 {
+                        clock.set_t_ns(H1 + seq as i64);
+                        assert!(
+                            writer.try_send(Envelope::frame(&*clock, "hl-ws", &conn, seq, "data"))
+                        );
+                    }
+                    writer.shutdown().expect("finalize writer");
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let segments = files_with_ext(&dir.join("testnet/hl-ws"), "zst");
+        assert_eq!(segments.len(), threads as usize);
+        let manifest = read_manifest(&dir.join("testnet/hl-ws/2026-01-01/manifest.jsonl"));
+        assert_eq!(
+            manifest.len(),
+            segments.len(),
+            "a finalized segment is missing its manifest line"
+        );
+        let listed: std::collections::HashSet<String> =
+            manifest.iter().map(|entry| entry.file.clone()).collect();
+        for segment in &segments {
+            let rel = rel_path(&dir, segment);
+            assert!(listed.contains(&rel), "{rel} has no manifest line");
+        }
     }
 }
