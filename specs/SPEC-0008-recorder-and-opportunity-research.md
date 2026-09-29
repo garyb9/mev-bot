@@ -133,6 +133,10 @@ Rough volume: one `l2Book` stream is about 1–3 KB every ~0.5 s ⇒ ~0.2–0.5 
 
 **Invariant:** research code treats every interval between a `gap_start` and the next `gap_end` on the same `conn` as **missing data** for every subscription on that conn. A segment that doesn't end with `segment_close` was cut off by a crash; its last `t_ns` counts as a `gap_start`.
 
+**Gap timestamps (R-8 fix2).** A `gap_start` is stamped with the wall-clock and monotonic time the disconnect was **detected** (`Envelope::gap_start_at`/`new_at`), not the time the line was written, and `gap_end` with the reopen time; `meta.gap_ms = gap_end.t_ns - gap_start.t_ns`. Envelope `seq` order is still the write order, so a `gap_start`'s `t_ns` can be **earlier** than the preceding frame's (the frame was stamped when the recorder processed it, the gap at the drop). A `shutdown` `gap_start` is unpaired by design (the run ends there). A writer stopped by the disk/mount guard also emits a `gap_start` (§6, §6.1).
+
+**Reading a gap.** Readers close an open gap at the next `gap_start`, `gap_end`, or data envelope (`frame`, `frame_bin`, `rest`) on the same `(src, conn)`, so a restart after an unpaired `shutdown` gap is covered from its first data record rather than the whole day being missing. Rust `reader::CoverageAcc` and Python `_GapTracker` (`research/hlr/normalize.py`) implement the same rule. A final unpaired gap is closed at the last record seen on the stream; how a `drop` gap ends remains the §17 open question (#24).
+
 ### 5.4 Source ids
 
 | `src` | What | Task |
@@ -174,6 +178,18 @@ data/rec/
 | Retention | Local: delete segments older than `retain_days` (default 30) **only after** they are shipped (R-10). Shipping is optional in v1. |
 
 `data/` is already git-ignored. Do not commit recordings.
+
+**Manifest appends are serialized (R-2b).** Every finished segment appends one line to its day's `manifest.jsonl`, and several writer threads (one per `(src, conn)`) append to the same file with independently-opened `O_APPEND` handles. On the recorder's WSL 9p `drvfs` mount (`/mnt/e`) that is **not** atomic: the 9p client caches the file size, so two writers that open at the same instant append at the same offset and a line is lost with no error (5 of 56 finalized segments in the 6.25 h V-4 run had no manifest line). The recorder now holds a process-wide, per-path lock across the whole open→write→fsync of each append (`crates/mev-recorder/src/segment.rs::manifest_append_lock`), so at most one handle appends at a time. `hl record verify` trusts the manifest: a segment whose line is missing is invisible to it and coverage is undercounted (§17 #36).
+
+### 6.1 Mount guard (R-14)
+
+A profile may pin recording to an external drive. `require_mount` (an absolute path) and the optional `require_mount_source` (the mount's source from `/proc/self/mountinfo`, e.g. `'E:\'`, matched case-insensitively ignoring a trailing separator) are checked at startup and re-checked before every guarded write, so a disconnected drive cannot silently send writes to the root disk. See `crates/mev-recorder/src/mount_guard.rs`, `config/record-ssd.toml`, and `deploy/recorder/run-ssd.sh`.
+
+- **Startup:** the recorder refuses to start unless `require_mount` is a real mount point on a device other than `/` and `out_dir` is strictly inside it, before and after canonicalization (a symlink or `..` cannot escape). `validate_startup` creates nothing.
+- **Guarded write paths:** segment create (directory + `.partial`), segment finalize (`fsync` + rename + manifest), manifest append, crash recovery (`.partial` → `.crashed` rename + manifest), the REST paging state file, and `out_dir` creation — a single `create_dir` of a **direct child** of the verified mount, never `create_dir_all` along a path that may have become the root disk.
+- **Watchdog:** the writer re-checks the mount every 2 s (`MOUNT_RECHECK_INTERVAL`) even when no segment rotates, and the async path probes on a blocking thread under a 2 s timeout; a hung probe counts as a lost mount.
+- **Fail-closed:** on the first failed check the guard trips and the stream stops. The open segment is dropped **without** finalizing (finalization is path-based, so the `.partial` is left for crash recovery on the next start), and `hl record` exits non-zero. `/readyz` reports not-ready as soon as the guard trips.
+- **External watchdog:** `deploy/recorder/run-ssd.sh` refuses to `start` against anything but `/mnt/e`, and its 1 s watchdog SIGTERMs (then SIGKILLs) the recorder if `/mnt/e` stops being the E: `drvfs`/9p mount.
 
 ## 7. Hyperliquid WebSocket recording
 
@@ -230,20 +246,28 @@ zstd_level = 3
 min_free_gb = 20
 retain_days = 30
 meta_refresh_secs = 300          # re-resolve universes, pick up new listings
+http_port = 9091                 # kept separate from the bot's 9090
 
 [profile.default.hl]
 bbo              = ["perps:all", "hip3:all", "spot:top:40", "spot:quotes"]
 trades           = ["perps:top:40", "hip3:all", "spot:top:20"]
 active_asset_ctx = ["perps:all", "hip3:all"]
 all_mids         = true          # main dex + every HIP-3 dex
-l2book           = ["BTC", "ETH", "SOL", "HYPE", "hip3:all"]
-max_subs         = 900           # keep 100 of the 1000 as headroom
+l2book           = ["BTC", "ETH", "SOL", "HYPE"]
+max_subs         = 950           # ~934 requested; 50 of the 1000/IP limit as headroom
 subs_per_conn    = 150
 connections      = 8             # of 10; leaves 2 for ad-hoc tools / the bot
+allow_truncate   = false         # refuse to drop priority-1 subscriptions
 
 [profile.default.rest]
 enabled = true
 # see §8 for the request list and cadences
+weight_per_min = 300             # a quarter of the 1200/IP budget
+
+[profile.default.deribit]
+enabled    = false               # R-12; public Deribit options summaries (no keys)
+currencies = ["BTC", "ETH"]
+base_url   = "https://www.deribit.com/api/v2"
 
 [profile.default.cex]
 binance_usdm = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT"]
@@ -256,6 +280,8 @@ rpc_ws  = "env:HL_EVM_WS_URL"
 pools   = "config/hyperevm-pools.toml"
 ```
 
+**Profile budget.** `max_subs` is a local cap, kept below the venue limit of **1000 subscriptions per IP** (§7.1) with headroom for the bot and ad-hoc tools. The shipped profile requests ~934 subscriptions against `max_subs = 950`, so nothing is dropped. Listing `hip3:all` in `l2book` instead requests ~1085 and the planner drops every priority-3 subscription, so the majors' books are not recorded. `l2Book` is the heaviest stream: at §5's 0.2–0.5 GB/day per coin raw, recording every market on every HIP-3 dex is roughly **30–75 GB/day raw**, which is why `hip3:all` is not a default. When over budget, priority-3 (`l2Book`, `allMids`) is dropped first.
+
 ### 7.4 Subscription planner (task R-4)
 
 Input: a resolved profile. Output: a `Plan` = list of connections, each with an ordered list of subscriptions.
@@ -263,7 +289,7 @@ Input: a resolved profile. Output: a `Plan` = list of connections, each with an 
 Algorithm (must be deterministic: same input ⇒ same plan):
 
 1. Expand every selector into `(stream, coin)` pairs, de-duplicated, sorted by `(priority, stream, coin)`.
-2. Count them. If the count is over `max_subs`, **drop from the lowest priority upward** (priority 3 first, then 2) until the plan fits. Log every dropped pair at WARN and fail if a priority-1 pair would be dropped, unless `--allow-truncate` is set.
+2. Count them. If the count is over `max_subs`, drop from the lowest priority upward: at each step, take the **highest priority number** present (3, then 2, then 1) and remove the **last** subscription with that priority in `(priority, stream, coin, dex)` sort order (`planner::plan`, `crates/mev-recorder/src/planner.rs`). An explicitly named coin gets no protection against a wildcard expansion of the same stream and priority: both are ordinary subscriptions in the same sorted set, so the lexicographically last coin is the one removed. Log every dropped pair at WARN and fail if a priority-1 pair would be dropped, unless `--allow-truncate` is set.
 3. Put `l2Book` subscriptions on their **own** connection(s): they are the heaviest, and isolating them keeps `bbo` latency clean.
 4. Fill the remaining connections round-robin, at most `subs_per_conn` each, so no single coin's `bbo`/`trades`/`ctx` all share one socket (limits the blast radius of one bad connection).
 5. Fail if the connection count exceeds `connections`.
@@ -1136,6 +1162,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Do:** `Protocol` implementations for `binance-usdm`, `binance-spot`, `bybit-linear` per §9 (confirmed by V-2). Add a `[cex]` section to the profile. Each venue gets its own `src` directory.
 - **Tests:** mock-server tests for the subscribe format and the Bybit ping cadence.
 - **Done when:** tests pass; a manual 10-minute run shows ticker frames for every configured symbol.
+- **Implemented (2026-09-29).** `crates/mev-recorder/src/sources/cex.rs` ships the three `Protocol`/source implementations; `crates/mev-bot/src/record.rs` spawns one per non-empty `[profile.default.cex]` list, each with its own `(src, src)` `SegmentWriter` under the mount guard. CEX liveness is registered with the readiness monitor but is **non-gating**: a stale reference feed logs a WARN and never takes the recorder out of `/readyz`. The 10-minute run against the real hosts (the Done-when above) is still to do.
 
 #### R-9 — HyperEVM pool source
 - **Do:** Implement §10 with Alloy (`alloy` provider with the `ws` feature, `sol!` for `IUniswapV2Pair.getReserves`, `IUniswapV3Pool.slot0/liquidity`, and `Multicall3.aggregate3`). One multicall per new block, at that block number. Handle reconnects by emitting gaps (reuse the envelope kinds). Add `enabled=false` by default.
@@ -1151,6 +1178,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Do:** Poll the §9.1 Deribit endpoints every 60 s for the configured currencies; record `rest` envelopes under `src:"deribit"`. Respect V-10's rate limits.
 - **Tests:** `wiremock` → envelopes; cadence.
 - **Done when:** tests pass; a 1-hour run shows 60 snapshots per currency.
+- **Implemented (2026-09-29).** `crates/mev-recorder/src/sources/deribit.rs` polls `public/get_book_summary_by_currency` and `public/get_index_price` per currency every 60 s and records the raw body as `rest` envelopes; `record.rs` wires it behind `[profile.default.deribit].enabled`, default off (config/record.toml). The 1-hour run (the Done-when above) is still to do. §17 #33 names the per-instrument `ticker`/`get_instruments` fan-out this source does not poll.
 
 #### R-13 — `equities` source
 - **Do:** Implement the V-11 provider as a `RawWsConn` `Protocol` (auth from env, never logged), subscribed to the mapped underlyings; record frames under `src:"equities"`. If the provider only offers REST, poll at its fastest allowed rate and note it.
@@ -1351,3 +1379,5 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 33. **R-12 Deribit field sources (V-10).** `get_book_summary_by_currency` omits `bid_iv`/`ask_iv`, greeks and `index_price`, so R-12 cannot fill §13.1's `deribit_options` row from it alone: add `get_instruments` (expiry/strike/cp, capped at 1 req/s) and per-instrument `ticker` (or the `ticker.<instrument>` WS channel). Deribit's terms for storing market data are unstated (see #27).
 34. **Grading edge cases (P-5 review, 2026-09-28).** Chosen readings, all conservative: coverage below `min_coverage_pct` grades **FAIL** (a failed `[quality]` gate), not INCONCLUSIVE; a missing, failed or non-positive buffered-cost re-run (`robustness_buffer_multiplier`) grades **FAIL**; a `preliminary` result is capped at **MARGINAL**; the headline latency rounds **up** to the next grid value (above the grid → INCONCLUSIVE) and the headline capital must match a run exactly; a report without the `adj_jitter` variant is INCONCLUSIVE; `data_source` is derived from the input tables' `source` column (anything but pure recorder data → HIST-PRELIM).
 35. **Accepted limits of P-5 grading (review #4, 2026-09-29).** (a) Hand-edited report front-matter metrics and provenance are trusted: the digest only guards data drift, not metric edits; closing this needs the bootstrap seed and draws saved, or the robustness frames' `source` stored in the parquet. (b) Studies built on the `bars` table carry source mid/trade/candle and can never be graded forward (forward is decided by `source == "recorder"` only). (c) Episode provenance is taken from the row at `t_start`. A malformed report never aborts `hlr-rank`; it grades INCONCLUSIVE with a reason.
+36. **`verify` trusts manifests; orphan segments (R-2b/V-4).** `hl record verify` enumerates the manifest (`reader::verify`), so a finished segment whose manifest line was lost is invisible to it and coverage is undercounted. The 9p/drvfs append race that caused this is now serialized per manifest path (R-2b, §6), but a **manifest-vs-disk check** (list segments on disk, flag those with no manifest line) and repair of the **5 orphan segments** from the V-4 run are open follow-ups.
+37. **V-4 / V-7 measured results (2026-09-29, external-SSD run on the pre-V-7b profile).** 6.25 h, 22.3 M records, 774 MB compressed on disk; `hl-ws`+`hl-rest` ~117 MB/h compressed and ~1.2 GB/h raw (10.5× compression); 24 connection opens over 8 connections. Measured **before** the `l2Book`/`allMids` fix, i.e. with every priority-3 subscription dropped; the corrected profile (majors' `l2Book` only) is estimated at +0.2–0.5 GB/day compressed. Recorded here rather than in §15 because the reference region/host (V-4's actual Done-when) is still unset.
