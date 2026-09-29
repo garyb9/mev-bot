@@ -189,6 +189,19 @@ enum RecordCmd {
         /// UTC date to verify, `YYYY-MM-DD`.
         #[arg(long)]
         date: String,
+        /// Do not fail when finished segments have no manifest line (orphans).
+        #[arg(long)]
+        allow_orphans: bool,
+    },
+    /// Append the missing manifest line for orphan finished segments
+    /// (SPEC-0008 §17 #36). Maintenance tool; never run automatically.
+    RepairManifest {
+        /// UTC date whose orphans to repair, `YYYY-MM-DD`.
+        #[arg(long)]
+        date: String,
+        /// Print the lines that would be appended without writing them.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -380,8 +393,12 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
                 record::plan(profile, network.map(Into::into), allow_truncate).await
             }
             Some(RecordCmd::Inspect { paths }) => record::inspect(&paths),
-            Some(RecordCmd::Verify { date }) => {
-                record::verify(profile, network.map(Into::into), &date)
+            Some(RecordCmd::Verify {
+                date,
+                allow_orphans,
+            }) => record::verify(profile, network.map(Into::into), &date, allow_orphans),
+            Some(RecordCmd::RepairManifest { date, dry_run }) => {
+                record::repair_manifest(profile, network.map(Into::into), &date, dry_run)
             }
         },
         Command::Probe { cmd } => match cmd {

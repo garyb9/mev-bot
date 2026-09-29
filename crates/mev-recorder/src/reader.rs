@@ -5,12 +5,14 @@
 //! ([`merge_segments_iter`]). A truncated zstd tail is tolerated only for
 //! `.crashed` files, which yield every envelope the writer managed to flush;
 //! for a finished segment a decode failure is an error. The analysis functions
-//! are pure library code; wiring the CLI is R-6's job.
+//! are pure library code; wiring the CLI is R-6's job. [`verify`] additionally
+//! compares the manifest against the files on disk and [`repair_manifest`]
+//! appends the missing line for an orphan finished segment (SPEC-0008 §17 #36).
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -42,6 +44,20 @@ pub enum ReaderError {
         path: String,
         /// The serde error.
         source: serde_json::Error,
+    },
+    /// A reconstructed manifest line could not be encoded.
+    #[error("manifest encode error for {path}: {source}")]
+    ManifestEncode {
+        /// Manifest file path.
+        path: String,
+        /// The serde error.
+        source: serde_json::Error,
+    },
+    /// A segment path does not follow the recorder's naming scheme.
+    #[error("invalid segment path `{path}`")]
+    InvalidSegment {
+        /// The offending path.
+        path: String,
     },
     /// The requested date was not `YYYY-MM-DD`.
     #[error("invalid date `{0}`")]
@@ -189,6 +205,11 @@ pub struct VerifyReport {
     pub date: String,
     /// Per-file checks.
     pub files: Vec<FileCheck>,
+    /// Finished segments on disk with no manifest line (SPEC-0008 §17 #36).
+    ///
+    /// Each entry is the line the segment *should* have; coverage already
+    /// counts its records, so a lost append no longer undercounts the day.
+    pub orphans: Vec<ManifestEntry>,
     /// Per-stream coverage.
     pub coverage: Vec<StreamCoverage>,
 }
@@ -202,6 +223,36 @@ pub struct VerifyConfig {
     pub network: String,
     /// UTC date to verify, `YYYY-MM-DD`.
     pub date: String,
+}
+
+/// Inputs for [`repair_manifest`].
+#[derive(Debug, Clone)]
+pub struct RepairConfig {
+    /// Root of the recording tree (usually `data/rec`).
+    pub out_dir: PathBuf,
+    /// Network directory name, `mainnet` or `testnet`.
+    pub network: String,
+    /// UTC date whose orphans are repaired, `YYYY-MM-DD`.
+    pub date: String,
+    /// Print what would be appended without writing anything.
+    pub dry_run: bool,
+}
+
+/// One action taken by [`repair_manifest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairAction {
+    /// A missing manifest line that was appended (or, in dry-run, would be).
+    Append {
+        /// The reconstructed line.
+        entry: ManifestEntry,
+    },
+    /// A segment that was left alone, with the reason.
+    Skip {
+        /// Path relative to `out_dir`.
+        file: String,
+        /// Why it was not repaired.
+        reason: String,
+    },
 }
 
 /// A lazy reader over one segment file, yielding one envelope per line.
@@ -573,7 +624,24 @@ pub fn inspect(paths: &[PathBuf]) -> Result<InspectReport, ReaderError> {
     Ok(report)
 }
 
+/// One segment to verify: its manifest line, or an orphan found on disk.
+struct SegmentTask {
+    /// Path relative to `out_dir` (the manifest `file` field format).
+    file: String,
+    src: String,
+    conn: String,
+    first_t_ns: i64,
+    /// The manifest line, when one exists.
+    manifest: Option<ManifestEntry>,
+}
+
 /// Check a day's manifest against the files on disk and compute coverage.
+///
+/// The check is two-sided (SPEC-0008 §17 #36): it reports manifest lines whose
+/// file is missing, size/record mismatches, and finished segments present on
+/// disk with **no** manifest line (orphans). Coverage is computed over the
+/// union of manifest and orphan segments, so a lost manifest append no longer
+/// undercounts the day.
 pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
     let (day_start, day_end) =
         day_bounds(&config.date).ok_or_else(|| ReaderError::InvalidDate(config.date.clone()))?;
@@ -581,52 +649,110 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
     let mut report = VerifyReport {
         date: config.date.clone(),
         files: Vec::new(),
+        orphans: Vec::new(),
         coverage: Vec::new(),
     };
-    let mut coverage: BTreeMap<(String, String), CoverageAcc> = BTreeMap::new();
 
-    for manifest in manifests_for(&config.out_dir, &config.network, &config.date)? {
-        for entry in read_manifest(&manifest)? {
-            let path = config.out_dir.join(&entry.file);
-            let exists = path.exists();
-            let bytes_zst_on_disk = if exists {
-                Some(fs::metadata(&path)?.len())
-            } else {
-                None
-            };
-            let records_on_disk = if exists {
-                let envelopes = read_envelopes(&path)?;
-                let acc = coverage
-                    .entry((entry.src.clone(), entry.conn.clone()))
-                    .or_default();
-                acc.start_segment();
-                for env in &envelopes {
-                    acc.observe(env);
-                }
-                acc.end_segment();
-                Some(envelopes.len() as u64)
-            } else {
-                None
-            };
-            let size_ok = bytes_zst_on_disk == Some(entry.bytes_zst);
-            let records_ok = entry.crashed || records_on_disk == Some(entry.records);
-
-            report.files.push(FileCheck {
-                file: entry.file,
-                src: entry.src,
-                conn: entry.conn,
-                exists,
-                bytes_zst_manifest: entry.bytes_zst,
-                bytes_zst_on_disk,
-                size_ok,
-                records_manifest: entry.records,
-                records_on_disk,
-                records_ok,
-                crashed: entry.crashed,
-            });
+    // Manifest lines for the day, keyed by their (relative) file path so the
+    // disk walk can tell which files already have a line.
+    let mut manifest: BTreeMap<String, ManifestEntry> = BTreeMap::new();
+    for path in manifests_for(&config.out_dir, &config.network, &config.date)? {
+        for entry in read_manifest(&path)? {
+            manifest.insert(entry.file.clone(), entry);
         }
     }
+
+    // Every segment on disk for the day: manifest-known ones and orphans.
+    let mut plan: Vec<SegmentTask> = Vec::new();
+    for (file, entry) in &manifest {
+        plan.push(SegmentTask {
+            file: file.clone(),
+            src: entry.src.clone(),
+            conn: entry.conn.clone(),
+            first_t_ns: entry.first_t_ns,
+            manifest: Some(entry.clone()),
+        });
+    }
+    for path in segments_for(&config.out_dir, &config.network, &config.date, &config.date)? {
+        let file = rel_path(&config.out_dir, &path);
+        if manifest.contains_key(&file) {
+            continue;
+        }
+        let (src, conn, first_t_ns) = segment_identity(&config.out_dir, &path)?;
+        plan.push(SegmentTask {
+            file,
+            src,
+            conn,
+            first_t_ns,
+            manifest: None,
+        });
+    }
+
+    // Visit each stream in time order so the gap state carried across segments
+    // (`CoverageAcc`) sees the same sequence a replay would.
+    plan.sort_by(|a, b| {
+        (&a.src, &a.conn, a.first_t_ns, &a.file).cmp(&(&b.src, &b.conn, b.first_t_ns, &b.file))
+    });
+
+    let mut coverage: BTreeMap<(String, String), CoverageAcc> = BTreeMap::new();
+    for task in &plan {
+        let path = config.out_dir.join(&task.file);
+        let Some(entry) = &task.manifest else {
+            // An orphan: read it from disk, reconstruct the line it should have
+            // had, and feed coverage from the same envelopes.
+            let envelopes = read_envelopes(&path)?;
+            let acc = coverage
+                .entry((task.src.clone(), task.conn.clone()))
+                .or_default();
+            acc.start_segment();
+            for env in &envelopes {
+                acc.observe(env);
+            }
+            acc.end_segment();
+            report
+                .orphans
+                .push(segment_manifest_entry(&config.out_dir, &path, &envelopes)?);
+            continue;
+        };
+        let exists = path.exists();
+        let bytes_zst_on_disk = if exists {
+            Some(fs::metadata(&path)?.len())
+        } else {
+            None
+        };
+        let records_on_disk = if exists {
+            let envelopes = read_envelopes(&path)?;
+            let acc = coverage
+                .entry((entry.src.clone(), entry.conn.clone()))
+                .or_default();
+            acc.start_segment();
+            for env in &envelopes {
+                acc.observe(env);
+            }
+            acc.end_segment();
+            Some(envelopes.len() as u64)
+        } else {
+            None
+        };
+        let size_ok = bytes_zst_on_disk == Some(entry.bytes_zst);
+        let records_ok = entry.crashed || records_on_disk == Some(entry.records);
+
+        report.files.push(FileCheck {
+            file: entry.file.clone(),
+            src: entry.src.clone(),
+            conn: entry.conn.clone(),
+            exists,
+            bytes_zst_manifest: entry.bytes_zst,
+            bytes_zst_on_disk,
+            size_ok,
+            records_manifest: entry.records,
+            records_on_disk,
+            records_ok,
+            crashed: entry.crashed,
+        });
+    }
     report.files.sort_by(|a, b| a.file.cmp(&b.file));
+    report.orphans.sort_by(|a, b| a.file.cmp(&b.file));
 
     let day_ms = day_end.saturating_sub(day_start) as u64 / 1_000_000;
     for ((src, conn), mut acc) in coverage {
@@ -648,6 +774,191 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
         .sort_by(|a, b| (&a.src, &a.conn).cmp(&(&b.src, &b.conn)));
 
     Ok(report)
+}
+
+/// `(src, conn, first_t_ns)` for a segment path, from its directory and name.
+///
+/// The name is `{conn}-{first_t_ns}.jsonl.zst[.crashed]`; `first_t_ns` is the
+/// same timestamp `segment.rs` uses for the manifest's `first_t_ns`, and the
+/// source is the directory level under the network root.
+fn segment_identity(out_dir: &Path, path: &Path) -> Result<(String, String, i64), ReaderError> {
+    let invalid = || ReaderError::InvalidSegment {
+        path: path.display().to_string(),
+    };
+    let src = path
+        .strip_prefix(out_dir)
+        .ok()
+        .and_then(|rel| rel.components().nth(1))
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .ok_or_else(invalid)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(invalid)?;
+    let stem = name.strip_suffix(".crashed").unwrap_or(name);
+    let stem = stem.strip_suffix(".jsonl.zst").ok_or_else(invalid)?;
+    let (conn, timestamp) = stem.rsplit_once('-').ok_or_else(invalid)?;
+    let first_t_ns = timestamp.parse::<i64>().map_err(|_| invalid())?;
+    Ok((src, conn.to_string(), first_t_ns))
+}
+
+/// Reconstruct the manifest line a finished (or recovered) segment must have,
+/// from its own records and its size on disk (SPEC-0008 §6, §17 #36).
+///
+/// `records` is the total decoded line count and `bytes_raw` the summed
+/// uncompressed line lengths including each newline, which matches what
+/// `segment.rs` writes. `first_t_ns` comes from the file name and `last_t_ns`
+/// from the last envelope written before `segment_close` (or `first_t_ns` when
+/// the file holds only `segment_open`/`segment_close`). Nothing is invented: a
+/// field the segment cannot supply is an error.
+pub fn segment_manifest_entry(
+    out_dir: &Path,
+    path: &Path,
+    envelopes: &[Envelope],
+) -> Result<ManifestEntry, ReaderError> {
+    let (src, conn, first_t_ns) = segment_identity(out_dir, path)?;
+    let mut bytes_raw = 0u64;
+    for env in envelopes {
+        let len = serde_json::to_vec(env)
+            .map_err(|source| ReaderError::ManifestEncode {
+                path: path.display().to_string(),
+                source,
+            })?
+            .len() as u64
+            + 1;
+        bytes_raw += len;
+    }
+    let last_t_ns = envelopes
+        .iter()
+        .rev()
+        .find(|env| !matches!(env.kind, Kind::SegmentOpen | Kind::SegmentClose))
+        .map_or(first_t_ns, |env| env.t_ns);
+    Ok(ManifestEntry {
+        file: rel_path(out_dir, path),
+        src,
+        conn,
+        first_t_ns,
+        last_t_ns,
+        records: envelopes.len() as u64,
+        bytes_raw,
+        bytes_zst: fs::metadata(path)?.len(),
+        crashed: is_crashed(path),
+    })
+}
+
+/// Append the missing manifest line for every orphan finished segment of a day
+/// (SPEC-0008 §17 #36).
+///
+/// Only segments that decode fully, end in `segment_close`, and are not
+/// `.crashed` are repaired; anything else is reported and left alone.
+/// Idempotent (a segment with an existing manifest line is skipped),
+/// append-only (no existing line or segment is ever rewritten or deleted), and
+/// it never creates a directory — only `manifest.jsonl` files inside the day
+/// directories that already hold the segments.
+pub fn repair_manifest(config: &RepairConfig) -> Result<Vec<RepairAction>, ReaderError> {
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    for path in manifests_for(&config.out_dir, &config.network, &config.date)? {
+        for entry in read_manifest(&path)? {
+            known.insert(entry.file);
+        }
+    }
+
+    let mut actions = Vec::new();
+    for path in segments_for(&config.out_dir, &config.network, &config.date, &config.date)? {
+        let file = rel_path(&config.out_dir, &path);
+        if known.contains(&file) {
+            continue;
+        }
+        if is_crashed(&path) {
+            actions.push(RepairAction::Skip {
+                file,
+                reason: "crashed segment (not fully finalized)".to_string(),
+            });
+            continue;
+        }
+        let envelopes = match read_envelopes(&path) {
+            Ok(envelopes) => envelopes,
+            Err(err) => {
+                actions.push(RepairAction::Skip {
+                    file,
+                    reason: format!("decode failed: {err}"),
+                });
+                continue;
+            }
+        };
+        if envelopes.last().map(|env| env.kind) != Some(Kind::SegmentClose) {
+            actions.push(RepairAction::Skip {
+                file,
+                reason: "no segment_close (not fully finalized)".to_string(),
+            });
+            continue;
+        }
+        let entry = match segment_manifest_entry(&config.out_dir, &path, &envelopes) {
+            Ok(entry) => entry,
+            Err(err) => {
+                actions.push(RepairAction::Skip {
+                    file,
+                    reason: format!("could not derive the manifest line: {err}"),
+                });
+                continue;
+            }
+        };
+        let Some(manifest) = manifest_path_for_segment(&path) else {
+            actions.push(RepairAction::Skip {
+                file,
+                reason: "cannot locate the day directory".to_string(),
+            });
+            continue;
+        };
+        if !config.dry_run
+            && let Err(err) = append_manifest_entry(&manifest, &entry)
+        {
+            actions.push(RepairAction::Skip {
+                file: entry.file.clone(),
+                reason: format!("append failed: {err}"),
+            });
+            continue;
+        }
+        actions.push(RepairAction::Append { entry });
+    }
+    Ok(actions)
+}
+
+/// Append one reconstructed manifest line, creating `manifest.jsonl` if needed.
+///
+/// The line is byte-identical to the writer's output (the same `serde_json`
+/// serialization of [`ManifestEntry`]). No parent directory is created; callers
+/// only pass a manifest path whose day directory already exists.
+pub fn append_manifest_entry(path: &Path, entry: &ManifestEntry) -> Result<(), ReaderError> {
+    let mut line = serde_json::to_vec(entry).map_err(|source| ReaderError::ManifestEncode {
+        path: path.display().to_string(),
+        source,
+    })?;
+    line.push(b'\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(&line)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+/// The day `manifest.jsonl` that a `…/{date}/{hour}/…` segment belongs to.
+fn manifest_path_for_segment(segment: &Path) -> Option<PathBuf> {
+    segment
+        .parent()
+        .and_then(Path::parent)
+        .map(|day| day.join("manifest.jsonl"))
+}
+
+/// A segment path relative to `out_dir`, with `/` separators (the manifest
+/// `file` format).
+fn rel_path(out_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(out_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn read_manifest(path: &Path) -> Result<Vec<ManifestEntry>, ReaderError> {
@@ -1722,5 +2033,204 @@ mod tests {
         let (start, end) = day_bounds("1970-01-01").unwrap();
         assert_eq!(start, 0);
         assert_eq!(end, 86_400_000_000_000);
+    }
+
+    /// Build a single finalized segment with the real `SegmentWriter` so its
+    /// manifest line is exactly what the writer would emit.
+    fn write_finalized_segment(dir: &Path, frames: u64, base: i64) -> PathBuf {
+        let clock = Arc::new(FixedEnvelopeClock::new(base, 0));
+        let config = SegmentConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            src: "hl-ws".into(),
+            conn: "hl-ws-01".into(),
+            clock: clock.clone(),
+            ..SegmentConfig::default()
+        };
+        let writer = SegmentWriter::spawn(config).unwrap();
+        for i in 0..frames {
+            clock.set_t_ns(base + i as i64 * 1_000_000);
+            assert!(writer.try_send(Envelope::frame(&*clock, "hl-ws", "hl-ws-01", i, "data")));
+        }
+        writer.shutdown().unwrap();
+        dir.join("testnet/hl-ws/2026-01-01/manifest.jsonl")
+    }
+
+    /// A finished segment with no manifest line is an orphan: `verify` reports
+    /// it, still counts its records in coverage, and leaves the manifest check
+    /// empty (SPEC-0008 §17 #36).
+    #[test]
+    fn verify_flags_an_orphan_and_counts_its_records() {
+        let tmp = temp_dir("verify-orphan");
+        let dir = tmp.path();
+        let base = 1_767_227_400_000_000_000i64; // 2026-01-01T00:30:00Z
+        let manifest = write_finalized_segment(dir, 10, base);
+        fs::remove_file(&manifest).unwrap();
+
+        let report = verify(&VerifyConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert!(report.files.is_empty(), "no manifest line must be checked");
+        assert_eq!(report.orphans.len(), 1);
+        assert_eq!(report.orphans[0].records, 12); // open + 10 frames + close
+        assert_eq!(report.orphans[0].src, "hl-ws");
+        assert_eq!(report.orphans[0].conn, "hl-ws-01");
+        assert!(
+            report.orphans[0].file.ends_with(".jsonl.zst"),
+            "{}",
+            report.orphans[0].file
+        );
+        // The orphan's own records still count: 10 ms of frames, minus the
+        // one-segment interval's exclusive end bound (9 ms inclusive span).
+        assert_eq!(report.coverage.len(), 1);
+        assert_eq!(report.coverage[0].covered_ms, 9);
+    }
+
+    /// `repair_manifest` appends exactly the line the writer would have written,
+    /// and a second run is a no-op.
+    #[test]
+    fn repair_appends_the_writer_line_and_is_idempotent() {
+        let tmp = temp_dir("repair");
+        let dir = tmp.path();
+        let manifest = write_finalized_segment(dir, 20, 1_767_227_400_000_000_000);
+        let original = fs::read(&manifest).unwrap();
+        fs::remove_file(&manifest).unwrap();
+
+        let config = RepairConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+            dry_run: false,
+        };
+        let actions = repair_manifest(&config).unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(matches!(actions[0], RepairAction::Append { .. }));
+        assert_eq!(
+            fs::read(&manifest).unwrap(),
+            original,
+            "the reconstructed line differs from the writer's"
+        );
+
+        // Idempotent: the repaired line is seen and nothing is appended.
+        let again = repair_manifest(&config).unwrap();
+        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(fs::read(&manifest).unwrap(), original);
+
+        // And `verify` now passes.
+        let report = verify(&VerifyConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+        })
+        .unwrap();
+        assert!(report.orphans.is_empty());
+        assert_eq!(report.files.len(), 1);
+        assert!(report.files[0].records_ok && report.files[0].size_ok);
+    }
+
+    /// `--dry-run` reports the line it would append but writes nothing.
+    #[test]
+    fn repair_dry_run_writes_nothing() {
+        let tmp = temp_dir("repair-dry");
+        let dir = tmp.path();
+        let manifest = write_finalized_segment(dir, 5, 1_767_227_400_000_000_000);
+        fs::remove_file(&manifest).unwrap();
+
+        let actions = repair_manifest(&RepairConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+            dry_run: true,
+        })
+        .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], RepairAction::Append { .. }));
+        assert!(!manifest.exists(), "dry run created the manifest");
+    }
+
+    /// A segment without `segment_close`, and a `.crashed` segment, are reported
+    /// and left alone (never repaired).
+    #[test]
+    fn repair_reports_unfinalized_and_crashed_segments() {
+        let tmp = temp_dir("repair-skip");
+        let dir = tmp.path();
+        let base = 1_767_227_400_000_000_000i64;
+        let clock = FixedEnvelopeClock::new(base, 0);
+        let env = Envelope::frame(&clock, "hl-ws", "hl-ws-01", 0, "data");
+        // A `.jsonl.zst` with no `segment_close` and a `.crashed` file; both get
+        // a manifest line from `write_segment`, which we then delete.
+        write_segment(
+            dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            base,
+            std::slice::from_ref(&env),
+            false,
+        );
+        write_segment(
+            dir,
+            "hl-ws",
+            "hl-ws-01",
+            "2026-01-01",
+            base + 10_000_000_000,
+            std::slice::from_ref(&env),
+            true,
+        );
+        let manifest = dir.join("testnet/hl-ws/2026-01-01/manifest.jsonl");
+        fs::remove_file(&manifest).unwrap();
+
+        let actions = repair_manifest(&RepairConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+            dry_run: false,
+        })
+        .unwrap();
+        assert_eq!(actions.len(), 2, "{actions:?}");
+        assert!(
+            actions
+                .iter()
+                .all(|action| matches!(action, RepairAction::Skip { .. })),
+            "an unfinalized/crashed segment must not be repaired: {actions:?}"
+        );
+        assert!(!manifest.exists(), "skipped segments created a manifest");
+    }
+
+    /// A corrupted finished segment cannot be reconstructed from: `repair`
+    /// reports it instead of inventing a line.
+    #[test]
+    fn repair_reports_a_corrupt_finished_segment() {
+        let tmp = temp_dir("repair-corrupt");
+        let dir = tmp.path();
+        let manifest = write_finalized_segment(dir, 3, 1_767_227_400_000_000_000);
+        fs::remove_file(&manifest).unwrap();
+
+        // Flip bytes in the middle of the compressed stream.
+        let segment = segments_for(dir, "testnet", "2026-01-01", "2026-01-01")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut bytes = fs::read(&segment).unwrap();
+        let mid = bytes.len() / 2;
+        for byte in &mut bytes[mid..mid + 8] {
+            *byte ^= 0xff;
+        }
+        fs::write(&segment, &bytes).unwrap();
+
+        let actions = repair_manifest(&RepairConfig {
+            out_dir: dir.to_path_buf(),
+            network: "testnet".into(),
+            date: "2026-01-01".into(),
+            dry_run: false,
+        })
+        .unwrap();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(matches!(actions[0], RepairAction::Skip { .. }));
+        assert!(!manifest.exists());
     }
 }

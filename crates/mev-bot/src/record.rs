@@ -1544,7 +1544,12 @@ pub fn inspect(paths: &[PathBuf]) -> Result<()> {
 }
 
 /// Print the `verify` report for a UTC date.
-pub fn verify(profile: Option<String>, network: Option<Network>, date: &str) -> Result<()> {
+pub fn verify(
+    profile: Option<String>,
+    network: Option<Network>,
+    date: &str,
+    allow_orphans: bool,
+) -> Result<()> {
     let (name, profile) = load_profile(profile.as_deref(), network)?;
     let network = profile_network(&profile)?;
     let report = reader::verify(&reader::VerifyConfig {
@@ -1564,6 +1569,13 @@ pub fn verify(profile: Option<String>, network: Option<Network>, date: &str) -> 
             if file.size_ok { "" } else { " MISMATCH" }
         );
     }
+    println!("orphans: {}", report.orphans.len());
+    for orphan in &report.orphans {
+        println!(
+            "  ORPHAN {:<70} {}/{} records={}",
+            orphan.file, orphan.src, orphan.conn, orphan.records
+        );
+    }
     println!("coverage:");
     for stream in &report.coverage {
         println!(
@@ -1571,6 +1583,69 @@ pub fn verify(profile: Option<String>, network: Option<Network>, date: &str) -> 
             stream.src, stream.conn, stream.coverage_pct, stream.covered_ms
         );
     }
+    verify_exit(&report, allow_orphans)
+}
+
+/// Fail `verify` when orphan segments remain, unless they were explicitly
+/// allowed.
+fn verify_exit(report: &reader::VerifyReport, allow_orphans: bool) -> Result<()> {
+    if report.orphans.is_empty() {
+        return Ok(());
+    }
+    if allow_orphans {
+        warn!(
+            orphans = report.orphans.len(),
+            "orphan segments ignored because --allow-orphans was passed"
+        );
+        return Ok(());
+    }
+    bail!(
+        "{} segment(s) on disk have no manifest line (orphans); run \
+         `hl record repair-manifest --date {}` or pass --allow-orphans",
+        report.orphans.len(),
+        report.date
+    );
+}
+
+/// Append the missing manifest line for each orphan finished segment (SPEC-0008
+/// §17 #36). A maintenance tool: it never runs automatically and never creates a
+/// directory.
+pub fn repair_manifest(
+    profile: Option<String>,
+    network: Option<Network>,
+    date: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let (name, profile) = load_profile(profile.as_deref(), network)?;
+    let network = profile_network(&profile)?;
+    let actions = reader::repair_manifest(&reader::RepairConfig {
+        out_dir: profile.out_dir.clone(),
+        network: network_dir(network).to_string(),
+        date: date.to_string(),
+        dry_run,
+    })?;
+    println!("profile: {name}  network: {}", network_dir(network));
+    println!("date: {date}");
+    let mut appended = 0usize;
+    for action in &actions {
+        match action {
+            reader::RepairAction::Append { entry } => {
+                appended += 1;
+                if dry_run {
+                    println!("would append: {}", serde_json::to_string(entry)?);
+                } else {
+                    println!("appended: {}", entry.file);
+                }
+            }
+            reader::RepairAction::Skip { file, reason } => {
+                println!("skipped: {file} ({reason})");
+            }
+        }
+    }
+    println!(
+        "repaired: {appended}{}",
+        if dry_run { " (dry run)" } else { "" }
+    );
     Ok(())
 }
 
@@ -2992,5 +3067,37 @@ mod tests {
             gap_ms >= Duration::from_secs(210).as_millis() as u64,
             "gap_ms {gap_ms} does not cover the 4-minute outage"
         );
+    }
+
+    /// `verify` exits non-zero for orphans unless `--allow-orphans` is passed.
+    #[test]
+    fn verify_fails_on_orphans_unless_allow_orphans() {
+        let orphan = mev_recorder::ManifestEntry {
+            file: "testnet/hl-ws/2026-01-01/00/hl-ws-01-1.jsonl.zst".into(),
+            src: "hl-ws".into(),
+            conn: "hl-ws-01".into(),
+            first_t_ns: 1,
+            last_t_ns: 2,
+            records: 3,
+            bytes_raw: 4,
+            bytes_zst: 5,
+            crashed: false,
+        };
+        let report = reader::VerifyReport {
+            date: "2026-01-01".into(),
+            files: Vec::new(),
+            orphans: vec![orphan],
+            coverage: Vec::new(),
+        };
+        assert!(verify_exit(&report, false).is_err());
+        assert!(verify_exit(&report, true).is_ok());
+
+        let clean = reader::VerifyReport {
+            date: "2026-01-01".into(),
+            files: Vec::new(),
+            orphans: Vec::new(),
+            coverage: Vec::new(),
+        };
+        assert!(verify_exit(&clean, false).is_ok());
     }
 }
