@@ -1189,23 +1189,45 @@ fn ensure_root_exists(out_dir: &Path, network: &str) -> Result<(), ReaderError> 
     Ok(())
 }
 
-/// The channel an envelope belongs to: a frame's `channel` field, or the kind
-/// name for everything else.
+/// The channel an envelope belongs to: a label for a frame, or the kind name
+/// for everything else.
+///
+/// For `frame` / `frame_bin` the raw text is parsed once as JSON and the label
+/// is the first of these that applies:
+///
+/// 1. a top-level string `channel` (Hyperliquid), used as is, even when other
+///    keys are present;
+/// 2. else a top-level string `stream` (Binance, e.g. `btcusdt@bookTicker`):
+///    the part after the last `@`, or the whole string when there is no `@`;
+/// 3. else a top-level string `topic` (Bybit, e.g. `orderbook.1.BTCUSDT`): the
+///    topic without its final `.`-separated segment (`orderbook.1`), or the
+///    whole string when there is no `.`;
+/// 4. else `"unknown"` (non-JSON raw, JSON without those string keys, Bybit
+///    `op` acks, and `frame_bin`, whose raw is base64).
 fn channel_of(env: &Envelope) -> String {
     match env.kind {
         Kind::Frame | Kind::FrameBin => env
             .raw
             .as_deref()
             .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .and_then(|value| {
-                value
-                    .get("channel")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
+            .and_then(|value| frame_label(&value))
             .unwrap_or_else(|| "unknown".to_string()),
         other => other.as_str().to_string(),
     }
+}
+
+/// Steps 1-3 of [`channel_of`] on an already parsed frame.
+fn frame_label(value: &Value) -> Option<String> {
+    if let Some(channel) = value.get("channel").and_then(Value::as_str) {
+        return Some(channel.to_string());
+    }
+    if let Some(stream) = value.get("stream").and_then(Value::as_str) {
+        let label = stream.rsplit_once('@').map_or(stream, |(_, tail)| tail);
+        return Some(label.to_string());
+    }
+    let topic = value.get("topic").and_then(Value::as_str)?;
+    let label = topic.rsplit_once('.').map_or(topic, |(head, _)| head);
+    Some(label.to_string())
 }
 
 #[derive(Default)]
@@ -1591,6 +1613,66 @@ mod tests {
 
     fn clock_at() -> FixedEnvelopeClock {
         FixedEnvelopeClock::new(1_700_000_000_000_000_000, 0)
+    }
+
+    fn label(kind_env: Envelope) -> String {
+        channel_of(&kind_env)
+    }
+
+    fn frame_label_of(raw: &str) -> String {
+        label(Envelope::frame(&clock_at(), "s", "c", 0, raw))
+    }
+
+    #[test]
+    fn channel_of_hyperliquid_channel_wins() {
+        assert_eq!(
+            frame_label_of(r#"{"channel":"l2Book","data":{}}"#),
+            "l2Book"
+        );
+        assert_eq!(
+            frame_label_of(r#"{"channel":"trades","stream":"a@b","topic":"x.y.z"}"#),
+            "trades"
+        );
+    }
+
+    #[test]
+    fn channel_of_binance_stream() {
+        assert_eq!(
+            frame_label_of(r#"{"stream":"btcusdt@bookTicker","data":{}}"#),
+            "bookTicker"
+        );
+        assert_eq!(frame_label_of(r#"{"stream":"plain"}"#), "plain");
+        assert_eq!(frame_label_of(r#"{"stream":"a@b@depth20"}"#), "depth20");
+    }
+
+    #[test]
+    fn channel_of_bybit_topic() {
+        assert_eq!(
+            frame_label_of(r#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot"}"#),
+            "orderbook.1"
+        );
+        assert_eq!(frame_label_of(r#"{"topic":"tickers"}"#), "tickers");
+    }
+
+    #[test]
+    fn channel_of_unlabelled_frames_are_unknown() {
+        for raw in [
+            "not json",
+            r#"{"data":1}"#,
+            r#"{"stream":5}"#,
+            r#"{"topic":["a.b"]}"#,
+            r#"{"success":true,"ret_msg":"pong","conn_id":"x","op":"ping"}"#,
+        ] {
+            assert_eq!(frame_label_of(raw), "unknown", "{raw}");
+        }
+        let bin = Envelope::frame_bin(&clock_at(), "s", "c", 0, "AAECAw==");
+        assert_eq!(channel_of(&bin), "unknown");
+    }
+
+    #[test]
+    fn channel_of_non_frames_use_kind_name() {
+        let gap = Envelope::gap_start(&clock_at(), "s", "c", 0, "close", "bye");
+        assert_eq!(channel_of(&gap), "gap_start");
     }
 
     #[test]
