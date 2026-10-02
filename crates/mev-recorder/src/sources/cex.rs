@@ -51,13 +51,27 @@ pub const CEX_WATCHDOG: Duration = raw_ws::DEFAULT_WATCHDOG;
 /// Binance connections over our long lossy path usually live 10 to 40 s, so
 /// with the default policy (healthy only after 60 s) the attempt counter never
 /// reset and backoff climbed to 30 s: one measured hour lost 37% of its time
-/// in 98 gaps with a 12.4 s median. A short cap and a 5 s healthy threshold
-/// keep gaps near a second. Bybit keeps the default policy.
+/// in 98 gaps with a 12.4 s median. A 5 s healthy threshold makes a normal
+/// 10 to 40 s connection reset the counter, so retries draw from the short end
+/// of the schedule and gaps stay near a second. The 10 s cap only matters for
+/// a persistent failure (maintenance, a 429/418 at the handshake): it holds
+/// the worst case near 50 dials per 5 minutes per source, well under Binance's
+/// documented 300 connection attempts per 5 minutes per IP for spot. Bybit
+/// keeps the default policy.
 pub const BINANCE_RECONNECT: ReconnectPolicy = ReconnectPolicy {
     base: Duration::from_millis(250),
-    max: Duration::from_secs(2),
+    max: Duration::from_secs(10),
     healthy_after: Duration::from_secs(5),
 };
+
+/// The reconnect policy for a venue. The match is exhaustive on purpose: a new
+/// [`CexKind`] must pick a policy instead of silently inheriting Binance's.
+pub fn reconnect_policy_for(kind: CexKind) -> ReconnectPolicy {
+    match kind {
+        CexKind::BinanceUsdm | CexKind::BinanceSpot => BINANCE_RECONNECT,
+        CexKind::BybitLinear => ReconnectPolicy::default(),
+    }
+}
 
 /// Delay before retrying a failed initial CEX dial.
 pub const CEX_CONNECT_RETRY: Duration = Duration::from_secs(3);
@@ -361,10 +375,7 @@ impl CexSource {
     /// Binance sources reconnect fast ([`BINANCE_RECONNECT`]); Bybit keeps the
     /// default policy.
     fn reconnect_policy(&self) -> ReconnectPolicy {
-        match self.config.kind {
-            CexKind::BybitLinear => ReconnectPolicy::default(),
-            _ => BINANCE_RECONNECT,
-        }
+        reconnect_policy_for(self.config.kind)
     }
 
     /// The URL the next dial uses (also recorded in `conn_open.meta.url`).
@@ -586,6 +597,25 @@ mod tests {
                 Err(_) => false,
             }
         }
+    }
+
+    #[test]
+    fn binance_sources_reconnect_fast_and_bybit_keeps_the_default() {
+        assert_eq!(
+            reconnect_policy_for(CexKind::BinanceUsdm),
+            BINANCE_RECONNECT
+        );
+        assert_eq!(
+            reconnect_policy_for(CexKind::BinanceSpot),
+            BINANCE_RECONNECT
+        );
+        assert_eq!(
+            reconnect_policy_for(CexKind::BybitLinear),
+            ReconnectPolicy::default()
+        );
+        // Guard the rate: the worst case stays far below Binance's documented
+        // 300 connection attempts per 5 minutes per IP.
+        assert!(BINANCE_RECONNECT.max >= Duration::from_secs(5));
     }
 
     fn channel_sink() -> (Arc<dyn EnvelopeSink>, mpsc::UnboundedReceiver<Envelope>) {

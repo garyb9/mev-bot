@@ -572,13 +572,24 @@ mod tests {
     fn fast_policy_backoff_stays_within_its_cap_and_the_floor() {
         let p = ReconnectPolicy {
             base: Duration::from_millis(250),
-            max: Duration::from_secs(2),
+            max: Duration::from_secs(10),
             healthy_after: Duration::from_secs(5),
         };
         for attempt in 1..=50 {
             let d = p.jittered_backoff(attempt);
-            assert!(d <= Duration::from_secs(2), "attempt {attempt}: {d:?}");
+            assert!(d <= Duration::from_secs(10), "attempt {attempt}: {d:?}");
             assert!(d >= BACKOFF_MIN, "attempt {attempt}: {d:?}");
+            // The ceiling doubles from `base`, so `base` is really used: an
+            // implementation that ignored it would blow these bounds.
+            let ceiling = p
+                .base
+                .saturating_mul(1 << attempt.saturating_sub(1).min(6))
+                .min(p.max);
+            assert!(d <= ceiling, "attempt {attempt}: {d:?} > {ceiling:?}");
+        }
+        for _ in 0..200 {
+            assert!(p.jittered_backoff(1) <= Duration::from_millis(250));
+            assert!(p.jittered_backoff(2) <= Duration::from_millis(500));
         }
     }
 
