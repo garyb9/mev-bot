@@ -1,105 +1,124 @@
 # mev-bot
 
-A **low-latency arbitrage / MEV-style trading system for Hyperliquid**, written
-in Rust (HyperCore first, HyperEVM where it pays). Which arb we build is
-decided by recorded data, not preference. A second, slower strategy family
-uses options-market positioning to trade HIP-3 tokenized-stock perps and
-crypto bluechips. The original Ethereum Uniswap V2 bot is retired under
-[`legacy/`](legacy/).
+A **low-latency arbitrage / MEV-style trading system for
+[Hyperliquid](https://hyperliquid.xyz)**, written in Rust (HyperCore first,
+HyperEVM later).
 
-**Start here:**
+- **Evidence before strategy.** A keyless recorder stores raw market data and an
+  offline Python toolkit measures edge net of costs. Only strategies with a
+  passing study get built.
+- **Latency first.** One single-threaded, event-driven engine serves `observe`,
+  `simulate`, `live`, and deterministic `replay`; only the I/O edges differ.
+- **Safety first.** The default mode never trades. `live` is gated and uses an
+  agent wallet that cannot withdraw.
 
-- [`docs/GOAL.md`](docs/GOAL.md): the goal, success metrics, latency budget,
-  and roadmap.
-- [`AGENTS.md`](AGENTS.md): how agents and contributors work in this repo.
+The original Ethereum Uniswap V2 bot is retired under [`legacy/`](legacy/)
+(reference only, never built).
 
-**Docs:** [GOAL](docs/GOAL.md) · [ARCHITECTURE](docs/ARCHITECTURE.md) · [REFERENCES](docs/REFERENCES.md).
+> **Status:** M0-M2 done (platform, market data, signing/execution) and the T0
+> fix-first list is complete. In progress: execution hardening (SPEC-0002 §17)
+> and the market-data recorder plus opportunity research (SPEC-0008). The
+> authoritative roadmap and success metrics are in [`docs/GOAL.md`](docs/GOAL.md).
 
-> Status: **M0–M2 done** (platform, HyperCore market data, signing and
-> execution) and the **T0 fix-first list is complete**
-> ([`docs/GOAL.md`](docs/GOAL.md) §2.2: cloid/status/aggressive pricing,
-> fail-closed live limits, concurrent WS `post`, cloid reconciliation,
-> dead-man policy, verified nonce/`scheduleCancel` rules, and the stream
-> watchdog). **Now:** M2.5 execution hardening (SPEC-0002 §17) and M3
-> market-data recorder + opportunity research (SPEC-0008). The bot defaults
-> to `observe` and never trades without explicit configuration.
+## Architecture
 
-## Design
+Three processes that never share a hot path:
 
-Everything is specified before it is built. Spec numbers are identifiers; the
-build order is the roadmap in [`docs/GOAL.md`](docs/GOAL.md). See [`specs/`](specs/):
-
-| Spec | Topic |
-|---|---|
-| [SPEC-0000](specs/SPEC-0000-platform.md) | Platform & architecture |
-| [SPEC-0001](specs/SPEC-0001-hyperliquid-client.md) | Hyperliquid client & market data |
-| [SPEC-0002](specs/SPEC-0002-execution-signing.md) | Execution, signing & account |
-| [SPEC-0003](specs/SPEC-0003-strategy-engine.md) | Strategy engine |
-| [SPEC-0004](specs/SPEC-0004-risk-portfolio-accounting.md) | Risk, portfolio & accounting |
-| [SPEC-0005](specs/SPEC-0005-hyperevm.md) | HyperEVM sources & executor (deferred) |
-| [SPEC-0006](specs/SPEC-0006-deployment-observability-runbooks.md) | Deployment, observability & runbooks |
-| [SPEC-0007](specs/SPEC-0007-polymarket-parked.md) | Polymarket (parked) |
-| [SPEC-0008](specs/SPEC-0008-recorder-and-opportunity-research.md) | Market-data recorder & opportunity research (M3) |
-| [SPEC-0009](specs/SPEC-0009-own-node.md) | Own Hyperliquid non-validator node (M3.5, later) |
-| [SPEC-0010](specs/SPEC-0010-event-driven-engine.md) | Event-driven engine & hot path (latency-first) |
-| [SPEC-0011](specs/SPEC-0011-multi-leg-execution.md) | Multi-leg execution & hedging |
-
-## Workspace
-
-```
-crates/
-  mev-core/       shared types, config, errors, clock
-  mev-hl-client/  Hyperliquid REST/WS client (market data + execution)
-  mev-engine/     engine core: types, ingest, v2 strategies [M4]
-  mev-recorder/   raw market-data recorder (SPEC-0008)          [M3]
-  mev-hyperevm/   HyperEVM (chain 999) sources & executor      [later]
-  mev-strategy/   strategy building blocks + cost/edge model
-  mev-risk/       risk limits, portfolio, accounting, kill switch
-  mev-metrics/    tracing, metrics, health
-  mev-bot/        the `hl` binary (orchestration)
-research/         Python opportunity-research toolkit (SPEC-0008) [M3]
-docs/             project goal and roadmap
+```mermaid
+flowchart LR
+  HL[("Hyperliquid<br/>WS + HTTP")]
+  subgraph bot["hl run (bot)"]
+    direction TB
+    ingest["market ingest<br/>mev-hl-client"] --> engine["EngineLoop + strategies<br/>mev-engine"]
+    engine --> risk["risk gate<br/>mev-risk"] --> exec["exec: paper or WS exchange"]
+  end
+  subgraph rec["hl record (recorder, no keys)"]
+    planner["planner + sources<br/>mev-recorder"] --> seg[("zstd segments")]
+  end
+  subgraph res["research/ (Python, offline)"]
+    studies["hlr studies"] --> rank["ranked opportunities"]
+  end
+  HL --> ingest
+  HL --> planner
+  exec --> HL
+  seg --> studies
+  seg -.->|"hl replay"| engine
 ```
 
-## Quickstart
+Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Quick start
+
+Requires Rust 1.90+. None of the commands below need keys; the network ones
+only read public market data.
 
 ```sh
-# Build and test
 cargo build --workspace
 cargo test --workspace
 
-# Show resolved config (secrets redacted)
-cargo run -p mev-bot -- config show
-
-# Run in observe mode (safe default: connects, builds state, never trades)
-cargo run -p mev-bot -- run --mode observe
-
-# Health / readiness / metrics
-curl localhost:9090/healthz
-curl localhost:9090/readyz
-curl localhost:9090/metrics
+cargo run -p mev-bot -- --help                  # the `hl` CLI
+cargo run -p mev-bot -- config show             # resolved config, secrets redacted
+cargo run -p mev-bot -- record plan             # recorder subscription plan, opens no sockets
+cargo run -p mev-bot -- run --mode observe      # connect, build state, never trade
+cargo run -p mev-bot -- run --mode simulate     # run strategies against paper fills
+cargo run -p mev-bot -- replay --from 2026-09-30 --to 2026-09-30 --rec-dir data/rec
+                                                # replay recorder segments through the engine
 ```
 
-Configuration layers as: built-in defaults → `config/default.toml` →
-`config/{HL_ENV}.toml` → `HL_*` env vars → CLI flags. Copy
-[`.env.example`](.env.example) to `.env` to get started.
+While `hl run` is up: `curl localhost:9090/healthz`, `/readyz`, `/metrics`.
 
-## Execution modes & safety
+Config layers, lowest to highest: built-in defaults, `config/default.toml`,
+`config/{HL_ENV}.toml`, `HL_*` env vars, CLI flags. `.env.example` lists the
+variables. Recorder profiles live in `config/record.toml`.
 
-| Mode | Behavior | Keys |
+## Safety model
+
+| Mode | Behavior | Keys needed |
 |---|---|---|
-| `observe` (default) | connect & build state; **never** place orders | none |
-| `simulate` | run strategies, simulate fills; **never** submit | none |
-| `live` | submit orders | agent key + `HL_LIVE_CONFIRM=YES` |
+| `observe` (default) | connect and build state; never places orders | none |
+| `simulate` | run strategies, simulate fills; never submits | none |
+| `live` | submit orders through the risk gate | agent key + `HL_LIVE_CONFIRM=YES` |
 
-- Only an **agent/API wallet** (which cannot withdraw) lives on the host; the
-  master key never does.
-- `live` also arms a dead-man's switch (`scheduleCancel`) so a dead bot can't
-  leave stale orders.
-- `HL_AUTONOMY=auto` (default) lets the engine trade; `confirm` asks first.
+- Only an **agent wallet** (cannot withdraw) is ever on the host.
+- Every order passes the risk engine; `live` also arms a dead-man's switch.
+- The recorder and research code never load keys.
 
-See [`RUNBOOK.md`](RUNBOOK.md) for operations.
+Operations: [`RUNBOOK.md`](RUNBOOK.md).
+
+## Repository layout
+
+| Path | What |
+|---|---|
+| [`crates/mev-core`](crates/mev-core) | common: config, clock, errors, SQLite store, watchlist |
+| [`crates/mev-metrics`](crates/mev-metrics) | common: tracing, Prometheus metric names, health |
+| [`crates/mev-hl-client`](crates/mev-hl-client) | client: Hyperliquid REST/WS, signing, nonces, orders |
+| [`crates/mev-hyperevm`](crates/mev-hyperevm) | client: HyperEVM (deferred) |
+| [`crates/mev-recorder`](crates/mev-recorder) | client/tooling: market-data recorder (segments, planner, reader) |
+| [`crates/mev-strategy`](crates/mev-strategy) | domain: cost model, views, intents, sizing, paper executor |
+| [`crates/mev-risk`](crates/mev-risk) | domain: limit gate, kill switch, halt |
+| [`crates/mev-engine`](crates/mev-engine) | domain: event-driven engine, order manager, v2 strategies |
+| [`crates/mev-bot`](crates/mev-bot) | app: the `hl` binary (CLI and orchestration) |
+| [`research/`](research) | offline Python research toolkit |
+| [`config/`](config) | default and recorder configs |
+| [`deploy/`](deploy) | recorder run scripts and deployment notes |
+| [`scripts/`](scripts) | CI helpers (benchmark regression check) |
+| [`docs/`](docs) | goal, architecture, references ([index](docs/README.md)) |
+| [`specs/`](specs) | specifications and ADRs |
+| [`legacy/`](legacy) | retired Ethereum bot, reference only |
+
+## Development
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+# research/ changes:
+cd research && uv run ruff check && uv run pytest
+```
+
+Contributor and agent rules: [`AGENTS.md`](AGENTS.md). Specs are the source of
+truth; the index is in [`docs/README.md`](docs/README.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
