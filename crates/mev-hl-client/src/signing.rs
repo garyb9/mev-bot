@@ -131,7 +131,7 @@ impl AgentSigner {
     pub fn from_hex(private_key: &str, mainnet: bool) -> Result<Self> {
         let raw = private_key.strip_prefix("0x").unwrap_or(private_key);
         let bytes =
-            hex::decode(raw).map_err(|e| Error::Config(format!("agent key is not hex: {e}")))?;
+            hex::decode(raw).map_err(|_| Error::Config("agent key is not hex".to_string()))?;
         let key = SigningKey::from_slice(&bytes)
             .map_err(|e| Error::Config(format!("invalid agent key: {e}")))?;
         Ok(Self {
