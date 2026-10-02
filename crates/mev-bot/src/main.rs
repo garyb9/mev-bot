@@ -18,6 +18,7 @@ use std::{
 mod db_lock;
 mod engine;
 mod live;
+mod probe_roundtrip;
 mod record;
 mod replay;
 
@@ -218,6 +219,8 @@ enum ProbeCmd {
         #[arg(long, default_value_t = 20)]
         count: u32,
     },
+    /// Testnet-only signed order round-trip (SPEC-0002 H-10).
+    TestnetRoundtrip(probe_roundtrip::RoundtripArgs),
 }
 
 #[derive(Subcommand)]
@@ -415,6 +418,9 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
         Command::Probe { cmd } => match cmd {
             ProbeCmd::Latency { count } => {
                 record::probe_latency(network.map(Into::into), count).await
+            }
+            ProbeCmd::TestnetRoundtrip(args) => {
+                probe_roundtrip::run(network.map(Into::into), args).await
             }
         },
         Command::Nonce { cmd } => match cmd {
