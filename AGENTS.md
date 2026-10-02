@@ -30,7 +30,7 @@ Don't pick one silently.
 
 | Path | What | Spec |
 |---|---|---|
-| `docs/GOAL.md` | Goal, principles, latency budget, roadmap | — |
+| `docs/GOAL.md` | Goal, principles, latency budget, roadmap (index of all docs: `docs/README.md`) | — |
 | `specs/SPEC-0000…` | Platform: config, modes, observability, CI | SPEC-0000 |
 | `crates/mev-core` | Config, clock, errors, SQLite (`db.rs`, `db/writer.rs`), watchlist | 0000, 0004 |
 | `crates/mev-hl-client` | Hyperliquid REST/WS client, market state, signing, nonce, orders, transports | 0001, 0002 |
