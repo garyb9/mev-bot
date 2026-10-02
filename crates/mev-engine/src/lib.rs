@@ -2,8 +2,8 @@
 //!
 //! This crate owns the shared types and the pieces of the engine that are not
 //! the binary: interned ids and events ([`types`]), typed ingest decoders and
-//! the market/account channels ([`ingest`]), and — in later tasks — the
-//! decision loop, order manager, and exec backends. It sits above
+//! the market/account channels ([`ingest`]), the decision loop, order manager,
+//! exec backends, and the v2 strategies. It sits above
 //! `mev-hl-client` (reusing its wire types and frame handling) and below
 //! `mev-bot` (which wires it to live I/O).
 //!

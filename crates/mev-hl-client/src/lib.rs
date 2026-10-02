@@ -1,8 +1,8 @@
 //! Hyperliquid (HyperCore) client.
 //!
 //! Owns market data (SPEC-0001) and execution (SPEC-0002) behind
-//! backend-swappable traits. REST `/info` and the WebSocket market stream land
-//! in M1.1/M1.2; execution follows in later milestones.
+//! backend-swappable traits: REST `/info`, the WebSocket market stream, signed
+//! order submission over HTTP or WS post, nonces, and the dead-man's switch.
 
 pub mod assets;
 pub mod client;
