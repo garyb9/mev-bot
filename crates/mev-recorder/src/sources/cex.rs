@@ -26,6 +26,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mev_hl_client::raw_ws::ReconnectPolicy;
 use mev_hl_client::{Protocol, RawEvent, RawWsConn, raw_ws};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -45,6 +46,19 @@ pub const BYBIT_LINEAR_BASE: &str = "wss://stream.bybit.com";
 pub const BYBIT_PING_INTERVAL: Duration = Duration::from_secs(20);
 /// Default silence window for the CEX watchdog.
 pub const CEX_WATCHDOG: Duration = raw_ws::DEFAULT_WATCHDOG;
+/// Reconnect policy for the Binance sources (BNR-1, fix A).
+///
+/// Binance connections over our long lossy path usually live 10 to 40 s, so
+/// with the default policy (healthy only after 60 s) the attempt counter never
+/// reset and backoff climbed to 30 s: one measured hour lost 37% of its time
+/// in 98 gaps with a 12.4 s median. A short cap and a 5 s healthy threshold
+/// keep gaps near a second. Bybit keeps the default policy.
+pub const BINANCE_RECONNECT: ReconnectPolicy = ReconnectPolicy {
+    base: Duration::from_millis(250),
+    max: Duration::from_secs(2),
+    healthy_after: Duration::from_secs(5),
+};
+
 /// Delay before retrying a failed initial CEX dial.
 pub const CEX_CONNECT_RETRY: Duration = Duration::from_secs(3);
 
@@ -344,6 +358,15 @@ impl CexSource {
         }
     }
 
+    /// Binance sources reconnect fast ([`BINANCE_RECONNECT`]); Bybit keeps the
+    /// default policy.
+    fn reconnect_policy(&self) -> ReconnectPolicy {
+        match self.config.kind {
+            CexKind::BybitLinear => ReconnectPolicy::default(),
+            _ => BINANCE_RECONNECT,
+        }
+    }
+
     /// The URL the next dial uses (also recorded in `conn_open.meta.url`).
     pub fn url(&self) -> String {
         self.protocol().url()
@@ -365,11 +388,12 @@ impl CexSource {
         let mut gap_started: Option<i64> = None;
 
         let mut raw = loop {
-            match RawWsConn::connect_with(
+            match RawWsConn::connect_with_policy(
                 self.protocol(),
                 self.subscriptions.clone(),
                 self.config.watchdog,
                 self.config.ping_interval,
+                self.reconnect_policy(),
             )
             .await
             {

@@ -38,6 +38,61 @@ pub const BACKOFF_MIN: Duration = Duration::from_millis(100);
 /// A connection is considered healthy after this long, resetting backoff.
 pub const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 
+/// Per-connection reconnect policy: the backoff schedule and when a dropped
+/// connection counts as healthy (resetting the attempt counter).
+///
+/// [`ReconnectPolicy::default`] is exactly the historical behaviour
+/// ([`BACKOFF_BASE`], [`BACKOFF_MAX`], [`HEALTHY_AFTER`]); Hyperliquid and Bybit
+/// use it. [`BACKOFF_MIN`] and the full-jitter formula are shared by all
+/// policies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    /// Backoff ceiling for the first retry, before doubling and jitter.
+    pub base: Duration,
+    /// Maximum backoff ceiling before jitter.
+    pub max: Duration,
+    /// A connection that lived at least this long resets the attempt counter
+    /// when it drops.
+    pub healthy_after: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    /// The historical policy: 500 ms base, 30 s max, healthy after 60 s.
+    fn default() -> Self {
+        Self {
+            base: BACKOFF_BASE,
+            max: BACKOFF_MAX,
+            healthy_after: HEALTHY_AFTER,
+        }
+    }
+}
+
+impl ReconnectPolicy {
+    /// Whether a connection that lived `lived` before dropping resets the
+    /// attempt counter.
+    pub fn is_healthy(&self, lived: Duration) -> bool {
+        lived >= self.healthy_after
+    }
+
+    /// Full-jitter exponential backoff for `attempt` (1-based): a uniform sleep
+    /// in `[BACKOFF_MIN, min(base * 2^(attempt-1), max)]`.
+    ///
+    /// The lower bound stops a host that accepts then immediately closes from
+    /// being retried in a tight loop (full jitter alone can roll ~0 ns).
+    pub fn jittered_backoff(&self, attempt: u32) -> Duration {
+        let shift = attempt.saturating_sub(1).min(6);
+        let ceiling = self.base.saturating_mul(1 << shift).min(self.max);
+        let floor = BACKOFF_MIN.min(ceiling);
+        let span = ceiling.saturating_sub(floor);
+        if span.is_zero() {
+            return floor;
+        }
+        let width = span.as_nanos().min(u64::MAX as u128) as u64;
+        let roll = pseudo_random();
+        floor + Duration::from_nanos(roll % (width + 1))
+    }
+}
+
 /// How a source connects and keeps itself alive (SPEC-0008 §7.5).
 pub trait Protocol: Send + Sync {
     /// A short label for metrics (`hl`, `binance`, `bybit`, …).
@@ -146,6 +201,7 @@ pub struct RawWsConn {
     /// connection (not rebuilt per `next()`) means a busy feed still gets its
     /// heartbeats instead of resetting the timer on every frame.
     next_ping: Instant,
+    policy: ReconnectPolicy,
     attempt: u32,
     metrics_src: &'static str,
     /// Set when a `Gap` has been returned: the next `next()` reconnects first
@@ -172,6 +228,24 @@ impl RawWsConn {
         watchdog: Duration,
         ping_interval: Duration,
     ) -> Result<Self> {
+        Self::connect_with_policy(
+            protocol,
+            subscriptions,
+            watchdog,
+            ping_interval,
+            ReconnectPolicy::default(),
+        )
+        .await
+    }
+
+    /// Dial with explicit timings and a custom [`ReconnectPolicy`].
+    pub async fn connect_with_policy(
+        protocol: Box<dyn Protocol>,
+        subscriptions: Vec<String>,
+        watchdog: Duration,
+        ping_interval: Duration,
+        policy: ReconnectPolicy,
+    ) -> Result<Self> {
         let socket = dial(&protocol.url()).await?;
         let src = protocol.name();
         let now = Instant::now();
@@ -185,6 +259,7 @@ impl RawWsConn {
             last_data: now,
             opened_at: now,
             next_ping: now + ping_interval,
+            policy,
             attempt: 1,
             metrics_src: src,
             pending_reconnect: false,
@@ -209,7 +284,7 @@ impl RawWsConn {
     /// requested. Returns `Ok(())` on reconnect and `Err` on shutdown.
     ///
     /// The attempt counter is reset only after a **healthy** connection: a
-    /// drop that follows a run of at least [`HEALTHY_AFTER`] resets it in
+    /// drop that follows a run of at least the policy's `healthy_after` resets it in
     /// [`RawWsConn::gap_now`] (at the drop, before the first retry). Otherwise
     /// it keeps growing, so a host that accepts and immediately drops cannot
     /// pin the backoff low. Resetting at the drop — a single synchronous step —
@@ -226,7 +301,7 @@ impl RawWsConn {
         metrics::gauge!(names::WS_CONNECTED, "src" => self.metrics_src).set(0.0);
         loop {
             self.attempt = self.attempt.saturating_add(1);
-            let backoff = jittered_backoff(self.attempt);
+            let backoff = self.policy.jittered_backoff(self.attempt);
             tokio::select! {
                 _ = self.shutdown.notified() => {
                     return Err(Error::Http("websocket shutdown requested".into()));
@@ -377,7 +452,7 @@ impl RawWsConn {
         // outage. Doing it here (synchronous, at the drop) instead of inside
         // `reconnect` means a cancelled-and-restarted reconnect cannot re-run
         // the reset and so cannot pin the backoff low.
-        if self.opened_at.elapsed() >= HEALTHY_AFTER {
+        if self.policy.is_healthy(self.opened_at.elapsed()) {
             self.attempt = 0;
         }
         self.pending_reconnect = true;
@@ -391,22 +466,10 @@ impl RawWsConn {
     }
 }
 
-/// Full-jitter exponential backoff for `attempt` (1-based): a uniform sleep in
-/// `[BACKOFF_MIN, min(base * 2^(attempt-1), max)]`.
-///
-/// The lower bound stops a host that accepts then immediately closes from being
-/// retried in a tight loop (full jitter alone can roll ~0 ns).
+/// Backoff under the default policy (test helper for the historical bounds).
+#[cfg(test)]
 fn jittered_backoff(attempt: u32) -> Duration {
-    let shift = attempt.saturating_sub(1).min(6);
-    let ceiling = BACKOFF_BASE.saturating_mul(1 << shift).min(BACKOFF_MAX);
-    let floor = BACKOFF_MIN.min(ceiling);
-    let span = ceiling.saturating_sub(floor);
-    if span.is_zero() {
-        return floor;
-    }
-    let width = span.as_nanos().min(u64::MAX as u128) as u64;
-    let roll = pseudo_random();
-    floor + Duration::from_nanos(roll % (width + 1))
+    ReconnectPolicy::default().jittered_backoff(attempt)
 }
 
 /// A cheap, non-cryptographic random source for jitter. Randomness here only
@@ -490,6 +553,47 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
+
+    #[test]
+    fn default_policy_equals_the_historical_constants() {
+        let p = ReconnectPolicy::default();
+        assert_eq!(p.base, Duration::from_millis(500));
+        assert_eq!(p.max, Duration::from_secs(30));
+        assert_eq!(p.healthy_after, Duration::from_secs(60));
+        assert_eq!(BACKOFF_MIN, Duration::from_millis(100));
+        for attempt in 1..=20 {
+            let d = p.jittered_backoff(attempt);
+            assert!(d <= Duration::from_secs(30), "attempt {attempt}: {d:?}");
+            assert!(d >= Duration::from_millis(100), "attempt {attempt}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn fast_policy_backoff_stays_within_its_cap_and_the_floor() {
+        let p = ReconnectPolicy {
+            base: Duration::from_millis(250),
+            max: Duration::from_secs(2),
+            healthy_after: Duration::from_secs(5),
+        };
+        for attempt in 1..=50 {
+            let d = p.jittered_backoff(attempt);
+            assert!(d <= Duration::from_secs(2), "attempt {attempt}: {d:?}");
+            assert!(d >= BACKOFF_MIN, "attempt {attempt}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn healthy_reset_depends_on_the_policy_threshold() {
+        let fast = ReconnectPolicy {
+            healthy_after: Duration::from_secs(5),
+            ..ReconnectPolicy::default()
+        };
+        assert!(fast.is_healthy(Duration::from_secs(6)));
+        assert!(!fast.is_healthy(Duration::from_secs(4)));
+        let default = ReconnectPolicy::default();
+        assert!(!default.is_healthy(Duration::from_secs(6)));
+        assert!(default.is_healthy(Duration::from_secs(60)));
+    }
 
     #[test]
     fn backoff_is_capped_jittered_and_floored() {
