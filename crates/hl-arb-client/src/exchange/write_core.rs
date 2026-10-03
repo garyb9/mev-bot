@@ -335,9 +335,13 @@ impl WriteCore {
         if self.gate == WriteGate::DryRun {
             return Ok(Prepared::DryRun(Box::new(request)));
         }
-        // Off the hot path: at most an atomic read and a `Copy` enqueue. The
-        // write-behind lease guarantees a crash cannot reuse this nonce.
-        if let Some(store) = &self.nonce_store
+        // Protective actions (cancels, the dead-man switch) must never be
+        // blocked by a stalled nonce-durability write: refusing them would
+        // leave exposure resting while the store is unavailable (SEC-007).
+        // Order placement and anything else that creates exposure stays gated
+        // exactly as before.
+        if !is_protective(action)
+            && let Some(store) = &self.nonce_store
             && let Err(err) = store.cover(nonce, now)
         {
             // The nonce is not covered, so it will not be sent: free it so a
@@ -350,6 +354,18 @@ impl WriteCore {
     }
 }
 
+/// Whether `action` protects the account rather than creating exposure.
+///
+/// Protective actions bypass the nonce-durability gate so a failing write to
+/// the nonce store can never prevent a cancel or the dead-man switch from
+/// reaching the venue (SEC-007).
+fn is_protective(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Cancel { .. } | Action::CancelByCloid { .. } | Action::ScheduleCancel { .. }
+    )
+}
+
 /// Whether a runtime far-future refusal should be logged now, stamping
 /// `last_ms` when it is. Rate-limited to one message per
 /// [`NONCE_WARN_INTERVAL_MS`] (the same pattern as the write-behind warning) so
@@ -360,4 +376,82 @@ pub(super) fn refusal_log_due(last_ms: &AtomicU64, now_ms: u64) -> bool {
         && last_ms
             .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nonce::NonceLease;
+    use crate::order::{CancelByCloidWire, CancelWire, Grouping, Tif, limit_order};
+    use hl_arb_core::clock::FixedClock;
+
+    const KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+    fn signer() -> AgentSigner {
+        AgentSigner::from_hex(KEY, true).unwrap()
+    }
+
+    fn order() -> Action {
+        Action::Order {
+            orders: vec![limit_order(0, true, "50000", "0.1", Tif::Gtc, false, None)],
+            grouping: Grouping::Na,
+        }
+    }
+
+    #[tokio::test]
+    async fn protective_actions_bypass_the_nonce_durability_gate() {
+        // A dead nonce-store writer makes every `cover()` fail. Order placement
+        // must stay fail-closed; protective actions must proceed anyway so a
+        // stalled store can never keep a cancel from reaching the venue
+        // (SEC-007).
+        let clock = Arc::new(FixedClock::new(1_000_000));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(rx); // writer gone: every enqueue fails
+        let durable = Arc::new(AtomicU64::new(0));
+        let core = WriteCore::new(Mode::Live, Some(signer()))
+            .unwrap()
+            .with_clock(clock)
+            .with_test_nonce_store(
+                NonceLease::with_channel(tx, 1_000_100, 100, durable, 1_000_000),
+                1_000_000,
+            );
+
+        // Order placement is gated exactly as before.
+        let mut place_blocked = false;
+        for _ in 0..200 {
+            match core.prepare(&order()).await {
+                Ok(Prepared::Send(_)) => {}
+                Ok(Prepared::DryRun(_)) => panic!("live mode must send"),
+                Err(Error::NotSent(_)) => {
+                    place_blocked = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(place_blocked, "an order must stay gated by a failing store");
+
+        // Cancels and the dead-man switch are exempt.
+        let cancels = vec![CancelWire { a: 0, o: 42 }];
+        let cloid_cancels = vec![CancelByCloidWire {
+            asset: 0,
+            cloid: "0x00000000000000000000000000000001".into(),
+        }];
+        for action in [
+            Action::Cancel {
+                cancels: cancels.clone(),
+            },
+            Action::CancelByCloid {
+                cancels: cloid_cancels.clone(),
+            },
+            Action::ScheduleCancel {
+                time: Some(1_060_000),
+            },
+        ] {
+            match core.prepare(&action).await {
+                Ok(Prepared::Send(_)) => {}
+                other => panic!("protective action must bypass the gate: {other:?}"),
+            }
+        }
+    }
 }
