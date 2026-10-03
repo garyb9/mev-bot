@@ -1,8 +1,10 @@
-# mev-bot
+# hl-arb-bot
 
 A **low-latency arbitrage / MEV-style trading system for
 [Hyperliquid](https://hyperliquid.xyz)**, written in Rust (HyperCore first,
 HyperEVM later).
+
+*Formerly `mev-bot`. The Cargo packages keep their `mev-*` names and the binary is `hl`.*
 
 - **Evidence before strategy.** A keyless recorder stores raw market data and an
   offline Python toolkit measures edge net of costs. Only strategies with a

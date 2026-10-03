@@ -28,7 +28,7 @@ cd "$REPO_ROOT"
 # temp directory. `start` rejects any value other than the real /mnt/e.
 MOUNT="${MEV_SSD_MOUNT:-/mnt/e}"
 REC_DIR="/mnt/e/mev-rec"
-STATE_DIR="${MEV_SSD_STATE_DIR:-/home/gb/projects/.orchestrator/mev-bot/logs}"
+STATE_DIR="${MEV_SSD_STATE_DIR:-/home/gb/projects/.orchestrator/hl-arb-bot/logs}"
 LOG="$STATE_DIR/recorder-ssd.log"
 REC_PIDFILE="$STATE_DIR/recorder-ssd.pid"
 WD_PIDFILE="$STATE_DIR/recorder-ssd-watchdog.pid"
@@ -55,7 +55,7 @@ usage: run-ssd.sh <start|stop|status|verify>
   verify   run `hl record verify` + `hl record inspect` on /mnt/e/mev-rec and
            print MB/hour (raw and compressed) per src from the manifests.
 
-State dir: /home/gb/projects/.orchestrator/mev-bot/logs
+State dir: /home/gb/projects/.orchestrator/hl-arb-bot/logs
 USAGE
 }
 

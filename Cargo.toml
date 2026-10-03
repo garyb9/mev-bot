@@ -17,7 +17,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
-repository = "https://github.com/garyb9/mev-bot"
+repository = "https://github.com/garyb9/hl-arb-bot"
 
 [workspace.dependencies]
 mev-core = { path = "crates/mev-core" }

@@ -39,7 +39,7 @@ installed by this repo; copy the line deliberately):
 
 ```cron
 # SPEC-0008 B-3: append rolling HL 1m/5m candles + funding once a day.
-17 3 * * *  cd /srv/mev-bot/research && /usr/bin/uv run hlr-hl-rest poll --out data/parquet >> /var/log/hlr-hl-rest.log 2>&1
+17 3 * * *  cd /srv/hl-arb-bot/research && /usr/bin/uv run hlr-hl-rest poll --out data/parquet >> /var/log/hlr-hl-rest.log 2>&1
 ```
 
 `uv sync` must have been run once in `research/` first. The log line prints the

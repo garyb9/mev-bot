@@ -42,7 +42,7 @@ working directory, `run-ssd.sh` runs the binary from a state-dir shim whose
   `.env` or keys.
 
 Log, pidfiles, and the stopped-reason file live in
-`/home/gb/projects/.orchestrator/mev-bot/logs/`.
+`/home/gb/projects/.orchestrator/hl-arb-bot/logs/`.
 
 ### 6-hour V-4 procedure
 
