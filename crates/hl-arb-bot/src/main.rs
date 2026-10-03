@@ -361,8 +361,10 @@ async fn main() {
     });
 
     if let Err(err) = dispatch(command, cli.network).await {
-        error!(error = %err, "fatal");
-        eprintln!("error: {err}");
+        // `?err` prints the whole anyhow chain; `%err` showed only the top
+        // context ("spawning segment writer"), hiding the cause (PERF-007).
+        error!(error = ?err, "fatal");
+        eprintln!("error: {err:#}");
         std::process::exit(1);
     }
 }

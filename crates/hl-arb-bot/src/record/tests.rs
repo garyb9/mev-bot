@@ -672,8 +672,8 @@ async fn cex_source_writes_a_bybit_linear_segment() {
         ..CexConfig::new(CexKind::BybitLinear, vec!["BTCUSDT".to_string()])
     };
     let source = CexSource::new(config, sink, clock);
-    let shutdown = Arc::new(Notify::new());
-    let task = tokio::spawn(run_cex(source, shutdown.clone()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(run_cex(source, shutdown_rx));
 
     // Wait for at least one frame to reach the segment writer.
     for _ in 0..400 {
@@ -688,7 +688,7 @@ async fn cex_source_writes_a_bybit_linear_segment() {
             break;
         }
     }
-    shutdown.notify_one();
+    let _ = shutdown_tx.send(true);
     task.await.unwrap();
     server.abort();
     drop(writer);

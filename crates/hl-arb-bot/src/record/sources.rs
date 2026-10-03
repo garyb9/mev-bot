@@ -133,6 +133,10 @@ pub(super) async fn run_deribit(
 
 /// Run one CEX reference source (SPEC-0008 §9, R-8) until shutdown, then
 /// finalize its segment.
-pub(super) async fn run_cex(source: CexSource, shutdown: Arc<Notify>) {
+///
+/// Takes a `watch` receiver, not a `Notify`, so every CEX source sharing the
+/// recorder's shutdown signal wakes: `Notify::notify_one` woke only one waiter
+/// (PERF-001).
+pub(super) async fn run_cex(source: CexSource, shutdown: watch::Receiver<bool>) {
     source.run(shutdown).await;
 }

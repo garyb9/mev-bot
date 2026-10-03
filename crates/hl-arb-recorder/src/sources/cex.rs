@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use hl_arb_client::raw_ws::ReconnectPolicy;
 use hl_arb_client::{Protocol, RawEvent, RawWsConn, raw_ws};
 use serde_json::{Value, json};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::envelope::{Envelope, EnvelopeClock};
@@ -383,13 +383,19 @@ impl CexSource {
         self.protocol().url()
     }
 
-    /// Run until `shutdown` is notified.
+    /// Run until `shutdown` becomes `true`.
     ///
     /// One connection is dialed; after that [`RawWsConn`] transparently
     /// reconnects on gaps. A failed initial dial is retried every
     /// [`CEX_CONNECT_RETRY`], emitting a single `gap_start` until the first
     /// successful open (a matching `gap_end` closes it).
-    pub async fn run(mut self, shutdown: Arc<Notify>) {
+    ///
+    /// `shutdown` is a `watch` receiver so one signal reaches every subscriber.
+    /// A shareable `Notify` woke only one waiter, so when several CEX sources
+    /// shared one shutdown the rest hung until the process was killed; the
+    /// receiver also remembers a `true` that was sent before this task first
+    /// waited.
+    pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         let url = self.url();
         // Wall-clock ns (envelope `t_ns`) at the start of the current outage.
         // Set when the drop is detected (initial-dial failure or the immediate
@@ -422,7 +428,7 @@ impl CexSource {
                     }
                     tokio::select! {
                         _ = tokio::time::sleep(CEX_CONNECT_RETRY) => {}
-                        _ = shutdown.notified() => {
+                        _ = shutdown_requested(&mut shutdown) => {
                             debug!(src = self.src, "cex source stopped during initial dial");
                             return;
                         }
@@ -439,7 +445,7 @@ impl CexSource {
 
         loop {
             tokio::select! {
-                _ = shutdown.notified() => {
+                _ = shutdown_requested(&mut shutdown) => {
                     let t_ns = self.clock.t_ns();
                     self.emit_gap_start(t_ns, raw_ws::mono_ns(), "shutdown", "shutdown requested");
                     break;
@@ -547,6 +553,23 @@ impl CexSource {
     }
 }
 
+/// Resolve when `shutdown` is (or becomes) `true`.
+///
+/// Checks the current value before awaiting `changed()`, so a `true` sent
+/// before this future was first polled — or before the receiver was cloned —
+/// is observed immediately. Dropping the sender (process teardown) also
+/// resolves, so a source never waits forever on a dead shutdown channel.
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
 /// Encode bytes with the standard base64 alphabet (SPEC-0008 §5.1).
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -640,6 +663,10 @@ mod tests {
         let (sink, rx) = channel_sink();
         let clock: Arc<dyn EnvelopeClock> = Arc::new(SystemEnvelopeClock::new());
         (CexSource::new(config, sink, clock), rx)
+    }
+
+    fn shutdown_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
+        watch::channel(false)
     }
 
     // -- Pure protocol facts (no network) --------------------------------
@@ -781,8 +808,8 @@ mod tests {
             format!("ws://{}", server.addr),
             &["BTCUSDT"],
         ));
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         let open = rx.recv().await.expect("conn_open");
         assert_eq!(open.kind, Kind::ConnOpen);
@@ -790,7 +817,7 @@ mod tests {
         let sub = rx.recv().await.expect("sub");
         assert_eq!(sub.kind, Kind::Sub);
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         handle.await.unwrap();
     }
 
@@ -803,8 +830,8 @@ mod tests {
             format!("ws://{}", server.addr),
             &["BTCUSDT", "ETHUSDT"],
         ));
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         let first = recv_until(&mut rx, Kind::Frame).await;
         assert_eq!(first.src, "binance-usdm");
@@ -814,7 +841,7 @@ mod tests {
             Some(r#"{"e":"bookTicker","s":"BTCUSDT"}"#)
         );
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         handle.await.unwrap();
     }
 
@@ -827,15 +854,15 @@ mod tests {
             format!("ws://{}", server.addr),
             &["BTCUSDT"],
         ));
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         let first = recv_until(&mut rx, Kind::Frame).await;
         assert_eq!(first.src, "binance-spot");
         assert_eq!(first.conn, "binance-spot");
         assert_eq!(first.raw.as_deref(), Some(r#"{"u":1,"s":"BTCUSDT"}"#));
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         handle.await.unwrap();
     }
 
@@ -849,8 +876,8 @@ mod tests {
             format!("ws://{}", server.addr),
             &["BTCUSDT", "ETHUSDT"],
         ));
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         let received = server.subscriptions.recv().await.expect("subscribe frame");
         assert_eq!(
@@ -873,7 +900,7 @@ mod tests {
             Some(r#"{"topic":"orderbook.1.BTCUSDT"}"#)
         );
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         handle.await.unwrap();
     }
 
@@ -905,14 +932,14 @@ mod tests {
             format!("ws://{addr}"),
             &["BTCUSDT"],
         ));
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         let env = recv_until(&mut rx, Kind::FrameBin).await;
         assert_eq!(env.src, "bybit-linear");
         assert_eq!(env.raw.as_deref(), Some("AAECAw=="));
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         handle.await.unwrap();
     }
 
@@ -928,14 +955,14 @@ mod tests {
             let server = spawn_mock(expect_subscribe, r#"{"x":1}"#, 1).await;
             let (source, mut rx) =
                 source(config(kind, format!("ws://{}", server.addr), &["BTCUSDT"]));
-            let shutdown = Arc::new(Notify::new());
-            let handle = tokio::spawn(source.run(shutdown.clone()));
+            let (shutdown_tx, shutdown_rx) = shutdown_channel();
+            let handle = tokio::spawn(source.run(shutdown_rx));
 
             let sub = recv_until(&mut rx, Kind::Sub).await;
             assert_eq!(sub.src, kind.src(), "sub src for {kind:?}");
             assert_eq!(sub.conn, kind.src(), "sub conn for {kind:?}");
 
-            shutdown.notify_one();
+            let _ = shutdown_tx.send(true);
             handle.await.unwrap();
         }
     }
@@ -973,8 +1000,8 @@ mod tests {
         let mut config = config(CexKind::BybitLinear, format!("ws://{addr}"), &["BTCUSDT"]);
         config.watchdog = Duration::from_secs(3600);
         let (source, _rx) = source(config);
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         // Advance ~62 s in 100 ms steps so the feed stays busy throughout.
         for _ in 0..620 {
@@ -1000,7 +1027,7 @@ mod tests {
             );
         }
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         let _ = handle.await;
     }
 
@@ -1031,8 +1058,8 @@ mod tests {
         let mut config = config(CexKind::BybitLinear, format!("ws://{addr}"), &["BTCUSDT"]);
         config.watchdog = Duration::from_secs(3600);
         let (source, mut rx) = source(config);
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         let started = recv_until(&mut rx, Kind::GapStart).await;
         let ended = recv_until(&mut rx, Kind::GapEnd).await;
@@ -1050,7 +1077,7 @@ mod tests {
         );
         assert_eq!(gap_ms, recorded_ns / 1_000_000, "gap_ms != t_ns difference");
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         let _ = handle.await;
     }
 
@@ -1080,8 +1107,8 @@ mod tests {
         let mut config = config(CexKind::BybitLinear, format!("ws://{addr}"), &["BTCUSDT"]);
         config.watchdog = Duration::from_secs(3600);
         let (source, mut rx) = source(config);
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         // Wait until the source has consumed the first frame: it is now in the
         // read loop with its ping interval armed.
@@ -1100,7 +1127,7 @@ mod tests {
         }
         assert!(pings >= 3, "expected >= 3 bybit pings, got {pings}");
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         let _ = handle.await;
     }
 
@@ -1114,8 +1141,8 @@ mod tests {
             format!("ws://{}", server.addr),
             &["BTCUSDT"],
         ));
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         let gap = recv_until(&mut rx, Kind::GapStart).await;
         assert_eq!(gap.meta.unwrap()["reason"], "closed");
@@ -1136,7 +1163,7 @@ mod tests {
             Some(r#"{"op":"subscribe","args":["orderbook.1.BTCUSDT"]}"#)
         );
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         handle.await.unwrap();
     }
 
@@ -1150,8 +1177,8 @@ mod tests {
             format!("ws://{}", server.addr),
             &["BTCUSDT"],
         ));
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         let gap = recv_until(&mut rx, Kind::GapStart).await;
         assert_eq!(gap.meta.unwrap()["reason"], "closed");
@@ -1161,7 +1188,7 @@ mod tests {
         assert!(recv_until(&mut rx, Kind::GapEnd).await.kind == Kind::GapEnd);
         wait_for_connections(&server, 2).await;
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         handle.await.unwrap();
     }
 
@@ -1178,8 +1205,8 @@ mod tests {
             format!("ws://{addr}"),
             &["BTCUSDT"],
         ));
-        let shutdown = Arc::new(Notify::new());
-        let handle = tokio::spawn(source.run(shutdown.clone()));
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let handle = tokio::spawn(source.run(shutdown_rx));
 
         let gap = recv_until(&mut rx, Kind::GapStart).await;
         assert_eq!(gap.meta.unwrap()["reason"], "error");
@@ -1199,7 +1226,69 @@ mod tests {
             );
         }
 
-        shutdown.notify_one();
+        let _ = shutdown_tx.send(true);
         let _ = handle.await;
+    }
+
+    // -- Shutdown: one signal must wake every source (PERF-001) ----------
+
+    /// One shutdown signal must stop all three CEX sources. With a shared
+    /// `Notify`, `notify_one()` woke only one of the three waiters and the
+    /// other two ran until the process was killed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_shutdown_signal_stops_three_cex_sources() {
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let kinds = [
+            CexKind::BinanceUsdm,
+            CexKind::BinanceSpot,
+            CexKind::BybitLinear,
+        ];
+        let mut handles = Vec::new();
+        for kind in kinds {
+            let server = spawn_mock(kind == CexKind::BybitLinear, r#"{"x":1}"#, 1).await;
+            let (source, mut rx) =
+                source(config(kind, format!("ws://{}", server.addr), &["BTCUSDT"]));
+            let handle = tokio::spawn(source.run(shutdown_rx.clone()));
+            // Wait until this source is connected and inside its read loop, so
+            // the signal really does race three live waiters.
+            let _ = recv_until(&mut rx, Kind::Sub).await;
+            handles.push(handle);
+        }
+
+        let _ = shutdown_tx.send(true);
+
+        for (index, handle) in handles.into_iter().enumerate() {
+            tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .unwrap_or_else(|_| panic!("cex source {index} did not stop within 1 s"))
+                .unwrap();
+        }
+    }
+
+    /// A shutdown sent before any source first waits on the channel must still
+    /// stop every source: a `watch` receiver remembers the current value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_before_waiting_still_stops_three_cex_sources() {
+        let (shutdown_tx, shutdown_rx) = shutdown_channel();
+        let _ = shutdown_tx.send(true);
+
+        let kinds = [
+            CexKind::BinanceUsdm,
+            CexKind::BinanceSpot,
+            CexKind::BybitLinear,
+        ];
+        let mut handles = Vec::new();
+        for kind in kinds {
+            let server = spawn_mock(kind == CexKind::BybitLinear, r#"{"x":1}"#, 1).await;
+            let (source, _rx) = source(config(kind, format!("ws://{}", server.addr), &["BTCUSDT"]));
+            handles.push(tokio::spawn(source.run(shutdown_rx.clone())));
+        }
+
+        for (index, handle) in handles.into_iter().enumerate() {
+            tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .unwrap_or_else(|_| panic!("cex source {index} did not stop within 1 s"))
+                .unwrap();
+        }
     }
 }

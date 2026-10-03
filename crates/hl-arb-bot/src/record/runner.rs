@@ -7,6 +7,13 @@ use super::monitor::{disk_monitor, readiness_monitor};
 use super::sources::{CountingSink, run_cex, run_deribit, run_rest};
 use super::*;
 
+/// Bound on waiting for one recorder task to stop during shutdown.
+///
+/// A task that misses the shutdown signal must not stall the process until an
+/// operator's SIGKILL (PERF-001); after this bound the join is abandoned, the
+/// laggard is named in a warning, and shutdown continues.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
+
 // ---------------------------------------------------------------------------
 // `hl record` run
 // ---------------------------------------------------------------------------
@@ -72,7 +79,6 @@ pub async fn run(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let rest_shutdown = Arc::new(Notify::new());
     let deribit_shutdown = Arc::new(Notify::new());
-    let cex_shutdown = Arc::new(Notify::new());
 
     // Register connection health before spawning the readiness monitor.
     let mut states: Vec<(String, Arc<ConnState>)> = plan
@@ -97,7 +103,7 @@ pub async fn run(
         .collect();
     let recorder_health = RecorderHealth::new(states.clone(), cex_states.clone());
 
-    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+    let mut tasks: Vec<(&'static str, JoinHandle<()>)> = Vec::new();
 
     // One WebSocket task per planned connection, dialed 1 per 3 s (§7.4 step 7).
     for (index, conn) in plan.connections.iter().enumerate() {
@@ -120,15 +126,18 @@ pub async fn run(
         let protocol: Box<dyn Fn() -> Box<dyn Protocol> + Send> =
             Box::new(move || Box::new(HlProtocol::new(network)));
         let delay = hl_arb_recorder::MIN_NEW_CONN_INTERVAL * index as u32;
-        tasks.push(tokio::spawn(run_ws_conn(
-            conn.clone(),
-            protocol,
-            writer,
-            clock.clone(),
-            state,
-            shutdown_rx.clone(),
-            delay,
-        )));
+        tasks.push((
+            "hl-ws",
+            tokio::spawn(run_ws_conn(
+                conn.clone(),
+                protocol,
+                writer,
+                clock.clone(),
+                state,
+                shutdown_rx.clone(),
+                delay,
+            )),
+        ));
     }
 
     // REST snapshotter (SPEC-0008 §8).
@@ -147,13 +156,16 @@ pub async fn run(
             .context("spawning segment writer for hl-rest")?,
         );
         let snapshotter = snapshotter_config(&profile, &plan, network, mount_guard.clone())?;
-        tasks.push(tokio::spawn(run_rest(
-            snapshotter,
-            writer,
-            clock.clone(),
-            recorder_health.clone(),
-            rest_shutdown.clone(),
-        )));
+        tasks.push((
+            "hl-rest",
+            tokio::spawn(run_rest(
+                snapshotter,
+                writer,
+                clock.clone(),
+                recorder_health.clone(),
+                rest_shutdown.clone(),
+            )),
+        ));
     } else {
         warn!("rest snapshotter disabled by profile");
     }
@@ -173,13 +185,16 @@ pub async fn run(
             ))
             .context("spawning segment writer for deribit")?,
         );
-        tasks.push(tokio::spawn(run_deribit(
-            deribit_config(&profile),
-            writer,
-            clock.clone(),
-            recorder_health.clone(),
-            deribit_shutdown.clone(),
-        )));
+        tasks.push((
+            "deribit",
+            tokio::spawn(run_deribit(
+                deribit_config(&profile),
+                writer,
+                clock.clone(),
+                recorder_health.clone(),
+                deribit_shutdown.clone(),
+            )),
+        ));
     } else {
         debug!("deribit source disabled by profile");
     }
@@ -221,20 +236,23 @@ pub async fn run(
         });
         let source = CexSource::new(CexConfig::new(kind, symbols.clone()), sink, clock.clone());
         info!(src, symbols = symbols.len(), "starting cex source");
-        tasks.push(tokio::spawn(run_cex(source, cex_shutdown.clone())));
+        tasks.push((src, tokio::spawn(run_cex(source, shutdown_rx.clone()))));
     }
 
-    tasks.push(tokio::spawn(disk_monitor(
-        profile.out_dir.clone(),
-        shutdown_rx.clone(),
-    )));
-    tasks.push(tokio::spawn(readiness_monitor(
-        recorder_health,
-        health.clone(),
-        clock.clone(),
-        mount_guard.clone(),
-        shutdown_rx.clone(),
-    )));
+    tasks.push((
+        "disk-monitor",
+        tokio::spawn(disk_monitor(profile.out_dir.clone(), shutdown_rx.clone())),
+    ));
+    tasks.push((
+        "readiness-monitor",
+        tokio::spawn(readiness_monitor(
+            recorder_health,
+            health.clone(),
+            clock.clone(),
+            mount_guard.clone(),
+            shutdown_rx.clone(),
+        )),
+    ));
 
     // Serve HTTP until a shutdown signal; `serve` also handles SIGTERM/SIGINT.
     let mut serve_task = tokio::spawn(crate::serve(health, prometheus, profile.http_port));
@@ -253,13 +271,33 @@ pub async fn run(
         warn!(error = %err, "http server stopped with an error");
     }
 
-    info!("shutdown requested; finalizing recorder");
+    let stop_cause = if mount_tripped {
+        "mount_guard"
+    } else {
+        "signal"
+    };
+    info!(
+        cause = stop_cause,
+        "shutdown requested; finalizing recorder"
+    );
     let _ = shutdown_tx.send(true);
     rest_shutdown.notify_one();
     deribit_shutdown.notify_one();
-    cex_shutdown.notify_one();
-    for task in tasks {
-        let _ = task.await;
+    // The CEX sources share `shutdown_rx` (a watch channel), so the one
+    // `shutdown_tx.send(true)` above wakes all of them. Bound each join so a
+    // task that misses the signal cannot hold the process until SIGKILL
+    // (PERF-001); name the laggard and keep going.
+    for (source, task) in tasks {
+        if tokio::time::timeout(SHUTDOWN_JOIN_TIMEOUT, task)
+            .await
+            .is_err()
+        {
+            warn!(
+                source,
+                timeout_secs = SHUTDOWN_JOIN_TIMEOUT.as_secs(),
+                "recorder task did not stop within the shutdown timeout"
+            );
+        }
     }
 
     // Re-read the guard AFTER every task has stopped: a writer can trip inside
