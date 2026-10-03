@@ -32,15 +32,15 @@ Don't pick one silently.
 |---|---|---|
 | `docs/GOAL.md` | Goal, principles, latency budget, roadmap (index of all docs: `docs/README.md`) | — |
 | `specs/SPEC-0000…` | Platform: config, modes, observability, CI | SPEC-0000 |
-| `crates/mev-core` | Config, clock, errors, SQLite (`db.rs`, `db/writer.rs`), watchlist | 0000, 0004 |
-| `crates/mev-hl-client` | Hyperliquid REST/WS client, market state, signing, nonce, orders, transports | 0001, 0002 |
-| `crates/mev-engine` | Event-driven engine core: interned types, typed ingest, v2 sync `Strategy` trait + `FundingBasis`/`MarketMaker` (the `hl` run path) | 0010 |
-| `crates/mev-recorder` | Market-data recorder (**new, M3**) | 0008 |
-| `crates/mev-strategy` | Strategy building blocks: cost model, views, intents, sizing, paper executor; the v2 `Strategy` trait + implementations live in `mev-engine` | 0003, 0010, 0011 |
-| `crates/mev-risk` | Risk limit gate (kill switch and breakers pending: SPEC-0004 §16) | 0004 |
-| `crates/mev-hyperevm` | HyperEVM sources/executor (deferred) | 0005 |
-| `crates/mev-metrics` | Tracing, Prometheus metric names, health | 0000, 0006 |
-| `crates/mev-bot` | The `hl` binary (CLI + orchestration); `src/engine.rs` holds config/strategy building, the SQLite `Recorder`, and replay helpers; the run loop is `mev-engine`'s `EngineLoop<StrategyDispatcher>` | all, 0010 |
+| `crates/hl-arb-core` | Config, clock, errors, SQLite (`db.rs`, `db/writer.rs`), watchlist | 0000, 0004 |
+| `crates/hl-arb-client` | Hyperliquid REST/WS client, market state, signing, nonce, orders, transports | 0001, 0002 |
+| `crates/hl-arb-engine` | Event-driven engine core: interned types, typed ingest, v2 sync `Strategy` trait + `FundingBasis`/`MarketMaker` (the `hl` run path) | 0010 |
+| `crates/hl-arb-recorder` | Market-data recorder (**new, M3**) | 0008 |
+| `crates/hl-arb-strategy` | Strategy building blocks: cost model, views, intents, sizing, paper executor; the v2 `Strategy` trait + implementations live in `hl-arb-engine` | 0003, 0010, 0011 |
+| `crates/hl-arb-risk` | Risk limit gate (kill switch and breakers pending: SPEC-0004 §16) | 0004 |
+| `crates/hl-arb-hyperevm` | HyperEVM sources/executor (deferred) | 0005 |
+| `crates/hl-arb-metrics` | Tracing, Prometheus metric names, health | 0000, 0006 |
+| `crates/hl-arb-bot` | The `hl` binary (CLI + orchestration); `src/engine.rs` holds config/strategy building, the SQLite `Recorder`, and replay helpers; the run loop is `hl-arb-engine`'s `EngineLoop<StrategyDispatcher>` | all, 0010 |
 | `research/` | Python research toolkit + studies (**new, M3**) | 0008 |
 | `specs/decisions/` | ADRs (architecture/strategy decisions) | — |
 | `legacy/` | Retired Ethereum bot. Reference only; never build or import it. | — |
@@ -92,7 +92,7 @@ verified fact, with a source link and date) and flag it in your final message.
   allocation.
 - Every hot-path change includes a benchmark or latency metric; a latency
   regression is a bug.
-- Metric names go in `crates/mev-metrics/src/lib.rs` (`names` module).
+- Metric names go in `crates/hl-arb-metrics/src/lib.rs` (`names` module).
 - Match the style of the surrounding code: doc comments on public items,
   `thiserror` in libraries, `anyhow` only at binary edges.
 - Add dependencies at the workspace level (`[workspace.dependencies]`) and

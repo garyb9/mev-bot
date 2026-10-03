@@ -1,0 +1,34 @@
+[package]
+name = "hl-arb-recorder"
+description = "Market-data recorder: envelope format and zstd segment writer (SPEC-0008)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hl-arb-core.workspace = true
+hl-arb-client.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zstd.workspace = true
+libc.workspace = true
+rust_decimal.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+wiremock.workspace = true
+criterion.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "segment"
+harness = false

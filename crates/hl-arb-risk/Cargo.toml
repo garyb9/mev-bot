@@ -1,0 +1,16 @@
+[package]
+name = "hl-arb-risk"
+description = "Risk limits, portfolio/margin guard, PnL accounting and kill switch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hl-arb-core.workspace = true
+hl-arb-strategy.workspace = true
+rust_decimal.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

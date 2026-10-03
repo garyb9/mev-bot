@@ -62,22 +62,22 @@ flowchart TB
 
 ## 2. Crate map
 
-Dependency direction is strictly downward: `mev-core` depends on nothing
-internal; `mev-bot` wires everything. The engine loop and the v2 `Strategy`
-trait live in **`mev-engine`**, not `mev-strategy`, because the trait's `Ctx`
+Dependency direction is strictly downward: `hl-arb-core` depends on nothing
+internal; `hl-arb-bot` wires everything. The engine loop and the v2 `Strategy`
+trait live in **`hl-arb-engine`**, not `hl-arb-strategy`, because the trait's `Ctx`
 names engine types (SPEC-0010 §23 Q-Layering).
 
 | Crate | Responsibility | Key types | Spec |
 |---|---|---|---|
-| `mev-core` | config, clock, errors, watchlist, SQLite store + single writer | `Config`, `Clock`/`SystemClock`, `Db`/`DbWriter`, `watchlist::load`/`save` | 0000, 0004 |
-| `mev-hl-client` | HyperCore REST/WS client, wire types, market state, order builder, nonce, EIP-712 signing, transports, dead-man switch | `InfoApi`/`HttpInfo`, `MarketStream`/`WsMarketStream`, `ExchangeApi`/`WsExchange`/`HttpExchange`, `RawWsConn`, `MarketSelector`, `MarketState`, `AgentSigner`, `NonceManager`, `DeadMansSwitch`, `CloidFactory`, `HlProtocol` | 0001, 0002 |
-| `mev-engine` | event-driven core: interned ids, typed ingest, engine loop, order manager, risk gate integration, order builder, paper exec, reconcile, latency instrumentation, action journal, the v2 strategies | `EngineLoop`, `StrategyDispatcher`, `CoinId`/`CoinRegistry`, `MarketUpdate`/`AccountUpdate`, `OrderManager`, `RiskGate`, `AssetTable`, `PaperExec`, `Reconciler`, `FundingBasis`, `MarketMaker`, `Strategy` | 0010 |
-| `mev-strategy` | venue-agnostic building blocks: cost/edge model, views, intents, sizing, paper executor, deterministic RNG | `CostModel`/`FeeRates`, `MarketView`/`AccountView`/`BookView`, `OrderIntent`, `Sizer`, `PaperExecutor`, `DeterministicRng` | 0003, 0011 |
-| `mev-risk` | fail-closed per-order limit gate, kill switch, trading halt | `LimitRisk`, `Limits`, `KillSwitch`, `TradingHalt`, `cancel_all_cloids` | 0004 |
-| `mev-recorder` | envelope format, per-connection segment writer/reader, subscription planner, HL REST snapshotter | `Envelope`/`Kind`, `SegmentWriter`/`SegmentReader`, `Plan`/`HlProfile`, `RestSnapshotter` | 0008 |
-| `mev-metrics` | `tracing` init, metric names, health, Prometheus recorder | `names`, `Health`, `install_recorder()` | 0000, 0006 |
-| `mev-bot` | the `hl` binary: CLI, orchestration, live I/O tasks, recorder CLI, replay driver | `Command`, `run()`, `live::*`, `record::*`, `replay::*`, `engine::build` | all |
-| `mev-hyperevm` | HyperEVM chain ids only — **deferred** | `chain::{MAINNET, TESTNET}` | 0005 |
+| `hl-arb-core` | config, clock, errors, watchlist, SQLite store + single writer | `Config`, `Clock`/`SystemClock`, `Db`/`DbWriter`, `watchlist::load`/`save` | 0000, 0004 |
+| `hl-arb-client` | HyperCore REST/WS client, wire types, market state, order builder, nonce, EIP-712 signing, transports, dead-man switch | `InfoApi`/`HttpInfo`, `MarketStream`/`WsMarketStream`, `ExchangeApi`/`WsExchange`/`HttpExchange`, `RawWsConn`, `MarketSelector`, `MarketState`, `AgentSigner`, `NonceManager`, `DeadMansSwitch`, `CloidFactory`, `HlProtocol` | 0001, 0002 |
+| `hl-arb-engine` | event-driven core: interned ids, typed ingest, engine loop, order manager, risk gate integration, order builder, paper exec, reconcile, latency instrumentation, action journal, the v2 strategies | `EngineLoop`, `StrategyDispatcher`, `CoinId`/`CoinRegistry`, `MarketUpdate`/`AccountUpdate`, `OrderManager`, `RiskGate`, `AssetTable`, `PaperExec`, `Reconciler`, `FundingBasis`, `MarketMaker`, `Strategy` | 0010 |
+| `hl-arb-strategy` | venue-agnostic building blocks: cost/edge model, views, intents, sizing, paper executor, deterministic RNG | `CostModel`/`FeeRates`, `MarketView`/`AccountView`/`BookView`, `OrderIntent`, `Sizer`, `PaperExecutor`, `DeterministicRng` | 0003, 0011 |
+| `hl-arb-risk` | fail-closed per-order limit gate, kill switch, trading halt | `LimitRisk`, `Limits`, `KillSwitch`, `TradingHalt`, `cancel_all_cloids` | 0004 |
+| `hl-arb-recorder` | envelope format, per-connection segment writer/reader, subscription planner, HL REST snapshotter | `Envelope`/`Kind`, `SegmentWriter`/`SegmentReader`, `Plan`/`HlProfile`, `RestSnapshotter` | 0008 |
+| `hl-arb-metrics` | `tracing` init, metric names, health, Prometheus recorder | `names`, `Health`, `install_recorder()` | 0000, 0006 |
+| `hl-arb-bot` | the `hl` binary: CLI, orchestration, live I/O tasks, recorder CLI, replay driver | `Command`, `run()`, `live::*`, `record::*`, `replay::*`, `engine::build` | all |
+| `hl-arb-hyperevm` | HyperEVM chain ids only — **deferred** | `chain::{MAINNET, TESTNET}` | 0005 |
 
 ## 3. The hot path
 
@@ -116,7 +116,7 @@ sequenceDiagram
   Note over Eng,Ex: hl_tick_to_order_seconds = t_written − t_recv
 ```
 
-Hops and their queues (`crates/mev-bot/src/main.rs`, `crates/mev-engine/src/`):
+Hops and their queues (`crates/hl-arb-bot/src/main.rs`, `crates/hl-arb-engine/src/`):
 
 | Hop | Runs on | Channel | Full ⇒ |
 |---|---|---|---|
@@ -127,10 +127,10 @@ Hops and their queues (`crates/mev-bot/src/main.rs`, `crates/mev-engine/src/`):
 
 Conflation: `bbo`/`l2Book` frames are full snapshots, so the engine drains
 **all** pending market updates, applies each cheaply, and then dispatches a
-dirty coin **once** on its latest state (`crates/mev-engine/src/run.rs`).
+dirty coin **once** on its latest state (`crates/hl-arb-engine/src/run.rs`).
 
-Latency stamps and metric names (`crates/mev-engine/src/instrument.rs`,
-`crates/mev-metrics/src/lib.rs`). The engine-side `hl_engine_*` recorder exists
+Latency stamps and metric names (`crates/hl-arb-engine/src/instrument.rs`,
+`crates/hl-arb-metrics/src/lib.rs`). The engine-side `hl_engine_*` recorder exists
 in the loop but the `hl` binary does **not** export it yet *(planned)*; the
 `hl_*` names below are recorded on the live path today.
 
@@ -153,7 +153,7 @@ exists but `hl` does not call it yet) (SPEC-0010 §12/§18).
 
 One engine serves every mode (SPEC-0010 G-5/G-6). Strategies are pure and
 synchronous; they read time only from `Ctx::now`, so the same code is
-deterministic under replay (`crates/mev-engine/src/dispatch.rs`).
+deterministic under replay (`crates/hl-arb-engine/src/dispatch.rs`).
 
 | Mode | Market input | Strategies | Exec backend | Clock | Notes |
 |---|---|---|---|---|---|
@@ -163,7 +163,7 @@ deterministic under replay (`crates/mev-engine/src/dispatch.rs`).
 | `replay` | recorder segments, decoded by the same ingest decoders | yes | `PaperExec` with the same latency model | `ReplayClock` | deterministic: pinned cloid prefix + action journal; opens no sockets, loads no keys |
 
 `hl replay` runs the *real* engine over recorded data
-(`crates/mev-bot/src/replay.rs`): the same input must produce a byte-identical
+(`crates/hl-arb-bot/src/replay.rs`): the same input must produce a byte-identical
 action journal (FNV-1a fingerprint). There is also a legacy SQLite-session
 replay path when `--from` is absent.
 
@@ -208,16 +208,16 @@ stateDiagram-v2
 - **Unknown outcomes are reconciled by `cloid`**, never by resending. A lost
   reply marks the orders `Unknown`; a spawned task queries `orderStatus` by
   `cloid` with capped backoff, and a never-seen order resolves `Rejected` after
-  the bound (`crates/mev-bot/src/live.rs`).
+  the bound (`crates/hl-arb-bot/src/live.rs`).
 - **Account stream is the source of truth** for own orders and fills:
   `orderUpdates`, `userFills`, and `userEvents` run on their own lossless
-  connection (`crates/mev-bot/src/live.rs`). Fills come from `userFills` only,
+  connection (`crates/hl-arb-bot/src/live.rs`). Fills come from `userFills` only,
   are de-duplicated by venue `tid`, and map to orders via an `oid → cloid`
   index; the REST reconciler is a 30 s backstop.
 - **Dead-man switch** (`scheduleCancel`): armed only while an order rests,
   refreshed at half the TTL (default 120 s), disarmed on graceful shutdown. An
   arm/refresh failure while orders rest fails closed by sending
-  `Control::KillSwitch` (`crates/mev-bot/src/main.rs` `deadman`).
+  `Control::KillSwitch` (`crates/hl-arb-bot/src/main.rs` `deadman`).
 - **Kill switch** (SPEC-0004 K-3): `SIGUSR1`, the flag file `data/KILL`
   (`HL_KILL_FILE`, polled every 250 ms), or `hl panic`; it cancels every working
   order and halts new places. Clearing is two-key: `hl resume` **and**
@@ -225,22 +225,22 @@ stateDiagram-v2
 - **Risk is fail-closed**: `live` refuses to start unless
   `max_order_notional_usd`, `max_position_notional_usd`, `max_open_orders`,
   `max_margin_utilization_bps`, `max_daily_loss_usd`, and `max_unhedged_usd`
-  are all explicitly finite (`crates/mev-core/src/config.rs` `validate`). The
+  are all explicitly finite (`crates/hl-arb-core/src/config.rs` `validate`). The
   check order is kill → breaker → stale coin → unknown-on-coin → rate budget →
   notional → projected exposure → margin → tick/min-notional
-  (`crates/mev-engine/src/risk.rs`).
+  (`crates/hl-arb-engine/src/risk.rs`).
 
 ## 6. Persistence
 
 - **SQLite** (`rusqlite`, WAL) is the bot's store, written only by a single
   `DbWriter` thread fed over a bounded channel — never from the hot path
-  (SPEC-0004 §9). Tables (`crates/mev-core/src/db.rs`): `meta`, `sessions`,
+  (SPEC-0004 §9). Tables (`crates/hl-arb-core/src/db.rs`): `meta`, `sessions`,
   `events` (the replay log, with writer-assigned monotonic `seq`), `orders`,
   `fills`, `funding`, `positions_snapshot`, `open_orders_snapshot`.
 - **Nonce high-water mark** lives in `meta` under `nonce.last` and is persisted
   before a live send, so a restart cannot reuse a nonce
-  (`crates/mev-hl-client/src/nonce.rs`, `exchange.rs`).
-- **Recorder segments** (`crates/mev-recorder/`): one JSON-lines **envelope**
+  (`crates/hl-arb-client/src/nonce.rs`, `exchange.rs`).
+- **Recorder segments** (`crates/hl-arb-recorder/`): one JSON-lines **envelope**
   per line (`v`, `src`, `conn`, `seq`, `t_ns`, `mono_ns`, `kind`, `raw`/`meta`),
   zstd-compressed, rotated at the top of each UTC hour or 1 GiB uncompressed.
   A segment in progress is `*.jsonl.zst.partial`; on a clean finalize it gains a
@@ -303,13 +303,13 @@ PASS one (SPEC-0008 §13.11).
 
 ## 9. Where to start reading the code
 
-1. `crates/mev-bot/src/main.rs` — CLI, orchestration, ingest, health, shutdown.
-2. `crates/mev-bot/src/live.rs` — exec writer, account stream, kill-switch control.
-3. `crates/mev-engine/src/run.rs` — the per-iteration engine loop.
-4. `crates/mev-engine/src/dispatch.rs` — strategy dispatch, risk gating, batch/send.
-5. `crates/mev-engine/src/orders.rs` — order state machine and in-flight exposure.
-6. `crates/mev-engine/src/risk.rs` — the fail-closed risk gate.
-7. `crates/mev-engine/src/builder.rs` — cloid assignment, rounding, aggressive pricing.
-8. `crates/mev-hl-client/src/exchange.rs` / `ws_exchange.rs` — signing and WS `post`.
-9. `crates/mev-bot/src/record.rs` + `crates/mev-recorder/src/` — the recorder.
-10. `crates/mev-bot/src/replay.rs` — deterministic replay over segments.
+1. `crates/hl-arb-bot/src/main.rs` — CLI, orchestration, ingest, health, shutdown.
+2. `crates/hl-arb-bot/src/live.rs` — exec writer, account stream, kill-switch control.
+3. `crates/hl-arb-engine/src/run.rs` — the per-iteration engine loop.
+4. `crates/hl-arb-engine/src/dispatch.rs` — strategy dispatch, risk gating, batch/send.
+5. `crates/hl-arb-engine/src/orders.rs` — order state machine and in-flight exposure.
+6. `crates/hl-arb-engine/src/risk.rs` — the fail-closed risk gate.
+7. `crates/hl-arb-engine/src/builder.rs` — cloid assignment, rounding, aggressive pricing.
+8. `crates/hl-arb-client/src/exchange.rs` / `ws_exchange.rs` — signing and WS `post`.
+9. `crates/hl-arb-bot/src/record.rs` + `crates/hl-arb-recorder/src/` — the recorder.
+10. `crates/hl-arb-bot/src/replay.rs` — deterministic replay over segments.

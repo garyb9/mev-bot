@@ -76,15 +76,15 @@ jobs:
           MEV_BENCH_QUICK: "1"
         run: |
           CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion/hl-decode" \
-            cargo bench -p mev-hl-client --bench decode -- --quick
+            cargo bench -p hl-arb-client --bench decode -- --quick
           CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion/hl-sign" \
-            cargo bench -p mev-hl-client --bench sign -- --quick
+            cargo bench -p hl-arb-client --bench sign -- --quick
           CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion/engine-ingest" \
-            cargo bench -p mev-engine --bench ingest -- --quick
+            cargo bench -p hl-arb-engine --bench ingest -- --quick
           CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion/bot-engine" \
-            cargo bench -p mev-bot --bench engine -- --quick
+            cargo bench -p hl-arb-bot --bench engine -- --quick
           CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion/recorder-segment" \
-            cargo bench -p mev-recorder --bench segment -- --quick
+            cargo bench -p hl-arb-recorder --bench segment -- --quick
       - name: Compare against baseline (warn-only)
         run: python3 scripts/bench_check.py
       - name: Upload criterion results

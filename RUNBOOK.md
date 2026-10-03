@@ -177,10 +177,10 @@ or clock, and prints an FNV-1a-64 fingerprint over the emitted placements:
 
 ```sh
 # Replay the most recent session (prints events=, intents=, fingerprint=)
-cargo run -p mev-bot -- replay
+cargo run -p hl-arb-bot -- replay
 
 # Replay a specific session id
-cargo run -p mev-bot -- replay --session 12 --db data/hlbot.db
+cargo run -p hl-arb-bot -- replay --session 12 --db data/hlbot.db
 ```
 
 Identical logs must yield an identical fingerprint; a change means the strategy

@@ -1,0 +1,35 @@
+[package]
+name = "hl-arb-engine"
+description = "Event-driven engine core: interned types, typed ingest, and the decision loop (SPEC-0010)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+hl-arb-core.workspace = true
+hl-arb-client.workspace = true
+hl-arb-metrics.workspace = true
+hl-arb-risk.workspace = true
+hl-arb-strategy.workspace = true
+metrics.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+metrics-util.workspace = true
+
+[[bench]]
+name = "ingest"
+harness = false
+
+[[bench]]
+name = "iterate"
+harness = false

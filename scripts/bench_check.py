@@ -23,11 +23,11 @@ last writer overwrite the first. Reproduce the baseline on any host with:
 
     export MEV_BENCH_QUICK=1
     root="$PWD/target/criterion"
-    CRITERION_HOME="$root/hl-decode"         cargo bench -p mev-hl-client --bench decode -- --quick
-    CRITERION_HOME="$root/hl-sign"           cargo bench -p mev-hl-client --bench sign   -- --quick
-    CRITERION_HOME="$root/engine-ingest"     cargo bench -p mev-engine    --bench ingest -- --quick
-    CRITERION_HOME="$root/bot-engine"        cargo bench -p mev-bot       --bench engine -- --quick
-    CRITERION_HOME="$root/recorder-segment"  cargo bench -p mev-recorder  --bench segment -- --quick
+    CRITERION_HOME="$root/hl-decode"         cargo bench -p hl-arb-client --bench decode -- --quick
+    CRITERION_HOME="$root/hl-sign"           cargo bench -p hl-arb-client --bench sign   -- --quick
+    CRITERION_HOME="$root/engine-ingest"     cargo bench -p hl-arb-engine    --bench ingest -- --quick
+    CRITERION_HOME="$root/bot-engine"        cargo bench -p hl-arb-bot       --bench engine -- --quick
+    CRITERION_HOME="$root/recorder-segment"  cargo bench -p hl-arb-recorder  --bench segment -- --quick
     python3 scripts/bench_check.py --write-baseline
 
 Usage:

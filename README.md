@@ -4,7 +4,7 @@ A **low-latency arbitrage / MEV-style trading system for
 [Hyperliquid](https://hyperliquid.xyz)**, written in Rust (HyperCore first,
 HyperEVM later).
 
-*Formerly `mev-bot`. The Cargo packages keep their `mev-*` names and the binary is `hl`.*
+*Formerly `mev-bot`; the crates were `mev-*` before the rename. The binary is `hl`.*
 
 - **Evidence before strategy.** A keyless recorder stores raw market data and an
   offline Python toolkit measures edge net of costs. Only strategies with a
@@ -31,11 +31,11 @@ flowchart LR
   HL[("Hyperliquid<br/>WS + HTTP")]
   subgraph bot["hl run (bot)"]
     direction TB
-    ingest["market ingest<br/>mev-hl-client"] --> engine["EngineLoop + strategies<br/>mev-engine"]
-    engine --> risk["risk gate<br/>mev-risk"] --> exec["exec: paper or WS exchange"]
+    ingest["market ingest<br/>hl-arb-client"] --> engine["EngineLoop + strategies<br/>hl-arb-engine"]
+    engine --> risk["risk gate<br/>hl-arb-risk"] --> exec["exec: paper or WS exchange"]
   end
   subgraph rec["hl record (recorder, no keys)"]
-    planner["planner + sources<br/>mev-recorder"] --> seg[("zstd segments")]
+    planner["planner + sources<br/>hl-arb-recorder"] --> seg[("zstd segments")]
   end
   subgraph res["research/ (Python, offline)"]
     studies["hlr studies"] --> rank["ranked opportunities"]
@@ -58,12 +58,12 @@ only read public market data.
 cargo build --workspace
 cargo test --workspace
 
-cargo run -p mev-bot -- --help                  # the `hl` CLI
-cargo run -p mev-bot -- config show             # resolved config, secrets redacted
-cargo run -p mev-bot -- record plan             # recorder subscription plan, opens no sockets
-cargo run -p mev-bot -- run --mode observe      # connect, build state, never trade
-cargo run -p mev-bot -- run --mode simulate     # run strategies against paper fills
-cargo run -p mev-bot -- replay --from 2026-09-30 --to 2026-09-30 --rec-dir data/rec
+cargo run -p hl-arb-bot -- --help                  # the `hl` CLI
+cargo run -p hl-arb-bot -- config show             # resolved config, secrets redacted
+cargo run -p hl-arb-bot -- record plan             # recorder subscription plan, opens no sockets
+cargo run -p hl-arb-bot -- run --mode observe      # connect, build state, never trade
+cargo run -p hl-arb-bot -- run --mode simulate     # run strategies against paper fills
+cargo run -p hl-arb-bot -- replay --from 2026-09-30 --to 2026-09-30 --rec-dir data/rec
                                                 # replay recorder segments through the engine
 ```
 
@@ -91,15 +91,15 @@ Operations: [`RUNBOOK.md`](RUNBOOK.md).
 
 | Path | What |
 |---|---|
-| [`crates/mev-core`](crates/mev-core) | common: config, clock, errors, SQLite store, watchlist |
-| [`crates/mev-metrics`](crates/mev-metrics) | common: tracing, Prometheus metric names, health |
-| [`crates/mev-hl-client`](crates/mev-hl-client) | client: Hyperliquid REST/WS, signing, nonces, orders |
-| [`crates/mev-hyperevm`](crates/mev-hyperevm) | client: HyperEVM (deferred) |
-| [`crates/mev-recorder`](crates/mev-recorder) | client/tooling: market-data recorder (segments, planner, reader) |
-| [`crates/mev-strategy`](crates/mev-strategy) | domain: cost model, views, intents, sizing, paper executor |
-| [`crates/mev-risk`](crates/mev-risk) | domain: limit gate, kill switch, halt |
-| [`crates/mev-engine`](crates/mev-engine) | domain: event-driven engine, order manager, v2 strategies |
-| [`crates/mev-bot`](crates/mev-bot) | app: the `hl` binary (CLI and orchestration) |
+| [`crates/hl-arb-core`](crates/hl-arb-core) | common: config, clock, errors, SQLite store, watchlist |
+| [`crates/hl-arb-metrics`](crates/hl-arb-metrics) | common: tracing, Prometheus metric names, health |
+| [`crates/hl-arb-client`](crates/hl-arb-client) | client: Hyperliquid REST/WS, signing, nonces, orders |
+| [`crates/hl-arb-hyperevm`](crates/hl-arb-hyperevm) | client: HyperEVM (deferred) |
+| [`crates/hl-arb-recorder`](crates/hl-arb-recorder) | client/tooling: market-data recorder (segments, planner, reader) |
+| [`crates/hl-arb-strategy`](crates/hl-arb-strategy) | domain: cost model, views, intents, sizing, paper executor |
+| [`crates/hl-arb-risk`](crates/hl-arb-risk) | domain: limit gate, kill switch, halt |
+| [`crates/hl-arb-engine`](crates/hl-arb-engine) | domain: event-driven engine, order manager, v2 strategies |
+| [`crates/hl-arb-bot`](crates/hl-arb-bot) | app: the `hl` binary (CLI and orchestration) |
 | [`research/`](research) | offline Python research toolkit |
 | [`config/`](config) | default and recorder configs |
 | [`deploy/`](deploy) | recorder run scripts and deployment notes |

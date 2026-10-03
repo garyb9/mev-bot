@@ -1745,6 +1745,162 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-arb-bot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "clap",
+ "criterion",
+ "crossbeam-channel",
+ "figment",
+ "futures-util",
+ "hl-arb-client",
+ "hl-arb-core",
+ "hl-arb-engine",
+ "hl-arb-metrics",
+ "hl-arb-recorder",
+ "hl-arb-risk",
+ "hl-arb-strategy",
+ "libc",
+ "metrics",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "hl-arb-client"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "anyhow",
+ "async-trait",
+ "criterion",
+ "futures-util",
+ "hl-arb-core",
+ "hl-arb-metrics",
+ "k256",
+ "metrics",
+ "metrics-util",
+ "reqwest",
+ "rmp-serde",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "hl-arb-core"
+version = "0.1.0"
+dependencies = [
+ "figment",
+ "rusqlite",
+ "rust_decimal",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "hl-arb-engine"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "crossbeam-channel",
+ "hl-arb-client",
+ "hl-arb-core",
+ "hl-arb-metrics",
+ "hl-arb-risk",
+ "hl-arb-strategy",
+ "metrics",
+ "metrics-util",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hl-arb-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "hl-arb-core",
+]
+
+[[package]]
+name = "hl-arb-metrics"
+version = "0.1.0"
+dependencies = [
+ "metrics",
+ "metrics-exporter-prometheus",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "hl-arb-recorder"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "futures-util",
+ "hl-arb-client",
+ "hl-arb-core",
+ "libc",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "wiremock",
+ "zstd",
+]
+
+[[package]]
+name = "hl-arb-risk"
+version = "0.1.0"
+dependencies = [
+ "hl-arb-core",
+ "hl-arb-strategy",
+ "rust_decimal",
+ "tempfile",
+]
+
+[[package]]
+name = "hl-arb-strategy"
+version = "0.1.0"
+dependencies = [
+ "hl-arb-client",
+ "hl-arb-core",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2352,162 +2508,6 @@ dependencies = [
  "rand 0.9.5",
  "rand_xoshiro",
  "sketches-ddsketch",
-]
-
-[[package]]
-name = "mev-bot"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "clap",
- "criterion",
- "crossbeam-channel",
- "figment",
- "futures-util",
- "libc",
- "metrics",
- "mev-core",
- "mev-engine",
- "mev-hl-client",
- "mev-metrics",
- "mev-recorder",
- "mev-risk",
- "mev-strategy",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "smallvec",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "mev-core"
-version = "0.1.0"
-dependencies = [
- "figment",
- "rusqlite",
- "rust_decimal",
- "secrecy",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "mev-engine"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "crossbeam-channel",
- "metrics",
- "metrics-util",
- "mev-core",
- "mev-hl-client",
- "mev-metrics",
- "mev-risk",
- "mev-strategy",
- "rust_decimal",
- "serde",
- "serde_json",
- "smallvec",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "mev-hl-client"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
- "anyhow",
- "async-trait",
- "criterion",
- "futures-util",
- "k256",
- "metrics",
- "metrics-util",
- "mev-core",
- "mev-metrics",
- "reqwest",
- "rmp-serde",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "mev-hyperevm"
-version = "0.1.0"
-dependencies = [
- "mev-core",
-]
-
-[[package]]
-name = "mev-metrics"
-version = "0.1.0"
-dependencies = [
- "metrics",
- "metrics-exporter-prometheus",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mev-recorder"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "futures-util",
- "libc",
- "mev-core",
- "mev-hl-client",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "wiremock",
- "zstd",
-]
-
-[[package]]
-name = "mev-risk"
-version = "0.1.0"
-dependencies = [
- "mev-core",
- "mev-strategy",
- "rust_decimal",
- "tempfile",
-]
-
-[[package]]
-name = "mev-strategy"
-version = "0.1.0"
-dependencies = [
- "mev-core",
- "mev-hl-client",
- "rust_decimal",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

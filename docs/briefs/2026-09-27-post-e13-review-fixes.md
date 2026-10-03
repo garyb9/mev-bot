@@ -18,9 +18,9 @@ the G1 data clock. This brief turns the findings into tasks.
   - money math uses `rust_decimal`;
   - no `unwrap`/`expect` on network, parse, or I/O paths.
 - **Coordination:** another agent is working on R-6 (`hl record`). At review
-  time it had uncommitted changes in `crates/mev-bot/src/main.rs`,
-  `RUNBOOK.md`, `Cargo.lock`, `crates/mev-bot/Cargo.toml`, and
-  `crates/mev-metrics/src/lib.rs`, plus new `crates/mev-bot/src/record.rs` and
+  time it had uncommitted changes in `crates/hl-arb-bot/src/main.rs`,
+  `RUNBOOK.md`, `Cargo.lock`, `crates/hl-arb-bot/Cargo.toml`, and
+  `crates/hl-arb-metrics/src/lib.rs`, plus new `crates/hl-arb-bot/src/record.rs` and
   `config/record.toml`. Pull and re-read before you edit those files, don't
   touch `record.rs`, and commit only your own files.
 - Line numbers below are from `d74478f` and may have moved. Search for the
@@ -33,8 +33,8 @@ the G1 data clock. This brief turns the findings into tasks.
 
 | Agent | Tasks | Area |
 |---|---|---|
-| 1 (live path) | Step 0, then A → B → C → D, then E, F | `mev-engine`, `mev-hl-client`, `mev-bot` |
-| 2 (recorder) | G, H, I | `mev-recorder` only |
+| 1 (live path) | Step 0, then A → B → C → D, then E, F | `hl-arb-engine`, `hl-arb-client`, `hl-arb-bot` |
+| 2 (recorder) | G, H, I | `hl-arb-recorder` only |
 
 If only one agent is available, follow the order in the table; the recorder
 tasks come after A–D.
@@ -137,7 +137,7 @@ tasks come after A–D.
     `type: error` (rate limited, nonce rejected, …);
   - failures before the frame reached the socket (dial failure, the
     "websocket closed before send" path, request serialisation).
-- `mev-hl-client` returns `Error::UnknownOutcome` exactly when the outcome is
+- `hl-arb-client` returns `Error::UnknownOutcome` exactly when the outcome is
   ambiguous.
 - The recovery asks `orderStatus` once. On "not found"
   (`order_status_update` returns `None`) it `continue`s, with no retry and no
@@ -158,7 +158,7 @@ tasks come after A–D.
    - **Sent, no reliable answer** → `Unknown`.
 
    If one variant covers both cases today (e.g. `Error::Decode` is raised both
-   before sending and when parsing the reply), split it in `mev-hl-client`.
+   before sending and when parsing the reply), split it in `hl-arb-client`.
 2. Resolve "not found": retry `orderStatus` with backoff. Once the order can
    no longer land, resolve it as not placed (`Rejected`).
    - Recommended: set `expiresAfter` on order actions, so "not found after
@@ -215,7 +215,7 @@ tasks come after A–D.
 The commit added no tests for the exec writer, the account stream, the
 control task, or `hl panic`/`hl resume`. To make them testable, move
 `spawn_exec_writer`/`submit_post`, `account_stream`, and `control` out of
-`main.rs` into a module such as `crates/mev-bot/src/live.rs`. Move only; no
+`main.rs` into a module such as `crates/hl-arb-bot/src/live.rs`. Move only; no
 behaviour change in that commit.
 
 **Done when** (tests)
@@ -340,7 +340,7 @@ the `Unknown` orders, and shows that `exec_backpressure` is still tripped.
 - `OrderManager::has_unknown()` scans every order on each market event. Keep
   an incremental count, like `working_count`.
 - The ingest→sidecar `try_send` drops silently. Add a metric (in the
-  `mev-metrics` `names` module).
+  `hl-arb-metrics` `names` module).
 - The segment-writer throughput test uses 10-byte payloads and a wall-clock
   assertion, which is flaky on a loaded CI machine. Use realistic frame sizes,
   and consider moving the floor check into a bench.

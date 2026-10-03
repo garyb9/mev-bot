@@ -1,0 +1,20 @@
+[package]
+name = "hl-arb-core"
+description = "Core primitives for the trading system: types, errors, clock, config."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+rust_decimal.workspace = true
+figment.workspace = true
+secrecy.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

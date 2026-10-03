@@ -179,7 +179,7 @@ cmd_start() {
     build_shim
 
     echo "run-ssd.sh: building $BIN ..."
-    cargo build --release -p mev-bot >>"$LOG" 2>&1
+    cargo build --release -p hl-arb-bot >>"$LOG" 2>&1
     if [[ ! -x "$BIN" ]]; then
         echo "run-ssd.sh: build did not produce $BIN" >&2
         exit 1

@@ -1,6 +1,6 @@
 """Read the recorder's on-disk segment files (SPEC-0008 §5 and §6).
 
-The Rust crate `mev-recorder` is the ground truth for this format:
+The Rust crate `hl-arb-recorder` is the ground truth for this format:
 
 * A segment is a zstd-compressed JSON Lines file. Each line is one *envelope*
   object (`v`, `src`, `conn`, `seq`, `t_ns`, `mono_ns`, `kind`, `raw`/`meta`).
@@ -10,7 +10,7 @@ The Rust crate `mev-recorder` is the ground truth for this format:
 * Segments live under `{root}/{src}/{YYYY-MM-DD}/{HH}/`, where `root` is the
   recorder's network directory (for example `data/rec/mainnet`).
 
-This module mirrors `mev_recorder::reader::{SegmentReader, segments_for}`: only a
+This module mirrors `hl_arb_recorder::reader::{SegmentReader, segments_for}`: only a
 ``.crashed`` segment tolerates a truncated zstd tail or a partial final line (it
 stops cleanly at the last complete line). A damaged *finished* segment raises
 :class:`SegmentError` instead, because silently dropping data from a finished

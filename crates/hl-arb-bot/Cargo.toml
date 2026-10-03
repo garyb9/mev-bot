@@ -1,0 +1,49 @@
+[package]
+name = "hl-arb-bot"
+description = "Orchestration binary for the Hyperliquid-first trading system."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+crossbeam-channel.workspace = true
+figment.workspace = true
+futures-util.workspace = true
+libc.workspace = true
+metrics.workspace = true
+rust_decimal.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+
+hl-arb-core.workspace = true
+hl-arb-engine.workspace = true
+hl-arb-client.workspace = true
+hl-arb-metrics.workspace = true
+hl-arb-recorder.workspace = true
+hl-arb-risk.workspace = true
+hl-arb-strategy.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+criterion.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+wiremock.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "engine"
+harness = false

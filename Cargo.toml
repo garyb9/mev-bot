@@ -1,15 +1,15 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/mev-bot",
-    "crates/mev-core",
-    "crates/mev-engine",
-    "crates/mev-hl-client",
-    "crates/mev-hyperevm",
-    "crates/mev-metrics",
-    "crates/mev-recorder",
-    "crates/mev-risk",
-    "crates/mev-strategy",
+    "crates/hl-arb-bot",
+    "crates/hl-arb-core",
+    "crates/hl-arb-engine",
+    "crates/hl-arb-client",
+    "crates/hl-arb-hyperevm",
+    "crates/hl-arb-metrics",
+    "crates/hl-arb-recorder",
+    "crates/hl-arb-risk",
+    "crates/hl-arb-strategy",
 ]
 
 [workspace.package]
@@ -20,14 +20,14 @@ license = "MIT"
 repository = "https://github.com/garyb9/hl-arb-bot"
 
 [workspace.dependencies]
-mev-core = { path = "crates/mev-core" }
-mev-engine = { path = "crates/mev-engine" }
-mev-hl-client = { path = "crates/mev-hl-client" }
-mev-hyperevm = { path = "crates/mev-hyperevm" }
-mev-metrics = { path = "crates/mev-metrics" }
-mev-recorder = { path = "crates/mev-recorder" }
-mev-risk = { path = "crates/mev-risk" }
-mev-strategy = { path = "crates/mev-strategy" }
+hl-arb-core = { path = "crates/hl-arb-core" }
+hl-arb-engine = { path = "crates/hl-arb-engine" }
+hl-arb-client = { path = "crates/hl-arb-client" }
+hl-arb-hyperevm = { path = "crates/hl-arb-hyperevm" }
+hl-arb-metrics = { path = "crates/hl-arb-metrics" }
+hl-arb-recorder = { path = "crates/hl-arb-recorder" }
+hl-arb-risk = { path = "crates/hl-arb-risk" }
+hl-arb-strategy = { path = "crates/hl-arb-strategy" }
 
 rust_decimal = { version = "1.43", features = ["serde"] }
 
