@@ -53,6 +53,44 @@ A `SegmentError` from a finished segment means the recorder reported the file as
 complete but the bytes are truncated or corrupted: surface it, don't skip it
 (SPEC-0008 G-1/G-4).
 
+## Public-trades competition estimate (`hlr.competition`)
+
+Episode studies had no competition model: `compete_usd` was 0 and every
+"adjusted" number equalled the naive (generous) one. `hlr/competition.py`
+supplies one from the recorded HL public `trades` stream (which the recorder
+already writes; only the §13.1 `trades` parquet table is produced by
+`hlr.normalize`).
+
+```python
+import polars as pl
+
+from hlr.competition import estimate_competition, iter_recorded_trades
+
+# Stream a range's HL trades as hourly public-trades frames (never a whole day).
+chunks = iter_recorded_trades("data/rec/mainnet", "2026-10-01", "2026-10-01")
+trades = pl.concat(chunks)  # ts_ns, coin, px, sz, side, tid
+
+# Add per-episode compete_usd / gap_overlap to an episode table.
+episodes = estimate_competition(episodes, trades, latency_ns=250_000_000, gaps=gaps)
+```
+
+`compete_usd` is the USD notional of *other* traders' executions that were on
+the episode's opportunity side (a buy episode is competed by trades that lifted
+the ask), reached the stale quote price (buy: `px <= quote`; sell: `px >=
+quote`), and fall in the episode window `[t_start, t_end + latency_ns]`
+(inclusive at both ends). It is capped at the episode's quoted notional
+(`notional`, else `sz * quote_px`), never negative, and 0 without qualifying
+trades. Duplicate `tid`s (HL replays trades on resubscribe/reconnect) count
+once. `gap_overlap` is `True` when the window intersects a recorded gap for the
+feed, so its `compete_usd` is a lower bound; the caller flags it rather than
+dropping or imputing. Memory is bounded: the normalizer yields one hour at a
+time and the estimator only keeps the trades of the requested coins.
+
+Two spec gaps are flagged (see `hlr/competition.py`): the window is end-anchored
+at `t_end + latency_ns` per ST-1, while SPEC-0008 §13.10 words fill competition
+as `[t_start, t_start + L]`; and trades use local receive time `t_ns` (one clock
+with `hlr.episodes`), not the venue/`time` field.
+
 ## HL REST backfill (B-3)
 
 `hlr/backfill/hl_rest.py` (console script `hlr-hl-rest`) backfills
