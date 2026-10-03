@@ -435,13 +435,14 @@ async fn dispatch(command: Command, network: Option<NetworkArg>) -> Result<()> {
 }
 
 /// Resolve the configured kill-switch flag file and write/remove it
-/// (SPEC-0004 K-3).
+/// (SPEC-0004 K-3). Uses the lenient loader so an operator can still halt a
+/// live bot without `HL_LIVE_CONFIRM`/keys in their shell (SEC-004).
 fn set_kill_switch(network: Option<NetworkArg>, trip: bool) -> Result<()> {
-    let config = Config::load(ConfigOverrides {
+    let config = Config::load_lenient(ConfigOverrides {
         network: network.map(Into::into),
         ..Default::default()
     })?;
-    live::set_kill_switch(&config.kill_file, trip)
+    live::set_kill_switch(&config.kill_file_path(), trip)
 }
 
 fn resolve_network(network: Option<NetworkArg>) -> Result<Network> {

@@ -3,7 +3,7 @@
 //! Precedence: built-in defaults → `config/default.toml` → `config/{HL_ENV}.toml`
 //! → `HL_*` environment variables → CLI overrides.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use figment::{
     Figment,
@@ -315,6 +315,15 @@ pub struct Config {
     /// Agent wallet private key (required for `live`); never serialized or logged.
     #[serde(default, skip_serializing)]
     pub agent_private_key: Option<SecretString>,
+    /// Absolute directory of the config file this was loaded from, if any.
+    ///
+    /// Relative path fields (e.g. [`Config::kill_file`]) resolve against it so
+    /// the running bot and a separately-invoked `hl panic` agree regardless of
+    /// the operator's working directory. `None` when the config was not loaded
+    /// from a file; relative paths then resolve against the current directory
+    /// at call time. Not part of the serialized config surface.
+    #[serde(skip)]
+    pub config_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -334,6 +343,7 @@ impl Default for Config {
             kill_file: PathBuf::from("data/KILL"),
             account_address: None,
             agent_private_key: None,
+            config_dir: None,
         }
     }
 }
@@ -354,6 +364,24 @@ pub struct ConfigOverrides {
 impl Config {
     /// Load, layer, and validate configuration.
     pub fn load(overrides: ConfigOverrides) -> Result<Self> {
+        Self::load_inner(overrides, false)
+    }
+
+    /// Load configuration **without** running live-mode validation
+    /// (SPEC-0004 K-3, SEC-004).
+    ///
+    /// `hl panic`/`hl resume` must work while the bot is live, when the
+    /// operator's shell may not carry `HL_LIVE_CONFIRM` or the agent key. This
+    /// parses the same layers and applies the same env/CLI overrides as
+    /// [`Config::load`], then checks only the mode-independent invariants
+    /// (watchlist, address) — it never requires confirmation, keys, or finite
+    /// risk limits. Every other command must keep using [`Config::load`].
+    pub fn load_lenient(overrides: ConfigOverrides) -> Result<Self> {
+        Self::load_inner(overrides, true)
+    }
+
+    /// Shared loader. `lenient` selects which validation runs.
+    fn load_inner(overrides: ConfigOverrides, lenient: bool) -> Result<Self> {
         let env_name = std::env::var("HL_ENV").unwrap_or_else(|_| "default".to_string());
         let figment = Figment::new()
             .merge(Serialized::defaults(Config::default()))
@@ -364,6 +392,20 @@ impl Config {
         let mut config: Config = figment
             .extract()
             .map_err(|e| Error::Config(e.to_string()))?;
+
+        // Record where the config came from so relative path fields resolve
+        // against a stable absolute directory (SEC-004). Prefer the env-specific
+        // file when present, then `default.toml`; canonicalize so the value does
+        // not depend on the working directory later.
+        config.config_dir = [
+            format!("config/{env_name}.toml"),
+            "config/default.toml".to_string(),
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .and_then(|path| path.canonicalize().ok())
+        .and_then(|path| path.parent().map(Path::to_path_buf));
 
         if let Some(mode) = overrides.mode {
             config.mode = mode;
@@ -389,25 +431,17 @@ impl Config {
             config.risk.fill_defaults();
         }
 
-        config.validate()?;
+        if lenient {
+            config.validate_basic()?;
+        } else {
+            config.validate()?;
+        }
         Ok(config)
     }
 
     /// Validate invariants, including live-mode key gating.
     pub fn validate(&self) -> Result<()> {
-        if self.watchlist.is_empty() {
-            return Err(Error::Config("watchlist is empty".into()));
-        }
-        for coin in &self.watchlist {
-            if coin.trim().is_empty() {
-                return Err(Error::Config("watchlist contains an empty coin".into()));
-            }
-        }
-        if let Some(addr) = &self.account_address
-            && !is_hex_address(addr)
-        {
-            return Err(Error::Config(format!("invalid account address: {addr}")));
-        }
+        self.validate_basic()?;
 
         if self.mode == Mode::Live {
             let confirmed = std::env::var("HL_LIVE_CONFIRM")
@@ -432,6 +466,25 @@ impl Config {
                 ));
             }
             self.validate_live_limits()?;
+        }
+        Ok(())
+    }
+
+    /// Mode-independent invariants, shared by [`Self::validate`] and the
+    /// lenient path used by `hl panic`/`hl resume`.
+    fn validate_basic(&self) -> Result<()> {
+        if self.watchlist.is_empty() {
+            return Err(Error::Config("watchlist is empty".into()));
+        }
+        for coin in &self.watchlist {
+            if coin.trim().is_empty() {
+                return Err(Error::Config("watchlist contains an empty coin".into()));
+            }
+        }
+        if let Some(addr) = &self.account_address
+            && !is_hex_address(addr)
+        {
+            return Err(Error::Config(format!("invalid account address: {addr}")));
         }
         Ok(())
     }
@@ -486,6 +539,31 @@ impl Config {
     /// protection.
     pub fn unenforced_live_limits() -> &'static [&'static str] {
         &["max_daily_loss_usd", "max_unhedged_usd"]
+    }
+
+    /// The absolute path of the kill-switch flag file (SPEC-0004 K-3, SEC-004).
+    ///
+    /// A relative [`Config::kill_file`] is resolved here, in one place, against
+    /// the config file's directory when the config was loaded from a file,
+    /// otherwise against the current directory at call time. `hl panic` and
+    /// `hl resume` (and, once wired, the running bot) use this accessor so they
+    /// agree even when launched from different working directories.
+    pub fn kill_file_path(&self) -> PathBuf {
+        self.resolve_path(&self.kill_file)
+    }
+
+    /// Resolve `path` to an absolute path using [`Config::config_dir`] (or the
+    /// current directory when there is none). Absolute inputs are unchanged.
+    fn resolve_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        let base = self
+            .config_dir
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join(path)
     }
 
     /// The configured agent private key, if any. Handle with care: never log
@@ -676,5 +754,60 @@ mod tests {
         assert!(budget.hard_floor <= budget.ip_weight_min);
         // The engine share defaults to the full account weight and is settable.
         assert_eq!(Config::default().risk.rate_budget, budget);
+    }
+
+    #[test]
+    fn live_load_is_strict_but_lenient_load_skips_the_live_gates() {
+        // A `live` override with no HL_LIVE_CONFIRM / key / address / limits:
+        // strict loading must refuse, lenient loading (used by panic/resume)
+        // must succeed. No env mutation: both outcomes hold whether or not
+        // HL_LIVE_CONFIRM happens to be set by another test.
+        let overrides = || ConfigOverrides {
+            mode: Some(Mode::Live),
+            ..Default::default()
+        };
+        assert!(
+            Config::load(overrides()).is_err(),
+            "strict load must refuse"
+        );
+        let lenient = Config::load_lenient(overrides()).expect("lenient load succeeds");
+        assert_eq!(lenient.mode, Mode::Live);
+    }
+
+    #[test]
+    fn kill_file_path_resolves_relative_against_the_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            kill_file: PathBuf::from("data/KILL"),
+            config_dir: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let resolved = config.kill_file_path();
+        assert!(resolved.is_absolute(), "{resolved:?} must be absolute");
+        assert_eq!(resolved, dir.path().join("data/KILL"));
+    }
+
+    #[test]
+    fn kill_file_path_keeps_an_absolute_path_unchanged() {
+        let abs = std::env::temp_dir().join("hl-arb-sec004-absolute/KILL");
+        let config = Config {
+            kill_file: abs.clone(),
+            config_dir: Some(PathBuf::from("/somewhere/else")),
+            ..Config::default()
+        };
+        assert_eq!(config.kill_file_path(), abs);
+    }
+
+    #[test]
+    fn kill_file_path_falls_back_to_the_current_dir_without_a_config_file() {
+        let config = Config {
+            kill_file: PathBuf::from("data/KILL"),
+            config_dir: None,
+            ..Config::default()
+        };
+        let resolved = config.kill_file_path();
+        assert!(resolved.is_absolute(), "{resolved:?} must be absolute");
+        assert!(resolved.ends_with("data/KILL"));
+        assert_eq!(resolved, std::env::current_dir().unwrap().join("data/KILL"));
     }
 }

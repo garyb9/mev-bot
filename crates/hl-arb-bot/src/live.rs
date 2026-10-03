@@ -816,6 +816,27 @@ mod tests {
         assert!(!path.exists(), "hl resume removes the flag file");
     }
 
+    /// SEC-004: the absolute path `kill_file_path()` reports is exactly the one
+    /// panic writes and resume removes, and it does not depend on the cwd
+    /// because it was resolved against the config file's directory.
+    #[test]
+    fn panic_writes_the_absolute_path_the_kill_file_accessor_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = hl_arb_core::config::Config {
+            kill_file: std::path::PathBuf::from("nested/KILL"),
+            config_dir: Some(dir.path().to_path_buf()),
+            ..hl_arb_core::config::Config::default()
+        };
+        let resolved = config.kill_file_path();
+        assert!(resolved.is_absolute(), "{resolved:?} must be absolute");
+        assert_eq!(resolved, dir.path().join("nested/KILL"));
+
+        set_kill_switch(&resolved, true).unwrap();
+        assert!(resolved.exists(), "panic wrote the accessor's path");
+        set_kill_switch(&config.kill_file_path(), false).unwrap();
+        assert!(!resolved.exists(), "resume removed the accessor's path");
+    }
+
     /// A protocol that points at a test URL.
     #[derive(Clone)]
     struct TestProtocol {
