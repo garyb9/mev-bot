@@ -62,7 +62,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
-metrics-util = "0.19"
+metrics-util = "0.20"
 axum = "0.8"
 
 [profile.dev]

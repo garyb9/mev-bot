@@ -1791,7 +1791,7 @@ dependencies = [
  "hl-arb-metrics",
  "k256",
  "metrics",
- "metrics-util",
+ "metrics-util 0.20.4",
  "reqwest",
  "rmp-serde",
  "rust_decimal",
@@ -1830,7 +1830,7 @@ dependencies = [
  "hl-arb-risk",
  "hl-arb-strategy",
  "metrics",
- "metrics-util",
+ "metrics-util 0.20.4",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -2483,7 +2483,7 @@ dependencies = [
  "indexmap 2.14.2",
  "ipnet",
  "metrics",
- "metrics-util",
+ "metrics-util 0.19.1",
  "quanta",
  "thiserror 1.0.69",
  "tokio",
@@ -2496,10 +2496,26 @@ version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8496cc523d1f94c1385dd8f0f0c2c480b2b8aeccb5b7e4485ad6365523ae376"
 dependencies = [
- "aho-corasick",
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.15.5",
+ "metrics",
+ "quanta",
+ "rand 0.9.5",
+ "rand_xoshiro",
+ "sketches-ddsketch",
+]
+
+[[package]]
+name = "metrics-util"
+version = "0.20.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96f8722f8562635f92f8ed992f26df0532266eb03d5202607c20c0d7e9745e13"
+dependencies = [
+ "aho-corasick",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "hashbrown 0.16.1",
  "indexmap 2.14.2",
  "metrics",
  "ordered-float",
@@ -2507,6 +2523,7 @@ dependencies = [
  "radix_trie",
  "rand 0.9.5",
  "rand_xoshiro",
+ "rapidhash",
  "sketches-ddsketch",
 ]
 
@@ -2616,9 +2633,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "ordered-float"
-version = "4.6.0"
+version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
+checksum = "8c7c9e0d9b23589f26070720bac724174bfec1083e82f7854cdd0267518343c0"
 dependencies = [
  "num-traits",
 ]
