@@ -1,7 +1,7 @@
 //! REST `POST /exchange` transport and the signed request envelope (SPEC-0002 §9).
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -14,7 +14,10 @@ use hl_arb_core::error::{Error, Result};
 use crate::order::Action;
 use crate::signing::{AgentSigner, Signature};
 
-use super::{ActionResponse, ExchangeApi, ExchangeResponse, Prepared, WriteCore};
+use super::{
+    ActionResponse, ExchangeApi, ExchangeResponse, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+    Prepared, WriteCore,
+};
 
 /// A signed `/exchange` request payload.
 ///
@@ -108,8 +111,27 @@ impl HttpExchange {
         mode: Mode,
         signer: Option<AgentSigner>,
     ) -> Result<Self> {
+        Self::with_base_url_and_timeout(
+            base_url,
+            mode,
+            signer,
+            HTTP_CONNECT_TIMEOUT,
+            HTTP_REQUEST_TIMEOUT,
+        )
+    }
+
+    /// Create a client against an explicit base URL with explicit connect and
+    /// total request timeouts (tests that prove a black-holed server cannot
+    /// hang a write; SEC-001).
+    pub fn with_base_url_and_timeout(
+        base_url: impl Into<String>,
+        mode: Mode,
+        signer: Option<AgentSigner>,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self> {
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: super::http_client_with(connect_timeout, request_timeout),
             base_url: base_url.into(),
             core: WriteCore::new(mode, signer)?,
             submit_histogram: metrics::histogram!(
@@ -181,7 +203,19 @@ impl HttpExchange {
             .json(&request)
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(|e| {
+                // A connect failure (including a connect timeout) means the
+                // action never left the host (`NotSent`); a timeout after the
+                // connection was up leaves the outcome unknown and must be
+                // reconciled, never resent (SPEC-0002 H-1/H-2, SEC-001).
+                if e.is_connect() {
+                    Error::NotSent(format!("exchange request failed to connect: {e}"))
+                } else if e.is_timeout() {
+                    Error::UnknownOutcome(format!("exchange request timed out: {e}"))
+                } else {
+                    Error::Http(e.to_string())
+                }
+            })?;
         // Submit-to-ack: request written through the venue's response
         // (SPEC-0002 H-7, `transport="rest"`).
         self.submit_histogram

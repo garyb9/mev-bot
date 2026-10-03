@@ -18,6 +18,7 @@ use hl_arb_core::error::Error;
 use hl_arb_metrics::names;
 use metrics_util::debugging::DebuggingRecorder;
 use serde_json::json;
+use tokio::net::TcpListener;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
@@ -104,6 +105,39 @@ async fn live_maps_error_status_to_typed_error() {
     match err {
         Error::Exchange(message) => assert!(message.contains("Must deposit")),
         other => panic!("expected exchange error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_black_holed_server_times_out_fast() {
+    // A server that accepts the TCP connection but never replies must not hang
+    // a write. The timeout after the request was written leaves the outcome
+    // unknown, so it is typed `UnknownOutcome` (SPEC-0002 H-1/H-2, SEC-001).
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let exchange = HttpExchange::with_base_url_and_timeout(
+        format!("http://{addr}"),
+        Mode::Live,
+        Some(signer()),
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(100),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let err = exchange.submit(&simple_action()).await.unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a black-holed write must time out fast, took {:?}",
+        started.elapsed()
+    );
+    match err {
+        Error::UnknownOutcome(message) => assert!(message.contains("timed out"), "{message}"),
+        other => panic!("expected a typed timeout, got {other:?}"),
     }
 }
 

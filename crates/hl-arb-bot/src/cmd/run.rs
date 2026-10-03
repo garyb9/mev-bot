@@ -81,6 +81,11 @@ pub(crate) async fn run(
 
     let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::new(config.network));
     let exchange = live_exchange(&config)?;
+    // Warm the exec connection before the first order so a cold dial is never
+    // paid for on the order hot path (SPEC-0010 §12).
+    if let Some(exchange) = &exchange {
+        exchange.warm().await?;
+    }
 
     // Interned coins: the strategy universe when strategies run, else the
     // watchlist. The market decoder resolves names through this registry.
@@ -314,6 +319,29 @@ pub(crate) fn live_exchange(config: &Config) -> Result<Option<Arc<dyn ExchangeAp
     Ok(Some(Arc::new(exchange)))
 }
 
+/// Upper bound on a single `userRateLimit` poll. The poll runs in its own task
+/// so a slow or hung request can never delay the dead-man refresh arm of the
+/// `select!` below (SEC-001).
+pub(crate) const RATE_LIMIT_POLL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Poll the address rate-limit budget and publish it as a metric.
+///
+/// Runs detached with a hard timeout: a black-holed `userRateLimit` must not
+/// stall the dead-man switch's scheduleCancel cadence (SEC-001).
+pub(crate) async fn poll_rate_limit(info: Arc<dyn InfoApi>, address: String, timeout: Duration) {
+    match tokio::time::timeout(timeout, info.user_rate_limit(&address)).await {
+        Ok(Ok(budget)) => {
+            metrics::gauge!(
+                hl_arb_metrics::names::RATE_BUDGET_REMAINING,
+                "kind" => "address",
+            )
+            .set(budget.remaining() as f64);
+        }
+        Ok(Err(err)) => tracing::debug!(error = %err, "userRateLimit poll failed"),
+        Err(_) => tracing::debug!(address, "userRateLimit poll timed out"),
+    }
+}
+
 /// Keep `scheduleCancel` armed while (and only while) orders rest, and fail
 /// closed on any arm/refresh error (SPEC-0002 H-4).
 ///
@@ -324,8 +352,8 @@ pub(crate) fn live_exchange(config: &Config) -> Result<Option<Arc<dyn ExchangeAp
 /// spend address rate-limit budget. If arming/refreshing fails while orders
 /// rest, a fail-closed `Control::KillSwitch` is sent through the engine's
 /// account channel (halting dispatch and cancelling working orders). The task
-/// also polls `userRateLimit` every 60 s and exposes the remaining address
-/// budget as a metric.
+/// also polls `userRateLimit` every 60 s, in a detached task, and exposes the
+/// remaining address budget as a metric.
 pub(crate) async fn deadman(
     exchange: Arc<dyn ExchangeApi>,
     info: Arc<dyn InfoApi>,
@@ -344,18 +372,12 @@ pub(crate) async fn deadman(
             _ = shutdown_signal() => break,
             _ = rate.tick() => {
                 if let Some(address) = &address {
-                    match info.user_rate_limit(address).await {
-                        Ok(budget) => {
-                            metrics::gauge!(
-                                hl_arb_metrics::names::RATE_BUDGET_REMAINING,
-                                "kind" => "address",
-                            )
-                            .set(budget.remaining() as f64);
-                        }
-                        Err(err) => {
-                            tracing::debug!(error = %err, "userRateLimit poll failed");
-                        }
-                    }
+                    // Detached so a hung poll cannot block the refresh arm.
+                    tokio::spawn(poll_rate_limit(
+                        info.clone(),
+                        address.clone(),
+                        RATE_LIMIT_POLL_TIMEOUT,
+                    ));
                 }
             }
             _ = tick.tick() => {
@@ -597,5 +619,36 @@ pub(crate) async fn heartbeat() {
         metrics::gauge!(hl_arb_metrics::names::UPTIME_SECONDS).set(uptime as f64);
         metrics::counter!(hl_arb_metrics::names::HEARTBEATS).increment(1);
         tracing::debug!(uptime_seconds = uptime, "heartbeat");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn rate_limit_poll_is_time_bounded() {
+        // A black-holed `userRateLimit` must resolve within the injected
+        // timeout, so the dead-man refresh arm keeps its cadence (SEC-001).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let info: Arc<dyn InfoApi> = Arc::new(HttpInfo::with_base_url_and_timeout(
+            format!("http://{addr}"),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+        ));
+
+        let started = Instant::now();
+        poll_rate_limit(info, "0xabc".to_string(), Duration::from_millis(100)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the poll must be time-bounded, took {:?}",
+            started.elapsed()
+        );
     }
 }

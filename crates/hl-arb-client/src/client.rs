@@ -1,5 +1,7 @@
 //! REST `/info` client (SPEC-0001 §4, §9).
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use hl_arb_core::{
     config::Network,
@@ -65,7 +67,7 @@ impl HttpInfo {
     /// Create a client for the given network.
     pub fn new(network: Network) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::exchange::http_client(),
             base_url: network.rest_url().to_string(),
         }
     }
@@ -73,7 +75,21 @@ impl HttpInfo {
     /// Create a client against an explicit base URL (used in tests).
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::exchange::http_client(),
+            base_url: base_url.into(),
+        }
+    }
+
+    /// Create a client against an explicit base URL with explicit connect and
+    /// total request timeouts (used in tests that prove a black-holed server
+    /// cannot hang a read; SEC-001).
+    pub fn with_base_url_and_timeout(
+        base_url: impl Into<String>,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Self {
+        Self {
+            client: crate::exchange::http_client_with(connect_timeout, request_timeout),
             base_url: base_url.into(),
         }
     }
@@ -87,7 +103,13 @@ impl HttpInfo {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    Error::Http(format!("request timed out: {e}"))
+                } else {
+                    Error::Http(e.to_string())
+                }
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -373,6 +395,33 @@ mod tests {
             .await;
         let client = HttpInfo::with_base_url(server.uri());
         assert!(client.all_mids().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_black_holed_server_times_out_fast() {
+        // A server that accepts the TCP connection but never replies must not
+        // hang a read: the shared client's total timeout bounds it (SEC-001).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let client = HttpInfo::with_base_url_and_timeout(
+            format!("http://{addr}"),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+        );
+        let started = std::time::Instant::now();
+        let err = client.all_mids().await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a black-holed read must time out fast, took {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(err, Error::Http(_)), "got {err:?}");
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[tokio::test]

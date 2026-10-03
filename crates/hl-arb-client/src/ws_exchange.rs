@@ -45,6 +45,9 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub const MAX_IN_FLIGHT: usize = 100;
 /// Default per-request reply timeout (SPEC-0002 H-1).
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum time to complete the exec WebSocket handshake before a dial is
+/// abandoned with a typed error (PERF-004/SEC-001).
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// Application keepalive ping interval.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -89,9 +92,15 @@ pub struct WsExchange {
     url: String,
     core: WriteCore,
     connection: tokio::sync::Mutex<Option<Connection>>,
+    /// Serializes dials so concurrent first callers share one handshake
+    /// instead of opening a socket each. Never held together with
+    /// `connection`, and only on the (cold) dial path.
+    dialing: tokio::sync::Mutex<()>,
     next_id: AtomicU64,
     in_flight: Arc<Semaphore>,
     request_timeout: Duration,
+    /// Handshake deadline for this client's dials (shortened in tests).
+    dial_timeout: Duration,
     /// Cached `hl_submit_ack_seconds{transport="ws"}` handle (SPEC-0002 H-7).
     submit_histogram: metrics::Histogram,
     /// Cached `hl_tick_to_order_seconds` handle, handed to the socket task
@@ -136,9 +145,11 @@ impl WsExchange {
             url: url.into(),
             core: WriteCore::new(mode, signer)?,
             connection: tokio::sync::Mutex::new(None),
+            dialing: tokio::sync::Mutex::new(()),
             next_id: AtomicU64::new(1),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            dial_timeout: DIAL_TIMEOUT,
             submit_histogram: metrics::histogram!(
                 hl_arb_metrics::names::SUBMIT_ACK_SECONDS,
                 "transport" => "ws"
@@ -158,6 +169,13 @@ impl WsExchange {
     /// Override the per-request timeout (default 5 s).
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Override the handshake timeout (tests use a shorter one).
+    #[cfg(test)]
+    fn with_dial_timeout(mut self, timeout: Duration) -> Self {
+        self.dial_timeout = timeout;
         self
     }
 
@@ -204,19 +222,14 @@ impl WsExchange {
         self.core.heal_nonce().await
     }
 
-    async fn dial(url: &str) -> Result<Socket> {
+    async fn dial(url: &str, timeout: Duration) -> Result<Socket> {
         ensure_crypto_provider();
-        let (socket, _resp) = connect_async(url)
+        let (socket, _resp) = tokio::time::timeout(timeout, connect_async(url))
             .await
+            .map_err(|_| Error::NotSent(format!("websocket dial timed out after {timeout:?}")))?
             .map_err(|e| Error::NotSent(format!("websocket dial failed: {e}")))?;
         set_tcp_nodelay(socket.get_ref())?;
         Ok(socket)
-    }
-
-    /// Open the exec connection now if it is not already open (SPEC-0010 §12:
-    /// connections are warmed at startup, never on demand). Does nothing else.
-    pub async fn warm(&self) -> Result<()> {
-        self.ensure_connection().await.map(|_| ())
     }
 
     /// Whether a live connection is currently held, without blocking on a dial
@@ -224,33 +237,77 @@ impl WsExchange {
     pub fn is_connected(&self) -> bool {
         self.connection
             .try_lock()
-            .map(|guard| guard.is_some())
+            .map(|guard| guard.as_ref().is_some_and(|conn| !conn.tx.is_closed()))
             .unwrap_or(false)
     }
 
-    /// Return the outbound sender, dialing and spawning the connection task on
-    /// first use. Shared by [`Self::warm`] and [`Self::register_pending`].
-    async fn ensure_connection(&self) -> Result<mpsc::Sender<Outbound>> {
-        let mut guard = self.connection.lock().await;
-        if guard.is_none() {
-            let socket = Self::dial(&self.url).await?;
-            let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-            let (send_tx, rx) = mpsc::channel::<Outbound>(MAX_IN_FLIGHT);
-            let task = tokio::spawn(Self::connection_task(
-                socket,
-                rx,
-                pending.clone(),
-                self.tick_to_order.clone(),
-                self.tick_skipped_unset.clone(),
-                self.tick_skipped_clock.clone(),
-            ));
-            *guard = Some(Connection {
-                tx: send_tx,
-                pending,
-                task,
-            });
+    /// Return the outbound sender and pending map, dialing and spawning the
+    /// connection task when there is none.
+    ///
+    /// The connection mutex is **not** held across the dial: the lock is taken
+    /// only to check the current connection, dropped, and retaken to install
+    /// the new one. A separate `dialing` mutex serializes the dials so a burst
+    /// of first callers shares one handshake instead of opening a socket each.
+    /// If another task installed a connection while this dial was in flight,
+    /// the existing one wins and the freshly dialed socket is dropped (its
+    /// task aborted). A connection whose writer channel is closed is known
+    /// dead and is replaced, so the transport redials after a socket loss
+    /// instead of reusing a dead one (PERF-005).
+    async fn ensure_connection(&self) -> Result<(mpsc::Sender<Outbound>, PendingMap)> {
+        if let Some(existing) = self.live_connection().await {
+            return Ok(existing);
         }
-        Ok(guard.as_ref().expect("connection present").tx.clone())
+
+        // One dial at a time: concurrent callers wait and then reuse the
+        // connection the winner installed.
+        let _dialing = self.dialing.lock().await;
+        if let Some(existing) = self.live_connection().await {
+            return Ok(existing);
+        }
+
+        let socket = Self::dial(&self.url, self.dial_timeout).await?;
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (send_tx, rx) = mpsc::channel::<Outbound>(MAX_IN_FLIGHT);
+        let task = tokio::spawn(Self::connection_task(
+            socket,
+            rx,
+            pending.clone(),
+            self.tick_to_order.clone(),
+            self.tick_skipped_unset.clone(),
+            self.tick_skipped_clock.clone(),
+        ));
+
+        let mut guard = self.connection.lock().await;
+        if let Some(conn) = guard.as_ref() {
+            if !conn.tx.is_closed() {
+                // Another task won the race: keep the existing connection and
+                // discard the one dialed here.
+                task.abort();
+                return Ok((conn.tx.clone(), conn.pending.clone()));
+            }
+            *guard = None;
+        }
+        let tx = send_tx.clone();
+        *guard = Some(Connection {
+            tx: send_tx,
+            pending: pending.clone(),
+            task,
+        });
+        Ok((tx, pending))
+    }
+
+    /// The current live connection's sender and pending map, or `None` when
+    /// there is no connection or the socket is known dead.
+    async fn live_connection(&self) -> Option<(mpsc::Sender<Outbound>, PendingMap)> {
+        let mut guard = self.connection.lock().await;
+        if let Some(conn) = guard.as_ref() {
+            if !conn.tx.is_closed() {
+                return Some((conn.tx.clone(), conn.pending.clone()));
+            }
+            // Known dead: drop it (aborting its task) and let the caller dial.
+            *guard = None;
+        }
+        None
     }
 
     /// Serialize and enqueue `request`, returning the reply waiter.
@@ -380,18 +437,11 @@ impl WsExchange {
         id: u64,
         tx: oneshot::Sender<Option<Reply>>,
     ) -> Result<(mpsc::Sender<Outbound>, PendingMap)> {
-        let send_tx = self.ensure_connection().await?;
-        let guard = self.connection.lock().await;
-        if let Some(conn) = guard.as_ref() {
-            conn.pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(id, tx);
-        }
-        let pending = guard
-            .as_ref()
-            .map(|conn| conn.pending.clone())
-            .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+        let (send_tx, pending) = self.ensure_connection().await?;
+        pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, tx);
         Ok((send_tx, pending))
     }
 
@@ -511,6 +561,12 @@ impl ExchangeApi for WsExchange {
     async fn enqueue_timed(&self, action: &Action, recv_mono_ns: u64) -> Result<ReplyHandle> {
         self.enqueue_split_timed(action, recv_mono_ns).await
     }
+
+    /// Open the exec connection now if it is not already open (SPEC-0010 §12:
+    /// connections are warmed at startup, never on demand).
+    async fn warm(&self) -> Result<()> {
+        self.ensure_connection().await.map(|_| ())
+    }
 }
 
 #[cfg(test)]
@@ -597,6 +653,101 @@ mod tests {
                     .to_string();
                     ws.send(Message::Text(frame.into())).await.unwrap();
                 }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// A mock venue that accepts any number of connections, delays each
+    /// handshake by `delay` after the TCP accept, then answers posts. Used to
+    /// prove a slow dial does not hold the connection lock or block a
+    /// concurrent send.
+    async fn slow_handshake_multi_venue(delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let Ok(mut ws) = accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let Ok(request) = serde_json::from_str::<Value>(&text) else {
+                            continue;
+                        };
+                        let Some(id) = request["id"].as_u64() else {
+                            continue;
+                        };
+                        let frame = json!({
+                            "channel": "post",
+                            "data": {
+                                "id": id,
+                                "response": {
+                                    "type": "action",
+                                    "payload": {"status": "ok", "response": {"n": 1}},
+                                },
+                            },
+                        })
+                        .to_string();
+                        if ws.send(Message::Text(frame.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// A mock venue that answers one post on its first connection, then drops
+    /// it; a second connection serves posts normally. Used to prove the client
+    /// redials after a socket loss.
+    async fn dropping_venue() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // First connection: answer one post, then close.
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(stream).await.unwrap();
+                if let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let id = request["id"].as_u64().unwrap();
+                    let frame = json!({
+                        "channel": "post",
+                        "data": {
+                            "id": id,
+                            "response": {
+                                "type": "action",
+                                "payload": {"status": "ok", "response": {"n": 1}},
+                            },
+                        },
+                    })
+                    .to_string();
+                    ws.send(Message::Text(frame.into())).await.unwrap();
+                }
+                ws.close(None).await.unwrap();
+                drop(ws);
+            }
+            // Second connection: serve posts normally.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let id = request["id"].as_u64().unwrap();
+                let frame = json!({
+                    "channel": "post",
+                    "data": {
+                        "id": id,
+                        "response": {
+                            "type": "action",
+                            "payload": {"status": "ok", "response": {"n": 1}},
+                        },
+                    },
+                })
+                .to_string();
+                ws.send(Message::Text(frame.into())).await.unwrap();
             }
         });
         format!("ws://{addr}")
@@ -955,6 +1106,92 @@ mod tests {
             Err(_) => panic!("warm hung instead of failing fast"),
         }
         assert!(!exchange.is_connected());
+    }
+
+    #[tokio::test]
+    async fn dial_times_out_on_a_stalled_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept TCP but never complete the WebSocket handshake.
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        });
+
+        let exchange = WsExchange::with_url(format!("ws://{addr}"), Mode::Live, Some(signer()))
+            .unwrap()
+            .with_dial_timeout(Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        match exchange.warm().await {
+            Err(Error::NotSent(message)) => assert!(message.contains("timed out"), "{message}"),
+            other => panic!("expected a typed dial timeout, got {other:?}"),
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a stalled handshake must fail fast, took {:?}",
+            start.elapsed()
+        );
+        assert!(!exchange.is_connected());
+    }
+
+    #[tokio::test]
+    async fn slow_dial_does_not_hold_the_connection_lock() {
+        let url = slow_handshake_multi_venue(Duration::from_millis(300)).await;
+        let exchange = Arc::new(
+            WsExchange::with_url(url, Mode::Live, Some(signer()))
+                .unwrap()
+                .with_dial_timeout(Duration::from_secs(5)),
+        );
+
+        let warm = {
+            let exchange = exchange.clone();
+            tokio::spawn(async move { exchange.warm().await })
+        };
+        // The slow handshake is now in flight: the connection lock must be
+        // free, because it is only taken to check/install, never across the
+        // dial (PERF-004/SEC-001).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            exchange.connection.try_lock().is_ok(),
+            "the dial must not hold the connection lock"
+        );
+
+        // A concurrent send must still make progress while the slow dial runs.
+        assert!(
+            exchange.submit(&action()).await.is_ok(),
+            "a concurrent send must not be blocked by a slow dial"
+        );
+        assert!(warm.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn redials_after_the_socket_dies() {
+        let url = dropping_venue().await;
+        let exchange = WsExchange::with_url(url, Mode::Live, Some(signer()))
+            .unwrap()
+            .with_request_timeout(Duration::from_millis(200));
+        // The first post lands on the first connection.
+        exchange.submit(&action()).await.unwrap();
+
+        // The server drops that connection. Once the client observes the
+        // close, the next call must re-establish the socket and succeed
+        // (PERF-005). Retry because the close may not be observed until the
+        // in-flight request resolves.
+        let mut ok = false;
+        for _ in 0..20 {
+            match exchange.submit(&action()).await {
+                Ok(_) => {
+                    ok = true;
+                    break;
+                }
+                Err(Error::UnknownOutcome(_)) | Err(Error::NotSent(_)) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(other) => panic!("unexpected error while redialing: {other:?}"),
+            }
+        }
+        assert!(ok, "WsExchange must redial after the socket dies");
     }
 
     #[tokio::test]

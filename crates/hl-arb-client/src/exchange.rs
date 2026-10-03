@@ -7,6 +7,8 @@
 //! module owns the shared signed-envelope/response types and the [`WriteCore`]
 //! (gating, signing, nonce sequencing) both transports build on.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 
 use hl_arb_core::error::Result;
@@ -23,6 +25,31 @@ pub use response::{
     STATUS_ERR, STATUS_OK, parse_post_reply,
 };
 pub use write_core::WriteCore;
+
+/// Connect timeout for every HTTP client in this crate: a dial that cannot open
+/// a TCP connection within this bound fails with a typed error (SEC-001).
+pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Total request timeout for every HTTP client in this crate: a server that
+/// accepts but never replies cannot hang a caller (SEC-001).
+pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Build the shared `reqwest` client used by every HTTP call in this crate.
+///
+/// Both timeouts are bounded, so a black-holed endpoint fails with a typed
+/// error instead of hanging. Tests use [`http_client_with`] to shorten them.
+pub fn http_client_with(connect_timeout: Duration, request_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()
+        .expect("constructing the shared HTTP client")
+}
+
+/// The shared HTTP client with the production timeouts
+/// ([`HTTP_CONNECT_TIMEOUT`], [`HTTP_REQUEST_TIMEOUT`]).
+pub fn http_client() -> reqwest::Client {
+    http_client_with(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)
+}
 /// Write API for HyperCore actions (SPEC-0002 §8).
 ///
 /// [`submit`](Self::submit) is the single primitive: every transport signs and
@@ -86,6 +113,16 @@ pub trait ExchangeApi: Send + Sync {
             leverage,
         })
         .await
+    }
+
+    /// Eagerly establish the transport before the first order (SPEC-0010 §12:
+    /// connections are warmed at startup, never dialed on the order hot path).
+    ///
+    /// The default is a no-op: REST has no persistent connection. WebSocket
+    /// transports dial here, so a cold connection is not paid for out of the
+    /// first order's latency budget.
+    async fn warm(&self) -> Result<()> {
+        Ok(())
     }
 }
 
