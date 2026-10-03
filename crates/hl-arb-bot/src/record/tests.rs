@@ -3,6 +3,14 @@
 //! Kept in a sibling file so `record.rs` stays within the size budget; the
 //! module path is still `record::tests`.
 
+use super::clock::*;
+use super::config::*;
+use super::connection::*;
+use super::inspect::*;
+use super::monitor::*;
+use super::probe::*;
+use super::runner::*;
+use super::sources::*;
 use super::*;
 use hl_arb_recorder::{MountProbe, Subscription};
 use tokio::net::TcpListener;
