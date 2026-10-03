@@ -222,9 +222,14 @@ pub fn max_price_decimals(market: &Market) -> u32 {
     base.saturating_sub(market.sz_decimals)
 }
 
-/// Round a size to the market's `szDecimals`.
+/// Round a size to the market's `szDecimals`, always toward zero.
+///
+/// Rounding is never upward, so the size that reaches the wire is at most the
+/// size risk approved: rounding cannot push an order over an approved notional
+/// or exposure cap, nor can it overshoot the requested size (SPEC-0002 §6,
+/// PERF-003).
 pub fn round_size(market: &Market, size: Decimal) -> Decimal {
-    size.round_dp_with_strategy(market.sz_decimals, RoundingStrategy::MidpointAwayFromZero)
+    size.round_dp_with_strategy(market.sz_decimals, RoundingStrategy::ToZero)
         .normalize()
 }
 
@@ -246,6 +251,30 @@ pub fn round_price_aggressive(market: &Market, price: Decimal, is_buy: bool) -> 
         RoundingStrategy::ToNegativeInfinity
     };
     round_price_with(market, price, strategy)
+}
+
+/// Round a price **away from the cross** for a passive, post-only order.
+///
+/// A maker buy rounds **down** and a maker sell **up**, so rounding can never
+/// move the limit across the spread and turn a post-only order into a taker
+/// (PERF-003). The result still obeys the significant-figure and decimal caps.
+pub fn round_price_passive(market: &Market, price: Decimal, is_buy: bool) -> Decimal {
+    let strategy = if is_buy {
+        RoundingStrategy::ToNegativeInfinity
+    } else {
+        RoundingStrategy::ToPositiveInfinity
+    };
+    round_price_with(market, price, strategy)
+}
+
+/// Round a price for an order's time in force: passive (away from the cross)
+/// for post-only `Alo`, midpoint otherwise.
+pub fn round_price_for_tif(market: &Market, price: Decimal, is_buy: bool, tif: Tif) -> Decimal {
+    if tif == Tif::Alo {
+        round_price_passive(market, price, is_buy)
+    } else {
+        round_price(market, price)
+    }
 }
 
 /// Round a price with an explicit [`RoundingStrategy`].
@@ -270,7 +299,7 @@ pub fn build_order_wire(market: &Market, params: &OrderParams) -> Result<OrderWi
         return Err(Error::Config("order size must be positive".into()));
     }
 
-    let price = round_price(market, params.limit_px);
+    let price = round_price_for_tif(market, params.limit_px, params.is_buy, params.tif);
     let size = round_size(market, params.size);
     if price <= Decimal::ZERO {
         return Err(Error::Config("limit price rounds to zero".into()));
@@ -376,10 +405,40 @@ mod tests {
     }
 
     #[test]
-    fn size_rounds_to_sz_decimals() {
+    fn size_rounds_to_sz_decimals_toward_zero() {
         let market = btc();
-        assert_eq!(round_size(&market, dec("0.123456789")), dec("0.12346"));
+        // Toward zero: 0.123456789 -> 0.12345, never up to 0.12346.
+        assert_eq!(round_size(&market, dec("0.123456789")), dec("0.12345"));
         assert_eq!(round_size(&market, dec("1.20000")), dec("1.2"));
+        // The whole part is untouched because it is already on the lot.
+        assert_eq!(round_size(&market, dec("1.999999")), dec("1.99999"));
+    }
+
+    /// The sent size never exceeds the requested size, for every lot size.
+    #[test]
+    fn size_rounding_never_rounds_up() {
+        for sz_decimals in 0..=5u32 {
+            let market = market(sz_decimals);
+            let mut size = dec("0.000001");
+            for _ in 0..5_000 {
+                let rounded = round_size(&market, size);
+                assert!(
+                    rounded <= size,
+                    "sz_decimals={sz_decimals}: {size} rounded up to {rounded}"
+                );
+                size *= dec("1.37");
+                if size > dec("1000000") {
+                    size = dec("0.000001");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sz_decimals_zero_truncates_fraction() {
+        let market = market(0);
+        assert_eq!(round_size(&market, dec("1.9")), dec("1"));
+        assert_eq!(round_size(&market, dec("0.9")), Decimal::ZERO);
     }
 
     #[test]
@@ -474,7 +533,7 @@ mod tests {
         assert_eq!(wire.a, 0);
         assert!(!wire.b);
         assert_eq!(wire.p, "61001");
-        assert_eq!(wire.s, "0.12346");
+        assert_eq!(wire.s, "0.12345");
         assert!(wire.r);
         assert_eq!(wire.t, OrderType::limit(Tif::Alo));
         assert_eq!(
@@ -506,6 +565,51 @@ mod tests {
         }
         assert!(buy.scale() <= max_price_decimals(&capped));
         assert!(sell.scale() <= max_price_decimals(&capped));
+    }
+
+    #[test]
+    fn passive_rounding_moves_away_from_the_cross() {
+        let five_figs = market(0);
+        let raw = dec("12345.678");
+        let buy = round_price_passive(&five_figs, raw, true);
+        let sell = round_price_passive(&five_figs, raw, false);
+        assert!(buy <= raw, "passive buy {buy} rounded up above {raw}");
+        assert!(sell >= raw, "passive sell {sell} rounded down below {raw}");
+        assert_eq!(buy, dec("12345"));
+        assert_eq!(sell, dec("12346"));
+
+        // The decimal cap rounds in the same, safe direction.
+        let capped = market(5); // perp: max 1 decimal place
+        let raw = dec("1234.5678");
+        assert!(round_price_passive(&capped, raw, true) <= raw);
+        assert!(round_price_passive(&capped, raw, false) >= raw);
+    }
+
+    #[test]
+    fn post_only_orders_use_passive_price_rounding() {
+        let market = market(0);
+        let params = |is_buy: bool| OrderParams {
+            is_buy,
+            size: dec("1"),
+            limit_px: dec("12345.678"),
+            tif: Tif::Alo,
+            reduce_only: false,
+            cloid: None,
+        };
+        // A post-only buy must not round up across the ask.
+        assert_eq!(build_order_wire(&market, &params(true)).unwrap().p, "12345");
+        // A post-only sell must not round down across the bid.
+        assert_eq!(
+            build_order_wire(&market, &params(false)).unwrap().p,
+            "12346"
+        );
+
+        // Non-post-only orders keep the midpoint rule.
+        let ioc = OrderParams {
+            tif: Tif::Ioc,
+            ..params(true)
+        };
+        assert_eq!(build_order_wire(&market, &ioc).unwrap().p, "12346");
     }
 
     /// Rounded values always satisfy the venue's sig-fig / decimal / lot rules.

@@ -12,10 +12,10 @@
 //! the freshest touch with the §12 rule and rounded in the safe direction by
 //! [`hl_arb_client::round_price_aggressive`], never to the mid.
 
+use hl_arb_client::order::round_price_for_tif;
 use hl_arb_client::{
     Action as VenueAction, AssetMap, CancelByCloidWire, Grouping, MIN_ORDER_NOTIONAL, Market,
-    MarketSelector, OrderParams, OrderWire, build_order_wire, round_price, round_price_aggressive,
-    round_size,
+    MarketSelector, OrderParams, OrderWire, build_order_wire, round_price_aggressive, round_size,
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 use smallvec::SmallVec;
@@ -322,7 +322,11 @@ fn build_place(
         }
     };
 
-    let rounded_px = round_price(market, limit_px);
+    let tif: hl_arb_client::Tif = intent.tif.into();
+    // Use the same rounding the wire builder will apply, so the min-notional
+    // check matches the price actually sent. Post-only orders round away from
+    // the cross and never become marketable by rounding (PERF-003).
+    let rounded_px = round_price_for_tif(market, limit_px, is_buy, tif);
     if rounded_px <= Decimal::ZERO {
         return Err((cloid, DropReason::BadSize));
     }
@@ -334,7 +338,7 @@ fn build_place(
         is_buy,
         size,
         limit_px,
-        tif: intent.tif.into(),
+        tif,
         reduce_only: intent.reduce_only,
         cloid: Some(cloid.to_hex()),
     };
@@ -706,5 +710,90 @@ mod tests {
             panic!("expected order post");
         };
         Decimal::from_str(&orders[0].p).unwrap()
+    }
+
+    /// The wire size of the single order in a batch.
+    fn order_size(batch: &BuiltBatch) -> Decimal {
+        assert_eq!(batch.posts.len(), 1, "{:?}", batch.dropped);
+        let VenueAction::Order { orders, .. } = &batch.posts[0].action else {
+            panic!("expected order post");
+        };
+        Decimal::from_str(&orders[0].s).unwrap()
+    }
+
+    #[test]
+    fn sent_size_never_exceeds_requested_for_any_lot() {
+        for sz_decimals in 0..=5u32 {
+            let registry = registry();
+            let table = table(sz_decimals);
+            let orders = OrderManager::new(1);
+            let wanted = ds("1.9");
+            let actions = vec![Action::Place(intent(Side::Buy, Some(ds("100")), wanted))];
+            let mut req_ids = ReqIds::new();
+            let batch = plan_iteration(
+                &actions,
+                &registry,
+                &table,
+                &orders,
+                &CloidAssigner::new(),
+                &touch(),
+                ds("10"),
+                &mut req_ids,
+            );
+            let sent = order_size(&batch);
+            assert!(
+                sent <= wanted,
+                "sz_decimals={sz_decimals}: sent {sent} > requested {wanted}"
+            );
+            if sz_decimals == 0 {
+                assert_eq!(sent, Decimal::ONE, "1.9 at szDecimals=0 must send 1");
+            }
+        }
+    }
+
+    #[test]
+    fn size_rounding_to_zero_is_dropped() {
+        let registry = registry();
+        let table = table(0);
+        let orders = OrderManager::new(1);
+        // 0.9 rounds to 0 at szDecimals=0; it must be dropped, not sent.
+        let actions = vec![Action::Place(intent(Side::Buy, Some(ds("100")), ds("0.9")))];
+        let mut req_ids = ReqIds::new();
+        let batch = plan_iteration(
+            &actions,
+            &registry,
+            &table,
+            &orders,
+            &CloidAssigner::new(),
+            &touch(),
+            ds("10"),
+            &mut req_ids,
+        );
+        assert!(batch.posts.is_empty());
+        assert_eq!(batch.dropped.len(), 1);
+        assert_eq!(batch.dropped[0].1, DropReason::BadSize);
+    }
+
+    #[test]
+    fn post_only_place_rounds_price_away_from_the_cross() {
+        let registry = registry();
+        let table = table(0);
+        let orders = OrderManager::new(1);
+        let mut buy = intent(Side::Buy, Some(ds("12345.678")), ds("1"));
+        buy.tif = TimeInForce::Alo;
+        let actions = vec![Action::Place(buy)];
+        let mut req_ids = ReqIds::new();
+        let batch = plan_iteration(
+            &actions,
+            &registry,
+            &table,
+            &orders,
+            &CloidAssigner::new(),
+            &touch(),
+            ds("10"),
+            &mut req_ids,
+        );
+        // A post-only buy rounds down (away from the ask), never up to 12346.
+        assert_eq!(order_price(&batch), ds("12345"));
     }
 }

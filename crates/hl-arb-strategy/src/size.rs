@@ -44,9 +44,12 @@ impl Sizer {
         notional / px
     }
 
-    /// Round a size down to the market's `sz_decimals` and normalize.
+    /// Round a size to the market's `sz_decimals` toward zero and normalize.
+    ///
+    /// Never rounds up, so the sized order can never exceed the requested size
+    /// (PERF-003).
     pub fn round(&self, size: Decimal, sz_decimals: u32) -> Decimal {
-        size.round_dp_with_strategy(sz_decimals, RoundingStrategy::MidpointAwayFromZero)
+        size.round_dp_with_strategy(sz_decimals, RoundingStrategy::ToZero)
             .normalize()
     }
 
@@ -137,5 +140,33 @@ mod tests {
         let sizer = Sizer::default();
         // 0.0001 rounds to 0.000 at 3 decimals.
         assert!(sizer.clamp(ds("0.0001"), Decimal::from(1000), 3).is_none());
+    }
+
+    #[test]
+    fn round_truncates_toward_zero() {
+        let sizer = Sizer::default();
+        assert_eq!(sizer.round(ds("1.9"), 0), ds("1"));
+        assert_eq!(sizer.round(ds("0.129"), 2), ds("0.12"));
+    }
+
+    /// The clamped size never exceeds the requested size, for every lot size.
+    #[test]
+    fn clamp_never_exceeds_requested_size() {
+        let sizer = Sizer::new(Decimal::ZERO, None);
+        for sz_decimals in 0..=5u32 {
+            let mut desired = ds("0.000001");
+            for _ in 0..5_000 {
+                if let Some(size) = sizer.clamp(desired, Decimal::from(100), sz_decimals) {
+                    assert!(
+                        size <= desired,
+                        "sz_decimals={sz_decimals}: {desired} -> {size} rounded up"
+                    );
+                }
+                desired *= ds("1.37");
+                if desired > ds("1000000") {
+                    desired = ds("0.000001");
+                }
+            }
+        }
     }
 }
