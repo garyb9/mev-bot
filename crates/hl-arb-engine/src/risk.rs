@@ -74,6 +74,9 @@ pub enum RiskReason {
     UnknownCloid,
     /// Multi-leg groups are not implemented yet (SPEC-0011).
     GroupUnsupported,
+    /// An action kind that must be handled before the increasing checks reached
+    /// them (a defensive guard; cancels are handled by the caller first).
+    UnhandledAction,
 }
 
 impl std::fmt::Display for RiskReason {
@@ -92,6 +95,7 @@ impl std::fmt::Display for RiskReason {
             RiskReason::TickInvalid => f.write_str("price not aligned to tick"),
             RiskReason::UnknownCloid => f.write_str("unknown cloid"),
             RiskReason::GroupUnsupported => f.write_str("multi-leg groups unsupported"),
+            RiskReason::UnhandledAction => f.write_str("unhandled action kind"),
         }
     }
 }
@@ -501,6 +505,16 @@ impl RiskGate {
             ));
         }
 
+        self.evaluate_action(action, ctx)
+    }
+
+    /// The non-cancel half of [`Self::evaluate`], extracted so the defensive
+    /// cancel arm is directly testable (PERF-014).
+    ///
+    /// Cancels are handled (and approved) before this is reached; a cancel here
+    /// is a routing error and is rejected with a typed reason rather than
+    /// panicking.
+    fn evaluate_action(&self, action: &Action, ctx: &RiskCtx<'_>) -> Result<Decision, RiskReason> {
         match action {
             Action::Place(intent) => self.check_increasing(
                 ctx.coin,
@@ -517,7 +531,7 @@ impl RiskGate {
                 self.check_increasing(ctx.coin, reduce_only, Some(*px), *sz, ctx)
             }
             Action::PlaceGroup(_) => Err(RiskReason::GroupUnsupported),
-            Action::Cancel { .. } => unreachable!("handled above"),
+            Action::Cancel { .. } => Err(RiskReason::UnhandledAction),
         }
     }
 
@@ -1001,6 +1015,29 @@ mod tests {
         assert_eq!(
             gate.evaluate(&Action::Cancel { cloid: c }, &ctx),
             Ok(Decision::Approve)
+        );
+    }
+
+    #[test]
+    fn cancel_reaching_increasing_checks_is_a_typed_error_not_a_panic() {
+        // The public API handles cancels before `evaluate_action`, so call the
+        // extracted helper directly to prove the old `unreachable!` is gone
+        // (PERF-014).
+        let orders = OrderManager::new(1);
+        let acct = account("0", "1000", "0");
+        let slot = slot();
+        let meta = asset_meta();
+        let budget = huge_budget();
+        let gate = generous_gate();
+        let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+        assert_eq!(
+            gate.evaluate_action(
+                &Action::Cancel {
+                    cloid: nth_cloid(1)
+                },
+                &ctx
+            ),
+            Err(RiskReason::UnhandledAction)
         );
     }
 
