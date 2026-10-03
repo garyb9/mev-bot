@@ -6,6 +6,8 @@ for the full design.
 > Current status: the v2 event-driven engine (`EngineLoop`) is wired into `hl`.
 > Some procedures reference SPEC-0004 components that are not wired yet; those
 > are marked _(pending)_.
+>
+> Last verified at commit `ac04f0a` (2026-10-03).
 
 ## Start / stop / restart
 
@@ -78,16 +80,18 @@ reuse a nonce.
   `POST /exchange` (`HttpExchange`) is the fallback. Both share the same signed
   envelope, nonce state, and SQLite high-water mark.
 - In `live`, `scheduleCancel` is armed on start with TTL
-  `HL_SCHEDULE_CANCEL_TTL_MS` (default 30s). A 1 s task checks the engine's
-  resting-order count and refreshes the switch once less than half the TTL
-  remains. A crash, stall, or loss of connectivity therefore cancels resting
+  `HL_SCHEDULE_CANCEL_TTL_MS` (default 120000 ms, i.e. 2 min; also
+  `schedule_cancel_ttl_ms` in `config/default.toml`). A 1 s task checks the
+  engine's resting-order count and refreshes the switch once less than half the
+  TTL remains. A crash, stall, or loss of connectivity therefore cancels resting
   orders after the TTL. Graceful shutdown disarms it explicitly.
 - Watch `hl_deadman_armed` (1 while armed), `hl_deadman_refreshes_total`, and
   `hl_deadman_failures_total`. Failure to refresh within the window is an alert.
 
 > Open item: the live testnet round-trip (place a far-from-mid ALO order,
-> confirm in `openOrders`, cancel) is wired but not yet exercised — it needs a
-> funded, agent-approved testnet account.
+> confirm in `openOrders`, cancel; SPEC-0002 H-10) is wired but not yet
+> exercised — it needs a funded, agent-approved testnet account. The harness is
+> `hl probe testnet-roundtrip` (testnet only; never run against mainnet).
 
 ## Go live (checklist)
 
@@ -107,9 +111,9 @@ reuse a nonce.
 - **Expected action:** cancel all working orders + halt new risk. Flattening is
   opt-in.
 - **Clear (two-key):** remove the flag file (`hl resume`) **and** send `SIGUSR2`
-  to the running process to clear the sticky in-process flag. Today `SIGUSR2`
-  resumes even while the file exists (the next poll re-trips); the two-key check
-  is task E of `docs/briefs/2026-09-27-post-e13-review-fixes.md`.
+  to the running process to clear the sticky in-process flag. `SIGUSR2` is
+  ignored while the flag file still exists (it resumes only once the file is
+  gone), so both keys are required.
 - **Verify:** open orders go to zero; `/healthz` reflects halt; logs record the
   trip.
 
@@ -181,12 +185,15 @@ cargo run -p hl-arb-bot -- replay
 
 # Replay a specific session id
 cargo run -p hl-arb-bot -- replay --session 12 --db data/hlbot.db
+
+# Replay recorder segments through the v2 engine (SPEC-0010 E-7, SPEC-0008 R-7)
+cargo run -p hl-arb-bot -- replay --from 2026-09-30 --to 2026-09-30 --rec-dir data/rec
 ```
 
 Identical logs must yield an identical fingerprint; a change means the strategy
 is non-deterministic (a bug — see SPEC-0003 §10). Replay never dials the network.
-The v2 replay driver that records `Timer`/`Fill` so new sessions replay is
-SPEC-0010 E-7 part 2 (blocked on SPEC-0008 R-7).
+The v2 segment replay (E-7) and the segment reader (R-7) are both done; the
+legacy SQLite-session path above remains for old sessions.
 
 ## Recorder (market data, SPEC-0008)
 
@@ -203,8 +210,9 @@ hl record
 hl record --network testnet
 hl record --profile default
 
-# Print the resolved subscription plan and exit; opens no recording sockets.
-# Use it to prove the plan stays within the HL WS limits (SPEC-0008 §7.4).
+# Print the resolved subscription plan and exit. It fetches public market
+# metadata over the network to resolve the universe, but opens no recording
+# sockets. Use it to prove the plan stays within the HL WS limits (SPEC-0008 §7.4).
 hl record plan
 
 # Stop gracefully: emits `gap_start{shutdown}` on every connection, finalizes
@@ -267,10 +275,11 @@ Symptom: local positions/orders differ from the exchange. Action:
 
 1. A background REST task refreshes the account snapshot every 30 s and feeds it
    to the engine through the account channel (SPEC-0010 §15).
-2. In `hl` today that `AccountUpdate::Reconcile` carries only
-   `account_value`/`margin_used`; position and order-state drift is not yet
-   applied until the H-3 account stream is wired (SPEC-0010 E-13 remaining).
-   Treat position/order drift as a manual intervention until it lands.
+2. Own orders and fills are driven by the lossless account stream
+   (`orderUpdates`, `userFills`, `userEvents`), not the REST snapshot, which is
+   only a 30 s backstop (SPEC-0010 E-8). Position state is refreshed from the
+   REST snapshot; treat persistent position drift as a manual intervention until
+   the reconciler applies it automatically.
 3. Resolve drift before resuming.
 
 ## Failed deploy / rollback

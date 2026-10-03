@@ -82,7 +82,7 @@
 | [metrics.rs](https://github.com/metrics-rs/metrics) | Prometheus metric facade and exporter. | SPEC-0000 §9, SPEC-0006 §6 |
 | [tracing](https://github.com/tokio-rs/tracing) | Structured JSON logging in production. | SPEC-0000 §4 |
 | [clap](https://github.com/clap-rs/clap) · [figment](https://github.com/SergioBenitez/figment) | CLI and layered TOML/env config. | SPEC-0000 §7 |
-| [k256](https://github.com/RustCrypto/elliptic-curves) · [rmp-serde](https://github.com/3Hren/rmp-serde) | secp256k1 signing and msgpack action hashing. | SPEC-0002 §4 |
+| [k256](https://github.com/RustCrypto/elliptic-curves) · [rmp-serde](https://github.com/3Hren/msgpack-rust) | secp256k1 signing and msgpack action hashing. | SPEC-0002 §4 |
 | [wiremock](https://github.com/LukeMathWalker/wiremock-rs) | Mock `/exchange` / `/info` tests. | SPEC-0002 §14 |
 | [axum](https://github.com/tokio-rs/axum) | `/healthz`, `/readyz`, `/metrics` endpoints. | SPEC-0000 §9 |
 

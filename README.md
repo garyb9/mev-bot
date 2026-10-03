@@ -4,8 +4,6 @@ A **low-latency arbitrage / MEV-style trading system for
 [Hyperliquid](https://hyperliquid.xyz)**, written in Rust (HyperCore first,
 HyperEVM later).
 
-*Formerly `mev-bot`; the crates were `mev-*` before the rename. The binary is `hl`.*
-
 - **Evidence before strategy.** A keyless recorder stores raw market data and an
   offline Python toolkit measures edge net of costs. Only strategies with a
   passing study get built.
@@ -55,8 +53,10 @@ Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Quick start
 
-Requires Rust 1.90+. None of the commands below need keys; the network ones
-only read public market data.
+Requires Rust 1.90+. The offline research toolkit additionally needs Python
+3.12 and [`uv`](https://docs.astral.sh/uv/) (see
+[`research/README.md`](research/README.md)). None of the commands below need
+keys; the network ones only read public market data.
 
 ```sh
 cargo build --workspace
@@ -64,11 +64,11 @@ cargo test --workspace
 
 cargo run -p hl-arb-bot -- --help                  # the `hl` CLI
 cargo run -p hl-arb-bot -- config show             # resolved config, secrets redacted
-cargo run -p hl-arb-bot -- record plan             # recorder subscription plan, opens no sockets
+cargo run -p hl-arb-bot -- record plan             # recorder plan; fetches public metadata
 cargo run -p hl-arb-bot -- run --mode observe      # connect, build state, never trade
 cargo run -p hl-arb-bot -- run --mode simulate     # run strategies against paper fills
 cargo run -p hl-arb-bot -- replay --from 2026-09-30 --to 2026-09-30 --rec-dir data/rec
-                                                # replay recorder segments through the engine
+                                                # replay recorder segments (needs data/rec)
 ```
 
 While `hl run` is up: `curl localhost:9090/healthz`, `/readyz`, `/metrics`.
@@ -92,6 +92,8 @@ variables. Recorder profiles live in `config/record.toml`.
 Operations: [`RUNBOOK.md`](RUNBOOK.md).
 
 ## Repository layout
+
+Formerly `mev-bot` (crates `mev-*`); the binary is `hl`.
 
 | Path | What |
 |---|---|

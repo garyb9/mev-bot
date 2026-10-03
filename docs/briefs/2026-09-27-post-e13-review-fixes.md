@@ -1,5 +1,7 @@
 # Task brief: fixes from the review of the post-E-13 checkpoint
 
+> **Status: superseded — all tasks done** (2026-10-03). Kept for history.
+
 **Date:** 2026-09-27
 **Reviewed commits:** `5919a37`, `5b99b57`, `d9e5318`, `b48babc`, `d74478f` (on top of `3f2d96c`)
 **State at review:** `cargo fmt`, `clippy -D warnings`, and `test --workspace` all pass.

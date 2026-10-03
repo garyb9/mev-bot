@@ -12,11 +12,11 @@ The `hlr-hl-rest` console script (in `research/`) backfills, from Hyperliquid's
 
 ```sh
 cd research
-uv run hlr-hl-rest backfill --out research/data/parquet
+uv run hlr-hl-rest backfill --out data/parquet
 ```
 
 Resumable/idempotent: each `(table, day)` partition is merge-deduped, and
-`research/data/parquet/hl_rest_state.json` records the last funding time and
+`data/parquet/hl_rest_state.json` records the last funding time and
 candle open time per stream. Re-running writes only new rows. `--full` ignores
 the resume points (still no duplicates). `--weight-per-min N` (default 300, a
 quarter of HL's 1200/IP/min budget) caps the token bucket; the client adds the
@@ -31,7 +31,7 @@ funding up, and appends 1m/5m candles:
 
 ```sh
 cd research
-uv run hlr-hl-rest poll --out research/data/parquet
+uv run hlr-hl-rest poll --out data/parquet
 ```
 
 Install this as a daily cron entry **on the research host** (nothing is

@@ -22,11 +22,28 @@ No keys, no `.env`, no network access is needed to run the reader or the tests.
 Recordings live under `research/data/` (git-ignored) after you copy or sync them
 from the recorder host; nothing in this directory writes to `data/`.
 
+## Data terms
+
+Fetched third-party market data (for example Tardis free days, Binance/Bybit
+public dumps) is governed by the vendor's terms of service. **Do not
+redistribute or commit it.** Derived data lives under the git-ignored
+`research/data/`; never check it in. See [`docs/REFERENCES.md`](../docs/REFERENCES.md)
+and SPEC-0008 §17 for the per-vendor terms.
+
 ## Layout
 
 | Path | What |
 |---|---|
 | `hlr/io.py` | `iter_envelopes(path)`, `iter_frames(root, src, date_from, date_to)` — read segment files (`*.jsonl.zst`, `*.jsonl.zst.crashed`) in the SPEC-0008 §5/§6 format |
+| `hlr/tables.py` | Shared §13.1 Parquet table schemas |
+| `hlr/normalize.py` | Envelope → §13.1 Parquet tables (P-2); console script `hlr-normalize` |
+| `hlr/costs.py` / `hlr/thresholds.py` | Cost model and study thresholds (P-3) |
+| `hlr/episodes.py` | Episode detector + latency capture (P-4) |
+| `hlr/competition.py` | `compete_usd` estimate from recorded public trades (ST-1) |
+| `hlr/report.py` / `hlr/rank.py` | Report template and `RANKING.md` generator (P-5) |
+| `hlr/backfill/tardis.py` | Tardis free-day downloader (B-1); console script `hlr-tardis-fetch` |
+| `hlr/backfill/tardis_normalize.py` | Tardis rows → §13.1 tables (B-2); console script `hlr-tardis-normalize` |
+| `hlr/backfill/hl_rest.py` | HL REST funding/candle backfill + daily poller (B-3); console script `hlr-hl-rest` |
 | `tests/` | Pytest suite; builds zstd fixtures in `tmp_path` (no committed binaries) |
 
 ## Usage
@@ -100,8 +117,10 @@ with `hlr.episodes`), not the venue/`time` field.
 documented REST weight through a token bucket with backoff.
 
 ```sh
-uv run hlr-hl-rest backfill --out research/data/parquet   # one-shot
-uv run hlr-hl-rest poll --out research/data/parquet       # scheduled daily 1m/5m
+# Run these from research/ (as in Setup above); --out is relative to the cwd,
+# so use data/parquet here. Run from the repo root with --out research/data/parquet.
+uv run hlr-hl-rest backfill --out data/parquet   # one-shot
+uv run hlr-hl-rest poll --out data/parquet       # scheduled daily 1m/5m
 ```
 
 See [`../deploy/research/hl-rest-poller.md`](../deploy/research/hl-rest-poller.md)
