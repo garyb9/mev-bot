@@ -1,6 +1,6 @@
 # SPEC-0004 — Risk, Portfolio & Accounting
 
-**Status:** Partially implemented (per-order limit gate in `mev-risk/src/limits.rs`). Remaining work in §16.
+**Status:** Partially implemented (per-order limit gate in `hl-arb-risk/src/limits.rs`). Remaining work in §16.
 **Depends on:** SPEC-0000, SPEC-0001, SPEC-0002
 **Blocks:** SPEC-0003 intents reaching live execution
 
@@ -153,15 +153,15 @@ Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path in
 
 **K-2:** Per-coin projected exposure = confirmed position + Σ worst-case fills of `PendingNew`/`Resting`/`PartiallyFilled`/`PendingModify`/`Unknown` orders, maintained incrementally by the order manager. Groups are checked on net **and** worst single-leg exposure. *Done when:* a property test shows no approved sequence can exceed a cap.
 
-**K-2 implemented, part 1 (2026-09-26, via SPEC-0010 E-9).** The per-coin rule is live: `mev_engine::risk::RiskGate` checks projected = `AccountState::projected_notional` (confirmed) + `OrderManager::pending_notional` (worst-case in-flight), resizing to the cap; `mev-risk`'s `LimitRisk` also counts resting in-flight gross toward the same cap. A fixed-seed randomized property test shows no approved sequence exceeds the cap. **Remaining:** the group net / worst-single-leg rule needs the SPEC-0011 group types (`RiskGate` returns `GroupUnsupported` for `Action::PlaceGroup`); build it with the SPEC-0011 L-tasks (SPEC-0010 §23 Q-Group-Risk).
+**K-2 implemented, part 1 (2026-09-26, via SPEC-0010 E-9).** The per-coin rule is live: `hl_arb_engine::risk::RiskGate` checks projected = `AccountState::projected_notional` (confirmed) + `OrderManager::pending_notional` (worst-case in-flight), resizing to the cap; `hl-arb-risk`'s `LimitRisk` also counts resting in-flight gross toward the same cap. A fixed-seed randomized property test shows no approved sequence exceeds the cap. **Remaining:** the group net / worst-single-leg rule needs the SPEC-0011 group types (`RiskGate` returns `GroupUnsupported` for `Action::PlaceGroup`); build it with the SPEC-0011 L-tasks (SPEC-0010 §23 Q-Group-Risk).
 
 **K-3:** The kill flag lives in engine state and is checked first in every risk check. Triggers: `SIGUSR1`, the existence of `HL_KILL_FILE` (default `data/KILL`, polled every 250 ms by a control task), and `hl panic` (writes the file). Action: cancel every working order, then `on_kill` policy (SPEC-0011 §9), then halt. Clearing needs `hl resume` **and** deleting the file. *Done when:* an end-to-end test in `simulate` shows all orders cancelled and no new places within one iteration of each trigger.
 
-**K-3 implemented, part 1 (2026-09-26, via SPEC-0010 E-9).** `mev-risk/src/kill.rs` ships the sticky `KillSwitch` (set/clear/is_active), the `check_flag_file(path)` helper (so a control task can poll `HL_KILL_FILE` off the hot path), and `cancel_all_cloids(&OrderManager)`; `RiskGate` checks the kill flag first and refuses all new places in one iteration. **Remaining (part 1):** the `SIGUSR1` handler and `hl panic`/`hl resume` CLI wiring, the 250 ms control-task file poll, and the `simulate` end-to-end test — scheduled with E-13's `mev-bot` cleanup.
+**K-3 implemented, part 1 (2026-09-26, via SPEC-0010 E-9).** `hl-arb-risk/src/kill.rs` ships the sticky `KillSwitch` (set/clear/is_active), the `check_flag_file(path)` helper (so a control task can poll `HL_KILL_FILE` off the hot path), and `cancel_all_cloids(&OrderManager)`; `RiskGate` checks the kill flag first and refuses all new places in one iteration. **Remaining (part 1):** the `SIGUSR1` handler and `hl panic`/`hl resume` CLI wiring, the 250 ms control-task file poll, and the `simulate` end-to-end test — scheduled with E-13's `hl-arb-bot` cleanup.
 
 **K-3 implemented, part 2 (2026-09-27, `hl` wiring).** The 250 ms control task is live in `hl run`: it polls `config.kill_file` (default `data/KILL`, `HL_KILL_FILE` override), handles `SIGUSR1` (trip) and `SIGUSR2` (resume), and feeds `Control::KillSwitch`/`Control::Resume` through the lossless account channel. `hl panic` writes the flag file and `hl resume` removes it. **Remaining:** the SPEC-0011 `on_kill` residual path.
 
-**K-3 done (2026-09-27, task D).** The control task, the account stream, and the exec writer moved to `crates/mev-bot/src/live.rs` with tests: a mock-WS account frame decodes to the expected `AccountUpdate`; creating the flag file sends `Control::KillSwitch`; `hl panic`/`hl resume` create/remove the file. The `simulate` end-to-end test (`dispatch::tests::simulate_kill_switch_cancels_all_and_places_none`) shows a kill cancels every working order and places nothing new within one iteration (the queued paper updates apply even while dispatch is halted).
+**K-3 done (2026-09-27, task D).** The control task, the account stream, and the exec writer moved to `crates/hl-arb-bot/src/live.rs` with tests: a mock-WS account frame decodes to the expected `AccountUpdate`; creating the flag file sends `Control::KillSwitch`; `hl panic`/`hl resume` create/remove the file. The `simulate` end-to-end test (`dispatch::tests::simulate_kill_switch_cancels_all_and_places_none`) shows a kill cancels every working order and places nothing new within one iteration (the queued paper updates apply even while dispatch is halted).
 
 **K-3 resume fixed (2026-09-27, task E).** `SIGUSR2` sends `Control::Resume` only when the kill flag file is absent; while it exists the signal is ignored, so a resume cannot race the next 250 ms poll and let orders out. Resume is sent regardless of the control task's own latch, so a kill from the dead-man task is resumable. At startup, a pre-existing flag file sends an initial `KillSwitch` before the loop runs, so the bot begins halted. Tests: `live::tests::sigusr2_resumes_only_without_the_flag_file`, `live::tests::startup_flag_file_sends_an_initial_kill`.
 
@@ -173,10 +173,10 @@ Found in the 2026-09-26 review of the live path (SPEC-0010 §2). The hot-path in
 
 **K-5:** Implement SPEC-0010 §12's budgets as a risk check. *Done when:* tests show places rejected below `rate_budget_min` while cancels pass.
 
-**K-5 implemented (2026-09-26, via SPEC-0010 E-9).** `mev_engine::risk::RateBudget` (IP-weight + address token buckets, caller-supplied time refill) rejects places below `rate_budget_min`/`*_min` and allows cancels above the hard floor; `RiskBudgetSettings` in `mev-core` config; tests cover consume/guard/refill and cancel-pass behaviour. The `hl_rate_budget_remaining{kind}` metric export and the live `userRateLimit` poll (reconciler) are still to be wired (SPEC-0010 E-10/E-12/E-13).
+**K-5 implemented (2026-09-26, via SPEC-0010 E-9).** `hl_arb_engine::risk::RateBudget` (IP-weight + address token buckets, caller-supplied time refill) rejects places below `rate_budget_min`/`*_min` and allows cancels above the hard floor; `RiskBudgetSettings` in `hl-arb-core` config; tests cover consume/guard/refill and cancel-pass behaviour. The `hl_rate_budget_remaining{kind}` metric export and the live `userRateLimit` poll (reconciler) are still to be wired (SPEC-0010 E-10/E-12/E-13).
 
 **K-6:** Tables per §9 (extend the existing `fills`/`funding`/`positions_snapshot`; add `groups`). Daily PnL rollup query. *Done when:* a `simulate` day reconciles computed realized PnL against the paper executor's ledger to the cent.
 
-**K-7:** `proptest` suites under `crates/mev-risk/tests/`. *Done when:* they run in CI.
+**K-7:** `proptest` suites under `crates/hl-arb-risk/tests/`. *Done when:* they run in CI.
 
 **K-8:** Only built when needed (T3 gate). *Done when:* SPEC-0004 §5 gains a "Directional strategies" block, with tests.

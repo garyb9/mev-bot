@@ -104,7 +104,7 @@ Streams consumed (subset per active strategy):
 
 ## 9. Client abstraction (backend-swappable)
 
-Traits in `mev-hl-client`:
+Traits in `hl-arb-client`:
 
 ```rust
 #[async_trait]
@@ -133,7 +133,7 @@ pub trait MarketStream {
 | ID | Backend | Notes |
 |---|---|---|
 | A | `hyperliquid_rust_sdk` 0.6 | Official; pulls deprecated `ethers 2.x` + `tokio-tungstenite 0.20` |
-| B | `mev-hl-client` custom | Alloy + `fastwebsockets` + `rmp-serde` |
+| B | `hl-arb-client` custom | Alloy + `fastwebsockets` + `rmp-serde` |
 | C | Alloy-native community SDK | e.g. `hypersdk`; **included** — keep/drop decided post-evaluation on measured performance, data, and usability |
 
 **Method (`criterion` + a WS load harness, fixed hardware, ≥3 runs)**

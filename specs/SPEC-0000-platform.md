@@ -46,18 +46,18 @@ Establish the foundation for a Hyperliquid-first, always-on trading system: work
 
 ```
 crates/
-  mev-core/       types, config, errors, clock, ids, decimal helpers
-  mev-hl-client/  HyperCore REST/WS client + signing (backend trait; SPEC-0001/0002)
-  mev-hyperevm/   HyperEVM (999) provider, DEX sources, executors      [SPEC-0005]
-  mev-strategy/   Strategy trait + implementations                     [SPEC-0003]
-  mev-risk/       limits, liquidation guard, portfolio, PnL            [SPEC-0004]
-  mev-metrics/    tracing init + metric definitions
-  mev-bot/        orchestration binary
+  hl-arb-core/       types, config, errors, clock, ids, decimal helpers
+  hl-arb-client/  HyperCore REST/WS client + signing (backend trait; SPEC-0001/0002)
+  hl-arb-hyperevm/   HyperEVM (999) provider, DEX sources, executors      [SPEC-0005]
+  hl-arb-strategy/   Strategy trait + implementations                     [SPEC-0003]
+  hl-arb-risk/       limits, liquidation guard, portfolio, PnL            [SPEC-0004]
+  hl-arb-metrics/    tracing init + metric definitions
+  hl-arb-bot/        orchestration binary
 specs/            this and sibling specs
 contracts/        HyperEVM executors only (later)
 ```
 
-Rules: `mev-core` depends on nothing internal; strategy/execution depend on core + client; `mev-bot` wires everything. No cycles.
+Rules: `hl-arb-core` depends on nothing internal; strategy/execution depend on core + client; `hl-arb-bot` wires everything. No cycles.
 
 The current `src/` and `contract/Arb.sol` (Ethereum mainnet V2 arb) are **retired**: deleted from the build, ABIs/math retained under `legacy/` as reference for SPEC-0005.
 
@@ -159,12 +159,12 @@ Milestones later in the list may split into smaller commits (e.g. client vs benc
 4. `tracing` + metrics + `/healthz` `/readyz` `/metrics`.
 5. Graceful shutdown + panic hook.
 6. CI pipelines + `Cargo.lock`.
-7. `mev-hl-client` trait stub + no-op observe loop so the daemon idles cleanly.
+7. `hl-arb-client` trait stub + no-op observe loop so the daemon idles cleanly.
 8. README + runbook.
 
 ## 16. Acceptance criteria
 
-- `cargo run -p mev-bot -- --mode observe` starts, loads config, logs, serves health endpoints, and exits cleanly on SIGTERM.
+- `cargo run -p hl-arb-bot -- --mode observe` starts, loads config, logs, serves health endpoints, and exits cleanly on SIGTERM.
 - `cargo tree | grep -c ethers` = 0.
 - CI green; `Cargo.lock` committed.
 - Running with `--mode live` and no keys fails fast with a clear error.
@@ -172,7 +172,7 @@ Milestones later in the list may split into smaller commits (e.g. client vs benc
 
 ## 17. Open questions
 
-1. ~~Repo/binary naming~~ **Resolved (2026-10-03):** the repo is renamed `hl-arb-bot`; the binary stays `hl` and the Cargo packages keep their `mev-*` names (a prefix rename would touch every import; revisit only if wanted).
+1. ~~Repo/binary naming~~ **Resolved (2026-10-03):** the repo is renamed `hl-arb-bot`, the Cargo packages are renamed `mev-*` to `hl-arb-*` (`mev-hl-client` becomes `hl-arb-client`), and the binary stays `hl`. Crate names and paths elsewhere in the specs were updated in the same change; history notes keep their dates.
 2. Delete old code outright, or keep under `legacy/` (ABIs + math + docs only)?
 3. Deployment target preference (VPS region, container vs bare metal)?
 4. Do you want the SPEC-0001 client benchmark to also include a community Alloy-native SDK, or custom-vs-official only?

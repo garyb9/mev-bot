@@ -10,7 +10,7 @@ mandated for evaluation:
 | ID | Backend |
 |---|---|
 | A | `hyperliquid_rust_sdk` 0.6 (official) |
-| B | custom `mev-hl-client` (Alloy + a WebSocket transport) |
+| B | custom `hl-arb-client` (Alloy + a WebSocket transport) |
 | C | Alloy-native community SDK — `hypersdk` 0.2.16 |
 
 The trait boundary (`InfoApi`, `MarketStream`) keeps the choice reversible.
@@ -35,8 +35,8 @@ lets LTO dead-code-eliminate the graph), so they are excluded.
 
 ### WS decode throughput (candidate B, typed decode)
 
-`cargo bench -p mev-hl-client --bench decode -- --quick`, recorded live frames
-(`crates/mev-hl-client/benches/fixtures`), compared against an untyped
+`cargo bench -p hl-arb-client --bench decode -- --quick`, recorded live frames
+(`crates/hl-arb-client/benches/fixtures`), compared against an untyped
 `serde_json::Value` parse of the same frames:
 
 | Channel | Typed decode | per frame | Throughput | `Value` parse | ratio |
@@ -75,15 +75,15 @@ Takeaways:
 ## Measured (SPEC-0002 H-7, 2026-09-28)
 
 Sign and local submit latency, measured with the new
-`crates/mev-hl-client/benches/sign.rs` criterion bench. It exercises the same
+`crates/hl-arb-client/benches/sign.rs` criterion bench. It exercises the same
 path `WriteCore::prepare` runs — the `hl_sign_seconds` stage: order build +
 msgpack + EIP-712 sign — plus a localhost mock-WS `post` round trip.
 
 - **Machine:** WSL2 (kernel `6.18.33.2-microsoft-standard-WSL2`), Intel(R)
   Core(TM) i7-14700K, 28 vCPU.
-- **Command:** `cargo bench -p mev-hl-client --bench sign -- --warm-up-time 1
+- **Command:** `cargo bench -p hl-arb-client --bench sign -- --warm-up-time 1
   --measurement-time 3 --sample-size 100`. CI quick mode:
-  `cargo bench -p mev-hl-client --bench sign -- --quick`.
+  `cargo bench -p hl-arb-client --bench sign -- --quick`.
 - Release profile (`lto = "fat"`), 100 samples. The mean equals criterion's own
   point estimate. The p50/p99 columns are the p50/p99 of criterion's
   **per-sample means**, not a strict per-iteration p99 (criterion does not
@@ -115,7 +115,7 @@ is now satisfied on decode and sign.
 
 ## Decision
 
-1. **Keep the custom `mev-hl-client` as the default backend (candidate B).**
+1. **Keep the custom `hl-arb-client` as the default backend (candidate B).**
    Rationale: it is the only backend that is simultaneously dependency-clean
    (no `ethers`), already correct for our data needs (HIP-3, BBO, perp ctx,
    staleness), permissively licensed (MIT), and lowest-footprint. Decode
@@ -136,7 +136,7 @@ is now satisfied on decode and sign.
 
 - Default remains `tokio-tungstenite` 0.30; trait boundary unchanged.
 - Follow-up landed: the sign/submit benchmarks (SPEC-0002 H-7) are in
-  `crates/mev-hl-client/benches/sign.rs` and the numbers are above.
+  `crates/hl-arb-client/benches/sign.rs` and the numbers are above.
 - Remaining optional follow-ups: `allMids` lazy/`simd-json` decoding; a mock-WS
   reconnect harness; and a real testnet submit round-trip (SPEC-0002 H-10) once
   a funded agent wallet exists.

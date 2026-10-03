@@ -203,7 +203,7 @@ All tasks are **T1**.
 - **L-6:** §9. *Done when:* a group whose worst-case single leg breaches a cap is rejected; kill switch + `neutralize` flattens residuals in the simulator.
 - **L-7:** §13. *Done when:* property tests run in CI (bounded case count).
 - **L-8:** `MakerPrimary` with re-pricing and fill-by-fill hedging. *Done when:* simulator tests cover partial maker fills hedged incrementally, and cancel when the edge disappears.
-- **L-9:** §12 metrics + a `groups` table (migration in `mev-core/src/db.rs`). *Done when:* metrics appear in `/metrics` in `simulate`, and rows are written for each group.
+- **L-9:** §12 metrics + a `groups` table (migration in `hl-arb-core/src/db.rs`). *Done when:* metrics appear in `/metrics` in `simulate`, and rows are written for each group.
 - **L-10:** `FundingBasis` enters and exits through a spot/perp `PlaceGroup` (`PrimaryThenHedge`, spot as primary). *Done when:* its tests pass, and a `simulate` run shows balanced groups.
 
 ## 15. Verified facts (filled in by L-V)

@@ -67,13 +67,13 @@ Components and where they live:
 
 | Component | Location | Language | Task |
 |---|---|---|---|
-| Envelope + segment writer/reader | `crates/mev-recorder/src/{envelope,segment,reader}.rs` | Rust | R-1, R-2, R-7 |
-| Raw WS connection (shared with the bot) | `crates/mev-hl-client/src/raw_ws.rs` | Rust | R-3 |
-| HL subscription planner | `crates/mev-recorder/src/planner.rs` | Rust | R-4 |
-| HL REST snapshotter | `crates/mev-recorder/src/sources/hl_rest.rs` | Rust | R-5 |
-| `hl record` CLI + profiles | `crates/mev-bot/src/main.rs`, `config/record.toml` | Rust | R-6 |
-| CEX reference sources | `crates/mev-recorder/src/sources/cex.rs` | Rust | R-8 |
-| HyperEVM pool source | `crates/mev-recorder/src/sources/evm.rs` | Rust | R-9 |
+| Envelope + segment writer/reader | `crates/hl-arb-recorder/src/{envelope,segment,reader}.rs` | Rust | R-1, R-2, R-7 |
+| Raw WS connection (shared with the bot) | `crates/hl-arb-client/src/raw_ws.rs` | Rust | R-3 |
+| HL subscription planner | `crates/hl-arb-recorder/src/planner.rs` | Rust | R-4 |
+| HL REST snapshotter | `crates/hl-arb-recorder/src/sources/hl_rest.rs` | Rust | R-5 |
+| `hl record` CLI + profiles | `crates/hl-arb-bot/src/main.rs`, `config/record.toml` | Rust | R-6 |
+| CEX reference sources | `crates/hl-arb-recorder/src/sources/cex.rs` | Rust | R-8 |
+| HyperEVM pool source | `crates/hl-arb-recorder/src/sources/evm.rs` | Rust | R-9 |
 | Deployment | `deploy/recorder/`, `RUNBOOK.md` | systemd / docs | R-10 |
 | Research toolkit | `research/hlr/` | Python | P-1…P-5 |
 | Studies + reports | `research/studies/`, `research/reports/` | Python / Markdown | S-1…S-23 |
@@ -179,11 +179,11 @@ data/rec/
 
 `data/` is already git-ignored. Do not commit recordings.
 
-**Manifest appends are serialized (R-2b).** Every finished segment appends one line to its day's `manifest.jsonl`, and several writer threads (one per `(src, conn)`) append to the same file with independently-opened `O_APPEND` handles. On the recorder's WSL 9p `drvfs` mount (`/mnt/e`) that is **not** atomic: the 9p client caches the file size, so two writers that open at the same instant append at the same offset and a line is lost with no error (5 of 56 finalized segments in the 6.25 h V-4 run had no manifest line). The recorder now holds a process-wide, per-path lock across the whole open→write→fsync of each append (`crates/mev-recorder/src/segment.rs::manifest_append_lock`), so at most one handle appends at a time. `hl record verify` trusts the manifest: a segment whose line is missing is invisible to it and coverage is undercounted (§17 #36).
+**Manifest appends are serialized (R-2b).** Every finished segment appends one line to its day's `manifest.jsonl`, and several writer threads (one per `(src, conn)`) append to the same file with independently-opened `O_APPEND` handles. On the recorder's WSL 9p `drvfs` mount (`/mnt/e`) that is **not** atomic: the 9p client caches the file size, so two writers that open at the same instant append at the same offset and a line is lost with no error (5 of 56 finalized segments in the 6.25 h V-4 run had no manifest line). The recorder now holds a process-wide, per-path lock across the whole open→write→fsync of each append (`crates/hl-arb-recorder/src/segment.rs::manifest_append_lock`), so at most one handle appends at a time. `hl record verify` trusts the manifest: a segment whose line is missing is invisible to it and coverage is undercounted (§17 #36).
 
 ### 6.1 Mount guard (R-14)
 
-A profile may pin recording to an external drive. `require_mount` (an absolute path) and the optional `require_mount_source` (the mount's source from `/proc/self/mountinfo`, e.g. `'E:\'`, matched case-insensitively ignoring a trailing separator) are checked at startup and re-checked before every guarded write, so a disconnected drive cannot silently send writes to the root disk. See `crates/mev-recorder/src/mount_guard.rs`, `config/record-ssd.toml`, and `deploy/recorder/run-ssd.sh`.
+A profile may pin recording to an external drive. `require_mount` (an absolute path) and the optional `require_mount_source` (the mount's source from `/proc/self/mountinfo`, e.g. `'E:\'`, matched case-insensitively ignoring a trailing separator) are checked at startup and re-checked before every guarded write, so a disconnected drive cannot silently send writes to the root disk. See `crates/hl-arb-recorder/src/mount_guard.rs`, `config/record-ssd.toml`, and `deploy/recorder/run-ssd.sh`.
 
 - **Startup:** the recorder refuses to start unless `require_mount` is a real mount point on a device other than `/` and `out_dir` is strictly inside it, before and after canonicalization (a symlink or `..` cannot escape). `validate_startup` creates nothing.
 - **Guarded write paths:** segment create (directory + `.partial`), segment finalize (`fsync` + rename + manifest), manifest append, crash recovery (`.partial` → `.crashed` rename + manifest), the REST paging state file, and `out_dir` creation — a single `create_dir` of a **direct child** of the verified mount, never `create_dir_all` along a path that may have become the root disk.
@@ -289,7 +289,7 @@ Input: a resolved profile. Output: a `Plan` = list of connections, each with an 
 Algorithm (must be deterministic: same input ⇒ same plan):
 
 1. Expand every selector into `(stream, coin)` pairs, de-duplicated, sorted by `(priority, stream, coin)`.
-2. Count them. If the count is over `max_subs`, drop from the lowest priority upward: at each step, take the **highest priority number** present (3, then 2, then 1) and remove the **last** subscription with that priority in `(priority, stream, coin, dex)` sort order (`planner::plan`, `crates/mev-recorder/src/planner.rs`). An explicitly named coin gets no protection against a wildcard expansion of the same stream and priority: both are ordinary subscriptions in the same sorted set, so the lexicographically last coin is the one removed. Log every dropped pair at WARN and fail if a priority-1 pair would be dropped, unless `--allow-truncate` is set.
+2. Count them. If the count is over `max_subs`, drop from the lowest priority upward: at each step, take the **highest priority number** present (3, then 2, then 1) and remove the **last** subscription with that priority in `(priority, stream, coin, dex)` sort order (`planner::plan`, `crates/hl-arb-recorder/src/planner.rs`). An explicitly named coin gets no protection against a wildcard expansion of the same stream and priority: both are ordinary subscriptions in the same sorted set, so the lexicographically last coin is the one removed. Log every dropped pair at WARN and fail if a priority-1 pair would be dropped, unless `--allow-truncate` is set.
 3. Put `l2Book` subscriptions on their **own** connection(s): they are the heaviest, and isolating them keeps `bbo` latency clean.
 4. Fill the remaining connections round-robin, at most `subs_per_conn` each, so no single coin's `bbo`/`trades`/`ctx` all share one socket (limits the blast radius of one bad connection).
 5. Fail if the connection count exceeds `connections`.
@@ -300,7 +300,7 @@ Algorithm (must be deterministic: same input ⇒ same plan):
 
 ### 7.5 Raw WS connection (task R-3)
 
-Extract a reusable raw connection from `crates/mev-hl-client/src/ws.rs` into `raw_ws.rs`. Then rebuild `WsMarketStream` on top of it, so the bot and the recorder share one reconnect implementation.
+Extract a reusable raw connection from `crates/hl-arb-client/src/ws.rs` into `raw_ws.rs`. Then rebuild `WsMarketStream` on top of it, so the bot and the recorder share one reconnect implementation.
 
 | Behavior | Requirement |
 |---|---|
@@ -316,7 +316,7 @@ Existing `ws.rs` tests must keep passing after the refactor, and new tests use a
 
 ## 8. Hyperliquid REST snapshots (task R-5)
 
-Recorded as `kind:"rest"` envelopes under `src:"hl-rest"`. All requests are `POST /info`. Use `HttpInfo::info(body)` from `mev-hl-client`.
+Recorded as `kind:"rest"` envelopes under `src:"hl-rest"`. All requests are `POST /info`. Use `HttpInfo::info(body)` from `hl-arb-client`.
 
 | Request body | Cadence | Weight (SPEC-0001 §5) | Why |
 |---|---|---|---|
@@ -402,7 +402,7 @@ Only needed for studies O4/O8. **Start R-9 only after V-5 and V-6 are ✅.**
 
 ### 12.2 Health and metrics
 
-`hl record` serves the same HTTP endpoints as `hl run` (reuse `mev-metrics`):
+`hl record` serves the same HTTP endpoints as `hl run` (reuse `hl-arb-metrics`):
 
 - `/healthz`: process alive and the segment writer thread alive.
 - `/readyz`: every planned connection is connected and has received data within its watchdog window.
@@ -1062,7 +1062,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | V-11 | Choose a real-time US equities data provider (owner approves) | T1 | S | — | ☐ |
 | V-12 | HIP-3 stock-perp mechanics (oracle in/out of hours, funding, fees, leverage, halts) | T1 | S | — | ☐ |
 | V-13 | Historical options data: vendors, coverage, cost; owner decides whether to buy | T3-data | S | V-9 | ☐ |
-| R-1 | `mev-recorder` crate skeleton + envelope types | T1 | S | — | ✅ |
+| R-1 | `hl-arb-recorder` crate skeleton + envelope types | T1 | S | — | ✅ |
 | R-2 | Segment writer (zstd, rotation, manifest, crash recovery, disk guard) | T1 | M | R-1 | ✅ |
 | R-3 | Extract `RawWsConn` (watchdog, jitter, cancel, gap events); rebase `WsMarketStream` on it | **T0** | M | — | ✅ |
 | R-4 | Subscription planner + universe selectors | T1 | M | R-1 | ✅ |
@@ -1198,53 +1198,53 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Do:** For each HIP-3 dex listing stock/index perps: how the oracle/mark is set during US regular hours, pre/post market, overnight, and weekends; funding formula and cadence; fees (links to V-3); max leverage; trading halts and behavior around corporate actions (splits, dividends, earnings). Sources required.
 - **Done when:** §15 has a per-dex table.
 
-#### R-1 — `mev-recorder` crate skeleton + envelope
-- **Do:** Create `crates/mev-recorder` (add it to the workspace `members`). Define `Envelope` (§5.1) and `Kind` (§5.3) with `serde`, plus constructors that take `t_ns`/`mono_ns` from an injectable clock (reuse the `mev_core::clock::Clock` pattern; add a monotonic-ns source). `raw` is stored as `String` and serialized as a JSON string.
-- **Files:** `Cargo.toml` (workspace), `crates/mev-recorder/{Cargo.toml,src/lib.rs,src/envelope.rs}`.
+#### R-1 — `hl-arb-recorder` crate skeleton + envelope
+- **Do:** Create `crates/hl-arb-recorder` (add it to the workspace `members`). Define `Envelope` (§5.1) and `Kind` (§5.3) with `serde`, plus constructors that take `t_ns`/`mono_ns` from an injectable clock (reuse the `hl_arb_core::clock::Clock` pattern; add a monotonic-ns source). `raw` is stored as `String` and serialized as a JSON string.
+- **Files:** `Cargo.toml` (workspace), `crates/hl-arb-recorder/{Cargo.toml,src/lib.rs,src/envelope.rs}`.
 - **Tests:** golden serialization for every kind; a round-trip test; a test that `raw` containing quotes, newlines and unicode survives the round-trip byte-exact.
 - **Done when:** the crate builds, tests pass, and there are no new deps beyond `serde`, `serde_json`, and workspace crates.
 
 #### R-2 — Segment writer
-- **Do:** Implement `SegmentWriter`: a dedicated OS thread (same pattern as `mev_core::db::writer::DbWriter`) that receives envelopes over a bounded `sync_channel` (capacity configurable, default 65 536), writes `segment_open` first, compresses with `zstd` (add the `zstd` crate to workspace deps), flushes every ≤ 5 s, and rotates per §6 (hour boundary or 1 GiB raw). Finalize and write the manifest per §6. Crash recovery for `.partial` per §6. Disk guard per §6. Expose `try_send(env) -> bool`; on `false` the **caller** increments `hl_rec_dropped_total` and sends a `gap_start{reason:"drop"}` as soon as the channel accepts again.
+- **Do:** Implement `SegmentWriter`: a dedicated OS thread (same pattern as `hl_arb_core::db::writer::DbWriter`) that receives envelopes over a bounded `sync_channel` (capacity configurable, default 65 536), writes `segment_open` first, compresses with `zstd` (add the `zstd` crate to workspace deps), flushes every ≤ 5 s, and rotates per §6 (hour boundary or 1 GiB raw). Finalize and write the manifest per §6. Crash recovery for `.partial` per §6. Disk guard per §6. Expose `try_send(env) -> bool`; on `false` the **caller** increments `hl_rec_dropped_total` and sends a `gap_start{reason:"drop"}` as soon as the channel accepts again.
 - **Tests (tempdir):** rotation at an hour boundary using an injected clock; rotation on size; the manifest line matches the file; a `.partial` left from a simulated crash becomes `.crashed` on restart; records written ≡ records read back (with R-7's reader, or a minimal decoder in the test).
 - **Done when:** tests pass; a benchmark note in the commit message shows ≥ 50k envelopes/s written on the dev machine.
-- **Implemented (2026-09-27, R-1 + R-2):** `crates/mev-recorder` with `envelope.rs` (`Envelope`, `Kind`, `SegmentOpenMeta`, `EnvelopeClock`/`MonoClock`/`SystemEnvelopeClock`/`FixedEnvelopeClock`) and `segment.rs` (`SegmentWriter`, `SegmentConfig`, `DiskSpace`/`SystemDiskSpace` over `statvfs`). The writer is one OS thread per `(src, conn)` on a bounded `sync_channel` (default 65 536), zstd level 3, rotates on UTC hour or 1 GiB raw, finalizes/manifests/fsyncs, and recovers `.partial` → `.crashed`. Throughput measured in the test binary: ~295k envelopes/s (debug, 100k envelopes in 338.6 ms) ≥ the 50k target. New workspace deps: `zstd` (compression), `thiserror` (typed errors), `libc` (`statvfs` free space). Open questions recorded in §17 (#8–#10): writer-originated `seq`, `records`/`bytes_raw` scope relative to `segment_close`, and the disk guard being per-stream until R-6's multi-stream coordinator exists.
+- **Implemented (2026-09-27, R-1 + R-2):** `crates/hl-arb-recorder` with `envelope.rs` (`Envelope`, `Kind`, `SegmentOpenMeta`, `EnvelopeClock`/`MonoClock`/`SystemEnvelopeClock`/`FixedEnvelopeClock`) and `segment.rs` (`SegmentWriter`, `SegmentConfig`, `DiskSpace`/`SystemDiskSpace` over `statvfs`). The writer is one OS thread per `(src, conn)` on a bounded `sync_channel` (default 65 536), zstd level 3, rotates on UTC hour or 1 GiB raw, finalizes/manifests/fsyncs, and recovers `.partial` → `.crashed`. Throughput measured in the test binary: ~295k envelopes/s (debug, 100k envelopes in 338.6 ms) ≥ the 50k target. New workspace deps: `zstd` (compression), `thiserror` (typed errors), `libc` (`statvfs` free space). Open questions recorded in §17 (#8–#10): writer-originated `seq`, `records`/`bytes_raw` scope relative to `segment_close`, and the disk guard being per-stream until R-6's multi-stream coordinator exists.
 
 #### R-3 — `RawWsConn`
-- **Do:** Implement §7.5 in `crates/mev-hl-client/src/raw_ws.rs`. Make the URL, subscribe payloads, and keepalive message pluggable via a small `Protocol` trait (HL / Binance / Bybit implementations come later; ship HL now). Rebuild `WsMarketStream` on top of `RawWsConn` (it decodes the `Text` events with the existing `decode`). Add `rand` for jitter if it's not already present.
+- **Do:** Implement §7.5 in `crates/hl-arb-client/src/raw_ws.rs`. Make the URL, subscribe payloads, and keepalive message pluggable via a small `Protocol` trait (HL / Binance / Bybit implementations come later; ship HL now). Rebuild `WsMarketStream` on top of `RawWsConn` (it decodes the `Text` events with the existing `decode`). Add `rand` for jitter if it's not already present.
 - **Tests (local mock WS server):** reconnect after the server closes; resubscribe order preserved; the watchdog fires when the server goes silent; a `Gap` then `Opened` is emitted; cancellation stops a reconnect loop mid-backoff; all existing `ws.rs` tests still pass.
 - **Done when:** tests pass and `hl watch BTC` still works manually.
 - **Implemented (2026-09-26):** `raw_ws.rs` ships `RawWsConn`, the `Protocol` trait (+ `HlProtocol`), and `RawEvent`; `WsMarketStream` is rebased on it. Jitter uses a std-hasher PRNG rather than adding the `rand` crate (no new dependency; spreading reconnect storms does not need cryptographic randomness). `RawEvent::Opened` is yielded after each (re)connect and `Gap` carries `watchdog`/`closed`/`error`/`shutdown`. The watchdog resets on any inbound frame including `pong`.
 
 #### R-4 — Subscription planner
-- **Do:** Implement the §7.3 selectors and the §7.4 algorithm in `crates/mev-recorder/src/planner.rs`. Input: profile + `AssetMap` + the ctx data needed for `top:N` (pass it in; the planner does no I/O). Output: a `Plan` with a pretty table `Display`.
+- **Do:** Implement the §7.3 selectors and the §7.4 algorithm in `crates/hl-arb-recorder/src/planner.rs`. Input: profile + `AssetMap` + the ctx data needed for `top:N` (pass it in; the planner does no I/O). Output: a `Plan` with a pretty table `Display`.
 - **Tests:** fixture `AssetMap`s → golden plans; the over-budget drop order; the priority-1 failure; `l2Book` isolation; determinism (shuffled input ⇒ same plan); pacer math (≤ 20 msg/s).
 - **Done when:** tests pass.
 
 #### R-5 — HL REST snapshotter
-- **Do:** Implement §8 in `crates/mev-recorder/src/sources/hl_rest.rs`: a task that schedules each request at its cadence through a weight token bucket (300/min default), records `rest` envelopes (raw body + `meta.req/status/latency_us`), and tracks `fundingHistory` paging state (the last fetched time per coin, persisted in a small JSON state file in `out_dir`).
+- **Do:** Implement §8 in `crates/hl-arb-recorder/src/sources/hl_rest.rs`: a task that schedules each request at its cadence through a weight token bucket (300/min default), records `rest` envelopes (raw body + `meta.req/status/latency_us`), and tracks `fundingHistory` paging state (the last fetched time per coin, persisted in a small JSON state file in `out_dir`).
 - **Tests:** `wiremock` `/info` → envelopes contain the raw bodies; the token bucket delays over-budget requests; paging resumes from state after a restart.
 - **Done when:** tests pass.
 
 #### R-6 — CLI, profiles, metrics, health
-- **Do:** Add the `record` (with `plan`) and `probe latency` subcommands to `crates/mev-bot/src/main.rs` (move the recorder wiring into a new `crates/mev-bot/src/record.rs` module to keep `main.rs` manageable). Load `config/record.toml` (create it from §7.3) via `figment`, overridable by `HL_RECORD_*` env vars. Wire planner → `RawWsConn`s (paced) → `SegmentWriter`; the REST snapshotter; the `clock` envelope task; `/healthz` `/readyz` `/metrics` with the §12.2 metrics; graceful shutdown (SIGTERM ⇒ `gap_start{shutdown}` on every conn, then finalize segments).
+- **Do:** Add the `record` (with `plan`) and `probe latency` subcommands to `crates/hl-arb-bot/src/main.rs` (move the recorder wiring into a new `crates/hl-arb-bot/src/record.rs` module to keep `main.rs` manageable). Load `config/record.toml` (create it from §7.3) via `figment`, overridable by `HL_RECORD_*` env vars. Wire planner → `RawWsConn`s (paced) → `SegmentWriter`; the REST snapshotter; the `clock` envelope task; `/healthz` `/readyz` `/metrics` with the §12.2 metrics; graceful shutdown (SIGTERM ⇒ `gap_start{shutdown}` on every conn, then finalize segments).
 - **Tests:** `hl record plan` on a fixture; an integration test with mock WS + mock REST that runs ~2 s and asserts files + manifest exist and contain `segment_open`, `sub`, `frame`, `segment_close`.
 - **Done when:** tests pass; a manual 10-minute mainnet run produces readable segments (`hl record inspect`) with no gaps other than startup.
-- **Implemented (2026-09-27).** `crates/mev-bot/src/record.rs` (+ `mod record;` and `Record`/`Probe` subcommands) wires planner → one `RawWsConn` per connection (staggered dials, initial-dial retry) → per-`(src,conn)` `SegmentWriter`; the R-5 `RestSnapshotter`; per-WS-conn `clock` envelopes; `/healthz` `/readyz` `/metrics`; SIGTERM/SIGINT ⇒ `gap_start{shutdown}` then finalize. `config/record.toml` is the §7.3 example (bot uses port 9091 to avoid colliding with 9090). The §12.2 `hl_rec_*` names are in `mev-metrics`. A ~2 s mock-WS + `wiremock`-REST integration test asserts `segment_open`/`sub`/`frame`/`segment_close`; a 40 s real mainnet run produced 9 segments / 23 485 records and `hl record verify` passed. **The full 10-minute production soak and the manual sign-off are left to the operator (R-10 host).** Open questions in §17 (#18–#23); the missing `mev-recorder` stats/clock/liveness APIs are the main follow-up.
+- **Implemented (2026-09-27).** `crates/hl-arb-bot/src/record.rs` (+ `mod record;` and `Record`/`Probe` subcommands) wires planner → one `RawWsConn` per connection (staggered dials, initial-dial retry) → per-`(src,conn)` `SegmentWriter`; the R-5 `RestSnapshotter`; per-WS-conn `clock` envelopes; `/healthz` `/readyz` `/metrics`; SIGTERM/SIGINT ⇒ `gap_start{shutdown}` then finalize. `config/record.toml` is the §7.3 example (bot uses port 9091 to avoid colliding with 9090). The §12.2 `hl_rec_*` names are in `hl-arb-metrics`. A ~2 s mock-WS + `wiremock`-REST integration test asserts `segment_open`/`sub`/`frame`/`segment_close`; a 40 s real mainnet run produced 9 segments / 23 485 records and `hl record verify` passed. **The full 10-minute production soak and the manual sign-off are left to the operator (R-10 host).** Open questions in §17 (#18–#23); the missing `hl-arb-recorder` stats/clock/liveness APIs are the main follow-up.
 
 #### R-7 — Segment reader + inspect/verify
-- **Do:** `crates/mev-recorder/src/reader.rs`: iterate the envelopes of a file (tolerates a truncated tail in `.crashed` files); merge several files by `(t_ns, conn, seq)`. Implement the `hl record inspect` and `hl record verify` outputs from §12.1.
+- **Do:** `crates/hl-arb-recorder/src/reader.rs`: iterate the envelopes of a file (tolerates a truncated tail in `.crashed` files); merge several files by `(t_ns, conn, seq)`. Implement the `hl record inspect` and `hl record verify` outputs from §12.1.
 - **Tests:** a truncated file reads up to the last full line; merge order; `seq` hole detection.
 - **Done when:** tests pass.
-- **Blocks:** ~~SPEC-0010 **E-7 part 2** (`hl replay` over recorder segments)~~ **unblocked and delivered (2026-09-27):** `mev-bot/src/replay.rs` + `hl replay --from … --to … --out actions.jsonl` drive the v2 engine over these segments (SPEC-0010 E-7 part 2; §23 Q-Replay-Gap resolved). A follow-up added `reader::segments_for` (inclusive UTC date range, `.crashed` included) as the driver's input.
+- **Blocks:** ~~SPEC-0010 **E-7 part 2** (`hl replay` over recorder segments)~~ **unblocked and delivered (2026-09-27):** `hl-arb-bot/src/replay.rs` + `hl replay --from … --to … --out actions.jsonl` drive the v2 engine over these segments (SPEC-0010 E-7 part 2; §23 Q-Replay-Gap resolved). A follow-up added `reader::segments_for` (inclusive UTC date range, `.crashed` included) as the driver's input.
 
-**R-4 / R-5 / R-7 implemented (2026-09-27).** `planner.rs` ships the §7.3 selectors and the §7.4 algorithm (`plan`, `Plan`/`Connection`/`Pacer`/`VolumeIndex`, deterministic golden plans, over-budget drop order, `l2Book` isolation). `sources/hl_rest.rs` ships `RestSnapshotter` with the 300/min weight bucket, raw-body `rest` envelopes, and persisted `fundingHistory`/`candleSnapshot` paging; because `HttpInfo` discards the raw text, R-5 uses a local `RawInfoClient` (reqwest) rather than changing `mev-hl-client`. `reader.rs` ships `read_envelopes` (truncated-tail tolerant), `merge_segments`, and the pure `inspect`/`verify` analyses. The `hl record` CLI, profiles, metrics, and health are **R-6**, still open. Open questions recorded in §17 (#11–#17).
+**R-4 / R-5 / R-7 implemented (2026-09-27).** `planner.rs` ships the §7.3 selectors and the §7.4 algorithm (`plan`, `Plan`/`Connection`/`Pacer`/`VolumeIndex`, deterministic golden plans, over-budget drop order, `l2Book` isolation). `sources/hl_rest.rs` ships `RestSnapshotter` with the 300/min weight bucket, raw-body `rest` envelopes, and persisted `fundingHistory`/`candleSnapshot` paging; because `HttpInfo` discards the raw text, R-5 uses a local `RawInfoClient` (reqwest) rather than changing `hl-arb-client`. `reader.rs` ships `read_envelopes` (truncated-tail tolerant), `merge_segments`, and the pure `inspect`/`verify` analyses. The `hl record` CLI, profiles, metrics, and health are **R-6**, still open. Open questions recorded in §17 (#11–#17).
 
 #### R-8 — CEX sources
 - **Do:** `Protocol` implementations for `binance-usdm`, `binance-spot`, `bybit-linear` per §9 (confirmed by V-2). Add a `[cex]` section to the profile. Each venue gets its own `src` directory.
 - **Tests:** mock-server tests for the subscribe format and the Bybit ping cadence.
 - **Done when:** tests pass; a manual 10-minute run shows ticker frames for every configured symbol.
-- **Implemented (2026-09-29).** `crates/mev-recorder/src/sources/cex.rs` ships the three `Protocol`/source implementations; `crates/mev-bot/src/record.rs` spawns one per non-empty `[profile.default.cex]` list, each with its own `(src, src)` `SegmentWriter` under the mount guard. CEX liveness is registered with the readiness monitor but is **non-gating**: a stale reference feed logs a WARN and never takes the recorder out of `/readyz`. The 10-minute run against the real hosts (the Done-when above) is still to do.
+- **Implemented (2026-09-29).** `crates/hl-arb-recorder/src/sources/cex.rs` ships the three `Protocol`/source implementations; `crates/hl-arb-bot/src/record.rs` spawns one per non-empty `[profile.default.cex]` list, each with its own `(src, src)` `SegmentWriter` under the mount guard. CEX liveness is registered with the readiness monitor but is **non-gating**: a stale reference feed logs a WARN and never takes the recorder out of `/readyz`. The 10-minute run against the real hosts (the Done-when above) is still to do.
 
 #### R-9 — HyperEVM pool source
 - **Do:** Implement §10 with Alloy (`alloy` provider with the `ws` feature, `sol!` for `IUniswapV2Pair.getReserves`, `IUniswapV3Pool.slot0/liquidity`, and `Multicall3.aggregate3`). One multicall per new block, at that block number. Handle reconnects by emitting gaps (reuse the envelope kinds). Add `enabled=false` by default.
@@ -1260,7 +1260,7 @@ Every task also has these implicit **Done when** items: `cargo fmt --all`, `carg
 - **Do:** Poll the §9.1 Deribit endpoints every 60 s for the configured currencies; record `rest` envelopes under `src:"deribit"`. Respect V-10's rate limits.
 - **Tests:** `wiremock` → envelopes; cadence.
 - **Done when:** tests pass; a 1-hour run shows 60 snapshots per currency.
-- **Implemented (2026-09-29).** `crates/mev-recorder/src/sources/deribit.rs` polls `public/get_book_summary_by_currency` and `public/get_index_price` per currency every 60 s and records the raw body as `rest` envelopes; `record.rs` wires it behind `[profile.default.deribit].enabled`, default off (config/record.toml). The 1-hour run (the Done-when above) is still to do. §17 #33 names the per-instrument `ticker`/`get_instruments` fan-out this source does not poll.
+- **Implemented (2026-09-29).** `crates/hl-arb-recorder/src/sources/deribit.rs` polls `public/get_book_summary_by_currency` and `public/get_index_price` per currency every 60 s and records the raw body as `rest` envelopes; `record.rs` wires it behind `[profile.default.deribit].enabled`, default off (config/record.toml). The 1-hour run (the Done-when above) is still to do. §17 #33 names the per-instrument `ticker`/`get_instruments` fan-out this source does not poll.
 
 #### R-13 — `equities` source
 - **Do:** Implement the V-11 provider as a `RawWsConn` `Protocol` (auth from env, never logged), subscribed to the mapped underlyings; record frames under `src:"equities"`. If the provider only offers REST, poll at its fastest allowed rate and note it.

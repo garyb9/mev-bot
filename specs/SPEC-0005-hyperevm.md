@@ -32,7 +32,7 @@ Scope the second venue: DEX arbitrage on **HyperEVM** (chain 999). This spec exi
 
 ## 5. Architecture
 
-- New crate `mev-hyperevm`: Alloy provider, pool sources, state cache, revm fork simulator, executor bindings.
+- New crate `hl-arb-hyperevm`: Alloy provider, pool sources, state cache, revm fork simulator, executor bindings.
 - **Sources** implement a common trait (factory discovery → pool registry → state updates via logs/multicall), mirroring the SPEC-0001 pattern for consistency.
 - **Simulation** uses a local **revm** fork of HyperEVM state as a pre-submit gate (bit-exact), with `eth_call` + state override as an alternative.
 - **Submission** goes through the risk engine (SPEC-0004) and a submitter (private bundle/relay if available, else the mempool).
