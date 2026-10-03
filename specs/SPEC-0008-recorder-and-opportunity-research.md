@@ -1052,7 +1052,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | V-1 | Verify HL WS/REST facts | T1 | S | — | ✅ |
 | V-2 | Verify CEX endpoints, fields, fees, reachability | T1 | S | — | ✅ |
 | V-3 | Verify HIP-3 fees and the spot quote-token set | T1 | S | — | ✅ |
-| V-4 | Measure latency from candidate regions; pick a host | T1 | M | R-6 (`hl probe latency`) | ☐ |
+| V-4 | Measure latency from candidate regions; pick a host | T1 | M | R-6 (`hl probe latency`) | ☐ — recorder running since 2026-09-29; host/latency not formally recorded |
 | V-5 | Verify HyperEVM facts (blocks, mempool, gas, Core↔EVM transfers) | T1 | M | — | ☐ |
 | V-6 | Build the HyperEVM pool list | T2 | M | V-5 | ☐ |
 | V-7 | Measure data volume per stream | T1 | S | R-6 | ☐ |
@@ -1071,7 +1071,7 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | R-7 | Segment reader + `hl record inspect` / `verify` | T1 | S | R-2 | ✅ |
 | R-8 | Binance/Bybit sources | T1 | S | R-3, R-6, V-2 | ✅ |
 | R-9 | HyperEVM pool source | T2 | L | R-6, V-5, V-6 (+ SPEC-0009 node or a provider) | ☐ |
-| R-10 | Deploy recorder (systemd, chrony, runbook, optional shipping) | T1 | M | R-6, R-7, V-4 | ☐ |
+| R-10 | Deploy recorder (systemd, chrony, runbook, optional shipping) | T1 | M | R-6, R-7, V-4 | 🔄 — recording since 2026-09-29; systemd/chrony/shipping hardening remains |
 | R-11 | Options-chain sources: `yahoo-options` chains (all fields) + optional `finsnap` `/snap` poller | T3-data | S | R-5, V-9 | ☐ |
 | R-12 | `deribit` options summary source | T3-data | S | R-5, V-10 | 🔄 |
 | R-13 | `equities` real-time quote source | T1 | M | R-3, V-11 | ☐ |
@@ -1091,11 +1091,11 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | B-7 | Deribit history | T1 | S–M | V-10 | ☐ |
 | B-8 | Equity minute bars (**owner account**; after V-11) | T1 | S | V-11 | ☐ |
 | B-9 | HIST-PRELIM report plumbing | T1 | S | P-5 | ✅ |
-| S-1 | Study O1 HIP-3 dislocations | T1 | M | P-5 | ☐ |
-| S-2 | Study O2 spot triangles | T1 | M | P-5 | ☐ |
-| S-3 | Study O3 spot-perp dislocation | T1 | S | P-5 | ☐ |
+| S-1 | Study O1 HIP-3 dislocations | T1 | M | P-5 | ☐ — PRELIM 2026-10-03: INCONCLUSIVE, leans MARGINAL (dust), see research/reports/prelim-2026-10-03/ |
+| S-2 | Study O2 spot triangles | T1 | M | P-5 | ☐ — PRELIM 2026-10-03: FAIL, see research/reports/prelim-2026-10-03/ |
+| S-3 | Study O3 spot-perp dislocation | T1 | S | P-5 | ☐ — PRELIM 2026-10-03: INCONCLUSIVE, leans FAIL (dust), see research/reports/prelim-2026-10-03/ |
 | S-4 | Study O4 Core↔EVM | T2 | L | P-5, R-9 | ☐ |
-| S-5 | Study O5 CEX lead-lag | T1 | M | P-5, R-8 | ☐ |
+| S-5 | Study O5 CEX lead-lag | T1 | M | P-5, R-8 | ☐ — PRELIM 2026-10-03: FAIL (Part 1 lead-lag supported; Part 2 stale quotes fail at 9 bps), see research/reports/prelim-2026-10-03/ |
 | S-6 | Study O6 liquidation/flow events | T2 | M | P-5 | ☐ |
 | S-7 | Study O7 funding carry | T2 | M | P-5 | ☐ |
 | S-8 | Study O8 HyperEVM MEV feasibility (Q1–Q4 desk research T1; Q5 pool data T2) | T1 | M | V-5 (+ V-6, R-9 for Q5) | ☐ |
@@ -1103,16 +1103,16 @@ Strategy code for any tier still waits for gate G1 (or an owner-approved G1.5 pi
 | S-10a | Study O10 Parts A + D: stock perp vs stock in hours; closed-hours lead-lag | T1 | M | P-4, V-12, R-13 (Part A) | ☐ |
 | S-10b | Study O10 Part C: HIP-3 stock-perp funding and premium by session | T2 | S | P-4, V-12 | ☐ |
 | S-10c | Study O10 Parts B + E: open convergence; weekend/overnight → next session/week | T3 | M | P-6, V-12 | ☐ |
-| S-11a | Study O11 Part A: Bollinger bands on spreads (stat-arb) | T1 | M | P-4 | ☐ |
+| S-11a | Study O11 Part A: Bollinger bands on spreads (stat-arb) | T1 | M | P-4 | ☐ — PRELIM 2026-10-03: FAIL (0/792 cells net-positive), see research/reports/prelim-2026-10-03/ |
 | S-11b | Study O11 Parts B + C: single-instrument bands; bands as a filter | T3 | M | P-6, R-5 candle backfill | ☐ |
-| S-12 | Study O12 oracle-tick lag and mark-price trigger cascade | T1 | M | P-5, R-8 | ☐ |
+| S-12 | Study O12 oracle-tick lag and mark-price trigger cascade | T1 | M | P-5, R-8 | ☐ — PRELIM 2026-10-03: INCONCLUSIVE (not testable, ctx 1 Hz), see research/reports/prelim-2026-10-03/ |
 | S-13 | Study O13 HIP-3 deployer-oracle stair-step / stale fallback | T1 | M | P-5, V-12 | ☐ |
 | S-14 | Study O14 funding-settlement timing | T2 | S | P-5, V-3, V-12 | ☐ |
 | S-15 | Study O15 liquidation-cluster ladder | T2 | L | P-5, public-positions/node source | ☐ |
 | S-16 | Study O16 public TWAP-flow prediction | T2 | M | P-5, node/TWAP source | ☐ |
 | S-17 | Study O17 HIP-4 outcomes: digital vs Deribit + 06:00 pin | T2 | M | P-5, outcomes source, V-10 | ☐ |
 | S-18 | Study O18 cross-dex funding-differential carry | T2 | S | P-5, V-3, V-12 | ☐ |
-| S-19 | Study O19 quote-asset peg defense + true fee multipliers | T1/T2 | S | P-5, V-3 | ☐ |
+| S-19 | Study O19 quote-asset peg defense + true fee multipliers | T1/T2 | S | P-5, V-3 | ☐ — PRELIM 2026-10-03: FAIL / nothing to trade, see research/reports/prelim-2026-10-03/ |
 | S-20 | Study O20 portfolio-/cross-margin contagion forced flow | T2 | L | P-5, public-positions/node source, V-12 | ☐ |
 | S-21 | Study O21 HIP-2 Hyperliquidity deterministic-quote pickoff | T2 | M | P-5 | ☐ |
 | S-22 | Study O22 read-precompile / CoreWriter-delay asymmetry | T2 | L | P-5, R-9, V-5, V-6, node/RPC | ☐ |

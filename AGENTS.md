@@ -35,16 +35,23 @@ Don't pick one silently.
 | `crates/hl-arb-core` | Config, clock, errors, SQLite (`db.rs`, `db/writer.rs`), watchlist | 0000, 0004 |
 | `crates/hl-arb-client` | Hyperliquid REST/WS client, market state, signing, nonce, orders, transports | 0001, 0002 |
 | `crates/hl-arb-engine` | Event-driven engine core: interned types, typed ingest, v2 sync `Strategy` trait + `FundingBasis`/`MarketMaker` (the `hl` run path) | 0010 |
-| `crates/hl-arb-recorder` | Market-data recorder (**new, M3**) | 0008 |
+| `crates/hl-arb-recorder` | Market-data recorder: segments, planner, reader | 0008 |
 | `crates/hl-arb-strategy` | Strategy building blocks: cost model, views, intents, sizing, paper executor; the v2 `Strategy` trait + implementations live in `hl-arb-engine` | 0003, 0010, 0011 |
-| `crates/hl-arb-risk` | Risk limit gate (kill switch and breakers pending: SPEC-0004 §16) | 0004 |
+| `crates/hl-arb-risk` | Risk limit gate, kill switch, trading halt (circuit breakers pending: SPEC-0004 K-4) | 0004 |
 | `crates/hl-arb-hyperevm` | HyperEVM sources/executor (deferred) | 0005 |
 | `crates/hl-arb-metrics` | Tracing, Prometheus metric names, health | 0000, 0006 |
 | `crates/hl-arb-bot` | The `hl` binary (CLI + orchestration); `src/engine.rs` holds config/strategy building, the SQLite `Recorder`, and replay helpers; the run loop is `hl-arb-engine`'s `EngineLoop<StrategyDispatcher>` | all, 0010 |
-| `research/` | Python research toolkit + studies (**new, M3**) | 0008 |
+| `research/` | Python research toolkit + studies | 0008 |
+| `config/` | Default bot config and recorder profiles | 0000, 0008 |
+| `deploy/` | Recorder systemd/run scripts and research-host poller notes | 0006, 0008 |
+| `benches/` | Workspace benchmark baseline for the CI regression check | 0010 |
+| `scripts/` | CI helpers (benchmark regression check) | 0000 |
 | `specs/decisions/` | ADRs (architecture/strategy decisions) | — |
 | `legacy/` | Retired Ethereum bot. Reference only; never build or import it. | — |
 | `RUNBOOK.md` | Operations | 0006 |
+
+Status shown in any prose (this file, `docs/GOAL.md`, the README) is **derived
+from the spec tables** — the spec table is the source of truth.
 
 ## 4. How to pick up and finish a task
 

@@ -17,10 +17,14 @@ HyperEVM later).
 The original Ethereum Uniswap V2 bot is retired under [`legacy/`](legacy/)
 (reference only, never built).
 
-> **Status:** M0-M2 done (platform, market data, signing/execution) and the T0
-> fix-first list is complete. In progress: execution hardening (SPEC-0002 §17)
-> and the market-data recorder plus opportunity research (SPEC-0008). The
-> authoritative roadmap and success metrics are in [`docs/GOAL.md`](docs/GOAL.md).
+> **Status:** M0-M2.5 done (platform, market data, signing/execution,
+> hardening; only the H-10 testnet round-trip is open) and the T0 fix-first
+> list is complete. The recorder has run since 2026-09-29; the research toolkit
+> (SPEC-0008 P-2…P-5, B-1…B-3, B-9) is built and the first preliminary studies
+> are in: **no strategy passes at base fees**
+> ([`research/reports/prelim-2026-10-03/`](research/reports/prelim-2026-10-03/)).
+> The authoritative roadmap and success metrics are in
+> [`docs/GOAL.md`](docs/GOAL.md); status is derived from the spec tables.
 
 ## Architecture
 

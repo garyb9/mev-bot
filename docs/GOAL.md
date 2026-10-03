@@ -198,8 +198,8 @@ Spec numbers are **stable identifiers, not an order**. This table is the order.
 | M0 | Platform: config, modes, observability, CI | SPEC-0000 | ✅ done | — |
 | M1 | HyperCore market data client, local state, benchmark | SPEC-0001, ADR-0001 | ✅ done | M0 |
 | M2 | Execution: signing, nonce, order builder, transports, dead-man switch | SPEC-0002 | ✅ done (testnet round-trip open) | M1 |
-| M2.5 | **Execution hardening + latency baseline**: concurrent WS post, account stream, mandatory `cloid`, dead-man policy, stream watchdog, tick-to-order instrumentation, sign/submit benchmarks | SPEC-0002 §17 | 🔄 H-1…H-4, H-9 ✅; H-5…H-8 open; H-10 (testnet round-trip) open | M2 |
-| **M3** | **Market-data recorder + opportunity research → ADR-0002** | **SPEC-0008** | ⏳ **now** (runs in parallel with M2.5) | M1 |
+| M2.5 | **Execution hardening + latency baseline**: concurrent WS post, account stream, mandatory `cloid`, dead-man policy, stream watchdog, tick-to-order instrumentation, sign/submit benchmarks | SPEC-0002 §17 | 🔄 H-1…H-9 ✅; H-10 (testnet round-trip) open | M2 |
+| **M3** | **Market-data recorder + opportunity research → ADR-0002** | **SPEC-0008** | 🔄 recorder running since 2026-09-29; toolkit P-2…P-5, B-1…B-3, B-9 ✅; preliminary studies done (nothing passes at base fees), gate G1 waits on ≥ 14 days | M1 |
 | M4 | **Event-driven engine** + risk hardening + multi-leg execution; **funding-carry pilot** at small size | SPEC-0010, SPEC-0004 §16, SPEC-0011, SPEC-0003 (A) | 🔄 v2 event engine runs `hl` (E-13); `hl replay` over recorder segments done (E-7); E-6/E-8 remainders, K-tasks, SPEC-0011 open | M2.5, M3 recorder (for replay) |
 | M3.5 | **Own non-validator node in Tokyo**: fastest data, local EVM RPC, richer data (fills, order statuses, L4 book) | SPEC-0009 | later (starts when its §2 triggers fire) | M3 recorder in production |
 | M5 | **First strategy**, the one chosen by ADR-0002 (arb, or the options-informed family if it ranks higher) | new spec, next free number (SPEC-0010+), written after ADR-0002 | planned | M3 gate, M4 |
@@ -218,19 +218,28 @@ Follow the tiers (§2.1):
 0. **T0 fix-first (§2.2) is clear (2026-09-27).** Rows 1–13 are ✅; the only
    remaining §2.2-adjacent item is SPEC-0002 H-10 (testnet round-trip, no
    longer blocked by T0 but needs an owner-provided testnet key).
-1. **T1: SPEC-0008 recorder** (R-1…R-7 done; now V-4/V-7, R-10) deployed to a
-   low-latency host, **and SPEC-0002 §17** remainder (H-5…H-8), in parallel.
+1. **T1: SPEC-0008 recorder** (R-1…R-8 done; recorder running since
+   2026-09-29; now V-4/V-7, R-10) deployed to a low-latency host.
    The recorder is the evidence pipeline and the clock for gate G1 (≥ 14 days
    of data).
 2. **T3-data, small and early:** V-9, V-10, V-13, R-11, R-12. Options
    history needs calendar time, so start its clock now.
 3. **T1 engine:** SPEC-0010 E-6/E-8 remainders (E-7 done), then SPEC-0011 L-tasks
    and SPEC-0004 K-tasks. SPEC-0000 C-tasks are small and can run any time.
-4. **T1 research:** the historical backtest lane starts now with **B-1 → B-2**
-   (B-3 after P-2, B-9 after P-5); P-2…P-5 follow, then studies O1, O2, O3, O5, O8 (desk), O10
-   A+D, O11 A.
-5. **T2** studies, then **T3** research once its gate opens. Everything ends
+4. **T1 research:** B-1…B-3, P-2…P-5, and B-9 are ✅. Preliminary studies of
+   O1, O2, O3, O5, O11a, O12, O19 have run on ~4 days of forward data and
+   **none passes at base fees** (see `research/reports/prelim-2026-10-03/`);
+   next, more recorder days and the O8 (desk), O10 A+D, O11 A studies.
+5. **G1 (preliminary verdict):** no strategy passes at base fees. The evidence
+   favors a fee-aware maker with a CEX signal, funding carry, or HIP-3
+   growth-mode legs (see PROVISIONAL
+   `specs/decisions/0002-strategy-direction.md`).
+6. **T2** studies, then **T3** research once its gate opens. Everything ends
    in ADR-0002.
+
+Status in this document and in the spec tables is **derived from the spec
+tables**, not maintained twice: when a task's status changes, the spec table
+is the source of truth.
 
 ## 9. Decision gates
 

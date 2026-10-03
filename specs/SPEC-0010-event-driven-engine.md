@@ -370,7 +370,7 @@ All tasks are **T1**, except **E-0, which is T0 fix-first** ([`docs/GOAL.md`](..
 | E-8 | Account stream + reconciler integration; delete `account_poller` | M | E-5, SPEC-0002 H-3 | 🔄 |
 | E-9 | Hot-path risk integration (§11) with SPEC-0004 K-tasks | M | E-5, SPEC-0004 K-1, K-2, K-3 | ✅ |
 | E-10 | Latency stamps, histograms, benches incl. zero-alloc (§17) | M | E-6 | ✅ |
-| E-11 | Fixed-point `Px`/`Sz` (**only if** E-10 shows decode/eval over budget) | L | E-10 | ✅ |
+| E-11 | Fixed-point `Px`/`Sz` (**only if** E-10 shows decode/eval over budget) | L | E-10 | n/a (not triggered) |
 | E-12 | Performance checklist (§18), results recorded | M | E-10 | ✅ |
 | E-13 | Remove the tick engine; update SPEC-0003 status; update RUNBOOK | S | E-4, E-5 | ✅ |
 

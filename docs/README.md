@@ -36,6 +36,7 @@ Numbers are identifiers, not an order; the build order is in GOAL.md §7.
 | ADR | Topic |
 |---|---|
 | [0001](../specs/decisions/0001-hl-client-backend.md) | Hyperliquid client backend |
+| [0002](../specs/decisions/0002-strategy-direction.md) | Strategy direction (PROVISIONAL, decision pending owner) |
 
 ## Notes and briefs
 

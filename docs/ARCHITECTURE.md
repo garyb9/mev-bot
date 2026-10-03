@@ -40,9 +40,9 @@ flowchart TB
   end
 
   subgraph Res["research/ — Python, offline"]
-    Hlr["hlr reader → normalizer → Parquet<br/>(planned, SPEC-0008 P-2)"]
-    Studies["episode + slow-signal studies O1..O23<br/>(planned, SPEC-0008 S-tasks)"]
-    Rank["reports → RANKING.md → ADR-0002<br/>(planned)"]
+    Hlr["hlr reader → normalizer → Parquet<br/>(done, SPEC-0008 P-2)"]
+    Studies["episode detector + competition model<br/>(done P-4/ST-1); reports O1..O23<br/>(prelim S-tasks; slow-signal P-6 planned)"]
+    Rank["reports → RANKING.md → ADR-0002<br/>(P-5 done; ADR-0002 PROVISIONAL)"]
   end
 
   HWS --> Ingest
@@ -252,24 +252,27 @@ stateDiagram-v2
 ## 7. Research pipeline
 
 Research is where the decision "what do we trade" is made; it never runs in the
-bot. Today the toolkit has the segment **reader** (`research/hlr/io.py`), the
-Tardis **backfill downloader** (`research/hlr/backfill/tardis.py`, task B-1),
-and the shared §13.1 **table schemas** (`research/hlr/tables.py`). The
-normalizers that populate those tables and the studies are in progress/planned
-(SPEC-0008 Part B, P-2…P-6, S-tasks).
+bot. Today the toolkit has the segment **reader**, the Tardis **backfill
+downloader** and normalizer (tasks B-1/B-2), the HL REST funding/candle
+backfill (B-3), the §13.1 **table schemas** and **normalizer** (P-2), the
+**cost model** (P-3), the **episode detector** with the public-trades
+**competition model** (`compete_usd`, P-4/ST-1), and the **report/RANKING**
+generator (P-5). The slow-signal backtester (P-6) and the studies are in
+progress; the first preliminary studies of O1, O2, O3, O5, O11a, O12 and O19
+have run (SPEC-0008 S-tasks).
 
 ```mermaid
 flowchart LR
   Seg[("recorder segments<br/>*.jsonl.zst / .crashed")] --> Reader["hlr/io.py reader<br/>(today)"]
-  Backfill["historical lane, B-tasks<br/>Tardis · Binance · Bybit · HL REST<br/>HL S3 archive · Hydromancer"] --> Norm
-  Reader --> Norm["normalizer → Parquet tables<br/>§13.1 (planned P-2)"]
-  Norm --> Ep["episode method<br/>§13.3 (planned P-4)"]
+  Backfill["historical lane, B-1…B-9<br/>Tardis · Binance · Bybit · HL REST<br/>HL S3 archive · Hydromancer"] --> Norm
+  Reader --> Norm["normalizer → Parquet tables<br/>§13.1 (done P-2)"]
+  Norm --> Ep["episode method + competition model<br/>§13.3 (done P-4/ST-1)"]
   Norm --> Slow["slow-signal method<br/>§13.8 (planned P-6)"]
-  Ep --> Cost["cost model §13.2 +<br/>latency grid §13.4 (planned P-3)"]
+  Ep --> Cost["cost model §13.2 +<br/>latency grid §13.4 (done P-3)"]
   Slow --> Cost
-  Cost --> Studies["studies O1..O23<br/>(planned S-tasks)"]
-  Studies --> Reports["reports/ + RANKING.md<br/>(planned)"]
-  Reports --> ADR["ADR-0002<br/>(planned)"]
+  Cost --> Studies["studies O1..O23<br/>(prelim S-tasks; in progress)"]
+  Studies --> Reports["reports/ + RANKING.md<br/>(done P-5)"]
+  Reports --> ADR["ADR-0002<br/>(PROVISIONAL)"]
 ```
 
 Historical data (Tardis free days, HL `/info`, requester-pays S3 archives) can
