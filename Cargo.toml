@@ -51,7 +51,7 @@ async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 wiremock = "0.6"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 anyhow = "1"
 figment = { version = "0.10", features = ["toml", "env"] }
