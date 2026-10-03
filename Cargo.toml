@@ -65,6 +65,15 @@ metrics-exporter-prometheus = "0.16"
 metrics-util = "0.19"
 axum = "0.8"
 
+[profile.dev]
+# Line tables only: enough for backtraces, far less disk than full debuginfo.
+# Measured -39% target/ size and -9% wall on a clean build (ARCH-011).
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies do not need debuginfo for local work; keeps target/ small.
+debug = false
+
 [profile.release]
 # Fat LTO: the workspace is small and its release artifact is the latency-
 # critical production binary, so the extra link time is acceptable. E-12 set
