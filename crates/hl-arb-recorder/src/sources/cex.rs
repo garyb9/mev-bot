@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hl_arb_client::raw_ws::ReconnectPolicy;
+use hl_arb_client::raw_ws::{DIAL_TIMEOUT, ReconnectPolicy};
 use hl_arb_client::{Protocol, RawEvent, RawWsConn, raw_ws};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -62,6 +62,7 @@ pub const BINANCE_RECONNECT: ReconnectPolicy = ReconnectPolicy {
     base: Duration::from_millis(250),
     max: Duration::from_secs(10),
     healthy_after: Duration::from_secs(5),
+    dial_timeout: DIAL_TIMEOUT,
 };
 
 /// The reconnect policy for a venue. The match is exhaustive on purpose: a new
@@ -260,6 +261,12 @@ pub struct CexConfig {
     pub watchdog: Duration,
     /// Application keepalive interval (only Bybit uses it).
     pub ping_interval: Duration,
+    /// Override the venue's default [`ReconnectPolicy`]. `None` uses
+    /// [`reconnect_policy_for`]. Tests under paused virtual time set a policy
+    /// with a far-future `dial_timeout`, since auto-advanced time would
+    /// otherwise trip the production handshake deadline while the runtime is
+    /// idle waiting on real IO.
+    pub reconnect_policy: Option<ReconnectPolicy>,
 }
 
 impl CexConfig {
@@ -275,6 +282,7 @@ impl CexConfig {
             base_url: kind.base_url().to_string(),
             watchdog: CEX_WATCHDOG,
             ping_interval,
+            reconnect_policy: None,
         }
     }
 }
@@ -373,9 +381,11 @@ impl CexSource {
     }
 
     /// Binance sources reconnect fast ([`BINANCE_RECONNECT`]); Bybit keeps the
-    /// default policy.
+    /// default policy. A [`CexConfig::reconnect_policy`] override wins.
     fn reconnect_policy(&self) -> ReconnectPolicy {
-        reconnect_policy_for(self.config.kind)
+        self.config
+            .reconnect_policy
+            .unwrap_or_else(|| reconnect_policy_for(self.config.kind))
     }
 
     /// The URL the next dial uses (also recorded in `conn_open.meta.url`).
@@ -656,6 +666,7 @@ mod tests {
                 CexKind::BybitLinear => BYBIT_PING_INTERVAL,
                 _ => raw_ws::DEFAULT_PING_INTERVAL,
             },
+            reconnect_policy: None,
         }
     }
 
@@ -1106,6 +1117,12 @@ mod tests {
 
         let mut config = config(CexKind::BybitLinear, format!("ws://{addr}"), &["BTCUSDT"]);
         config.watchdog = Duration::from_secs(3600);
+        // Paused time auto-advances while the runtime waits on the real
+        // handshake, so the production dial deadline must not apply here.
+        config.reconnect_policy = Some(ReconnectPolicy {
+            dial_timeout: Duration::from_secs(24 * 60 * 60),
+            ..ReconnectPolicy::default()
+        });
         let (source, mut rx) = source(config);
         let (shutdown_tx, shutdown_rx) = shutdown_channel();
         let handle = tokio::spawn(source.run(shutdown_rx));

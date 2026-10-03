@@ -136,6 +136,7 @@ pub async fn run(
                 state,
                 shutdown_rx.clone(),
                 delay,
+                hl_arb_client::raw_ws::ReconnectPolicy::default(),
             )),
         ));
     }

@@ -3,6 +3,7 @@
 
 use super::clock::chrony_tracking;
 use super::*;
+use hl_arb_client::raw_ws::ReconnectPolicy;
 
 // ---------------------------------------------------------------------------
 // WebSocket connection task
@@ -158,6 +159,7 @@ pub(super) async fn run_ws_conn(
     state: Arc<ConnState>,
     mut shutdown: watch::Receiver<bool>,
     start_delay: Duration,
+    policy: ReconnectPolicy,
 ) {
     let src = "hl-ws";
     let conn_id = conn.id.clone();
@@ -191,7 +193,15 @@ pub(super) async fn run_ws_conn(
     let mut gap_started: Option<(i64, u64)> = None;
     let mut gap_reason = String::new();
     let mut raw = loop {
-        match RawWsConn::connect(protocol(), subs.clone()).await {
+        match RawWsConn::connect_with_policy(
+            protocol(),
+            subs.clone(),
+            hl_arb_client::raw_ws::DEFAULT_WATCHDOG,
+            hl_arb_client::raw_ws::DEFAULT_PING_INTERVAL,
+            policy,
+        )
+        .await
+        {
             Ok(raw) => break raw,
             Err(err) => {
                 warn!(conn = %conn_id, error = %err, "websocket connect failed; retrying");

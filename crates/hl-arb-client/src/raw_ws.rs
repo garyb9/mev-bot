@@ -42,8 +42,9 @@ pub const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 /// handshake hangs the caller forever (PERF-004/SEC-001).
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Per-connection reconnect policy: the backoff schedule and when a dropped
-/// connection counts as healthy (resetting the attempt counter).
+/// Per-connection reconnect policy: the backoff schedule, when a dropped
+/// connection counts as healthy (resetting the attempt counter), and the
+/// handshake deadline for its dials.
 ///
 /// [`ReconnectPolicy::default`] is exactly the historical behaviour
 /// ([`BACKOFF_BASE`], [`BACKOFF_MAX`], [`HEALTHY_AFTER`]); Hyperliquid and Bybit
@@ -58,15 +59,23 @@ pub struct ReconnectPolicy {
     /// A connection that lived at least this long resets the attempt counter
     /// when it drops.
     pub healthy_after: Duration,
+    /// Maximum time to complete a WebSocket handshake before a dial is
+    /// abandoned with a typed error. A host that accepts TCP and then stalls
+    /// the handshake must not hang the caller (PERF-004/SEC-001). Tests that
+    /// run under paused virtual time dialing a real socket set this far future
+    /// so auto-advanced time can never trip it.
+    pub dial_timeout: Duration,
 }
 
 impl Default for ReconnectPolicy {
-    /// The historical policy: 500 ms base, 30 s max, healthy after 60 s.
+    /// The historical policy: 500 ms base, 30 s max, healthy after 60 s, and
+    /// the production [`DIAL_TIMEOUT`].
     fn default() -> Self {
         Self {
             base: BACKOFF_BASE,
             max: BACKOFF_MAX,
             healthy_after: HEALTHY_AFTER,
+            dial_timeout: DIAL_TIMEOUT,
         }
     }
 }
@@ -197,8 +206,6 @@ pub struct RawWsConn {
     subscriptions: Vec<String>,
     watchdog: Duration,
     ping_interval: Duration,
-    /// Handshake deadline for this connection's dials, including reconnects.
-    dial_timeout: Duration,
     shutdown: Arc<Notify>,
     last_data: Instant,
     opened_at: Instant,
@@ -252,47 +259,7 @@ impl RawWsConn {
         ping_interval: Duration,
         policy: ReconnectPolicy,
     ) -> Result<Self> {
-        Self::connect_inner(
-            protocol,
-            subscriptions,
-            watchdog,
-            ping_interval,
-            policy,
-            DIAL_TIMEOUT,
-        )
-        .await
-    }
-
-    /// Dial with an explicit handshake timeout (tests use a shorter one).
-    #[cfg(test)]
-    async fn connect_with_dial_timeout(
-        protocol: Box<dyn Protocol>,
-        subscriptions: Vec<String>,
-        watchdog: Duration,
-        ping_interval: Duration,
-        policy: ReconnectPolicy,
-        dial_timeout: Duration,
-    ) -> Result<Self> {
-        Self::connect_inner(
-            protocol,
-            subscriptions,
-            watchdog,
-            ping_interval,
-            policy,
-            dial_timeout,
-        )
-        .await
-    }
-
-    async fn connect_inner(
-        protocol: Box<dyn Protocol>,
-        subscriptions: Vec<String>,
-        watchdog: Duration,
-        ping_interval: Duration,
-        policy: ReconnectPolicy,
-        dial_timeout: Duration,
-    ) -> Result<Self> {
-        let socket = dial_with_timeout(&protocol.url(), dial_timeout).await?;
+        let socket = dial_with_timeout(&protocol.url(), policy.dial_timeout).await?;
         let src = protocol.name();
         let now = Instant::now();
         let mut conn = Self {
@@ -301,7 +268,6 @@ impl RawWsConn {
             subscriptions,
             watchdog,
             ping_interval,
-            dial_timeout,
             shutdown: Arc::new(Notify::new()),
             last_data: now,
             opened_at: now,
@@ -361,7 +327,7 @@ impl RawWsConn {
                 _ = self.shutdown.notified() => {
                     return Err(Error::Http("websocket shutdown requested".into()));
                 }
-                result = dial_with_timeout(&url, self.dial_timeout) => {
+                result = dial_with_timeout(&url, self.policy.dial_timeout) => {
                     match result {
                         Ok(socket) => socket,
                         Err(err) => {
@@ -630,6 +596,7 @@ mod tests {
             base: Duration::from_millis(250),
             max: Duration::from_secs(10),
             healthy_after: Duration::from_secs(5),
+            dial_timeout: DIAL_TIMEOUT,
         };
         for attempt in 1..=50 {
             let d = p.jittered_backoff(attempt);
@@ -811,13 +778,15 @@ mod tests {
         });
 
         let start = Instant::now();
-        let err = match RawWsConn::connect_with_dial_timeout(
+        let err = match RawWsConn::connect_with_policy(
             protocol(format!("ws://{addr}")),
             vec![],
             Duration::from_secs(30),
             Duration::from_secs(30),
-            ReconnectPolicy::default(),
-            Duration::from_millis(100),
+            ReconnectPolicy {
+                dial_timeout: Duration::from_millis(100),
+                ..ReconnectPolicy::default()
+            },
         )
         .await
         {
@@ -848,19 +817,19 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        let mut conn = RawWsConn::connect_with_dial_timeout(
+        let mut conn = RawWsConn::connect_with_policy(
             protocol(format!("ws://{addr}")),
             vec![],
             Duration::from_secs(3_600),
             Duration::from_secs(30),
-            // Tiny backoff so the reconnect reaches the dial immediately.
+            // Tiny backoff so the reconnect reaches the dial immediately, and a
+            // long dial timeout so only the shutdown signal can end the call.
             ReconnectPolicy {
                 base: Duration::from_millis(10),
                 max: Duration::from_millis(10),
                 healthy_after: Duration::from_secs(60),
+                dial_timeout: Duration::from_secs(30),
             },
-            // A long dial timeout: only the shutdown signal can end the call.
-            Duration::from_secs(30),
         )
         .await
         .unwrap();
@@ -980,7 +949,7 @@ mod tests {
             }
         });
 
-        let conn = RawWsConn::connect_with_dial_timeout(
+        let conn = RawWsConn::connect_with_policy(
             Box::new(KeepaliveProtocol {
                 url: format!("ws://{addr}"),
             }),
@@ -990,8 +959,10 @@ mod tests {
             Duration::from_secs(20),
             // Paused virtual time would fire a wall-clock-sized dial deadline
             // before the real handshake finishes, so keep it far future here.
-            ReconnectPolicy::default(),
-            Duration::from_secs(3_600),
+            ReconnectPolicy {
+                dial_timeout: Duration::from_secs(3_600),
+                ..ReconnectPolicy::default()
+            },
         )
         .await
         .unwrap();
@@ -1044,13 +1015,16 @@ mod tests {
             let mut ws = accept_async(stream).await.unwrap();
             while let Some(Ok(_)) = ws.next().await {}
         });
-        let mut conn = RawWsConn::connect_with_dial_timeout(
+        let mut conn = RawWsConn::connect_with_policy(
             protocol(format!("ws://{addr}")),
             vec![],
             Duration::from_secs(3_600),
             Duration::from_secs(3_600),
-            ReconnectPolicy::default(),
-            Duration::from_secs(3_600),
+            // Paused time: keep the dial deadline far future.
+            ReconnectPolicy {
+                dial_timeout: Duration::from_secs(3_600),
+                ..ReconnectPolicy::default()
+            },
         )
         .await
         .unwrap();
@@ -1199,13 +1173,16 @@ mod tests {
                 }
             }
         });
-        let mut conn = RawWsConn::connect_with_dial_timeout(
+        let mut conn = RawWsConn::connect_with_policy(
             protocol(format!("ws://{addr}")),
             vec!["s".to_string()],
             Duration::from_secs(3_600),
             Duration::from_secs(3_600),
-            ReconnectPolicy::default(),
-            Duration::from_secs(3_600),
+            // Paused time: keep the dial deadline far future.
+            ReconnectPolicy {
+                dial_timeout: Duration::from_secs(3_600),
+                ..ReconnectPolicy::default()
+            },
         )
         .await
         .unwrap();
@@ -1294,13 +1271,16 @@ mod tests {
         let subs: Vec<String> = (0..N)
             .map(|i| format!("{i}:{}", "x".repeat(4 * 1024)))
             .collect();
-        let mut conn = RawWsConn::connect_with_dial_timeout(
+        let mut conn = RawWsConn::connect_with_policy(
             protocol(format!("ws://{addr}")),
             subs,
             Duration::from_secs(3_600),
             Duration::from_secs(3_600),
-            ReconnectPolicy::default(),
-            Duration::from_secs(3_600),
+            // Paused time: keep the dial deadline far future.
+            ReconnectPolicy {
+                dial_timeout: Duration::from_secs(3_600),
+                ..ReconnectPolicy::default()
+            },
         )
         .await
         .unwrap();
@@ -1365,13 +1345,16 @@ mod tests {
             }
         });
 
-        let mut conn = RawWsConn::connect_with_dial_timeout(
+        let mut conn = RawWsConn::connect_with_policy(
             protocol(format!("ws://{addr}")),
             vec!["sub1".to_string()],
             Duration::from_secs(3_600),
             Duration::from_secs(30),
-            ReconnectPolicy::default(),
-            Duration::from_secs(3_600),
+            // Paused time: keep the dial deadline far future.
+            ReconnectPolicy {
+                dial_timeout: Duration::from_secs(3_600),
+                ..ReconnectPolicy::default()
+            },
         )
         .await
         .unwrap();

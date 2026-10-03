@@ -27,6 +27,16 @@ fn temp_dir(tag: &str) -> tempfile::TempDir {
         .unwrap()
 }
 
+/// A reconnect policy for tests that dial a real socket under paused virtual
+/// time: auto-advanced time would otherwise trip the production dial deadline
+/// while the runtime is idle waiting on real IO.
+fn paused_time_policy() -> hl_arb_client::raw_ws::ReconnectPolicy {
+    hl_arb_client::raw_ws::ReconnectPolicy {
+        dial_timeout: Duration::from_secs(24 * 60 * 60),
+        ..Default::default()
+    }
+}
+
 fn segment_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_segments(root, &mut files).unwrap();
@@ -669,6 +679,7 @@ async fn cex_source_writes_a_bybit_linear_segment() {
     });
     let config = CexConfig {
         base_url: format!("ws://{addr}"),
+        reconnect_policy: None,
         ..CexConfig::new(CexKind::BybitLinear, vec!["BTCUSDT".to_string()])
     };
     let source = CexSource::new(config, sink, clock);
@@ -795,6 +806,7 @@ async fn recorder_writes_segments_from_mock_feeds() {
         ConnState::new(),
         shutdown_rx.clone(),
         Duration::ZERO,
+        hl_arb_client::raw_ws::ReconnectPolicy::default(),
     ));
 
     // REST task.
@@ -921,6 +933,7 @@ async fn hl_ws_gap_covers_the_real_downtime() {
         ConnState::new(),
         shutdown_rx,
         Duration::ZERO,
+        hl_arb_client::raw_ws::ReconnectPolicy::default(),
     ));
 
     // Wait for the reconnect to complete, let `gap_end` flush, then stop.
@@ -1079,6 +1092,7 @@ async fn hl_ws_gap_is_one_pair_across_clock_ticks() {
         ConnState::new(),
         shutdown_rx,
         Duration::ZERO,
+        paused_time_policy(),
     ));
 
     // The server signals after it read the reconnect's subscribe frame;
