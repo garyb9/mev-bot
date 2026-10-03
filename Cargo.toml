@@ -33,7 +33,7 @@ rust_decimal = { version = "1.43", features = ["serde"] }
 
 alloy-primitives = { version = "1", features = ["k256"] }
 alloy-sol-types = "1"
-k256 = "0.13"
+k256 = "0.14"
 rmp-serde = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"
