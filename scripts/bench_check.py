@@ -11,10 +11,11 @@ not run), which means the bench job itself failed to build or run.
 
 Only the Python standard library is used.
 
-Baselines are host-specific. The committed baseline was generated on the dev
-host, and CI runners are usually slower, so the first CI run may warn on many
-benches; treat that as a signal to re-measure, not as a code regression. Prefer
-a baseline generated on CI if the check is meant to gate PRs.
+Baselines are host-specific. The committed baseline was generated on the
+GitHub Actions runner (see the ``host`` field in ``benches/baseline.json``), and
+a local dev host is usually faster, so a local run can appear faster than the
+baseline. Re-measure on the intended host class before treating a delta as a
+regression.
 
 Each bench target is run under its own absolute ``CRITERION_HOME`` because some
 benchmark ids collide across binaries (for example ``decode/l2Book`` exists in
