@@ -35,7 +35,7 @@ use hl_arb_client::MIN_ORDER_NOTIONAL;
 use hl_arb_core::config::{RateBudgetSettings, RiskSettings};
 use hl_arb_risk::Decision;
 use hl_arb_risk::kill::KillSwitch;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::builder::AssetMeta;
 use crate::orders::OrderManager;
@@ -547,6 +547,10 @@ impl RiskGate {
     }
 
     /// The shared checks for any risk-increasing action (place or modify).
+    ///
+    /// The requested size is rounded toward zero to the market's lot before any
+    /// notional or exposure check, so risk approves the exact size the builder
+    /// will send and can never overshoot a cap (PERF-003).
     fn check_increasing(
         &self,
         coin: CoinId,
@@ -577,16 +581,22 @@ impl RiskGate {
         if reference <= Decimal::ZERO {
             return Err(RiskReason::NoReferencePrice);
         }
-        let mut size = size;
-        let mut resized = false;
+        let requested = size;
+        let mut size = round_size_lot(size, ctx.meta.sz_decimals);
+        if size <= Decimal::ZERO {
+            return Err(RiskReason::NonPositiveSize);
+        }
+        // A rounded size that differs from the request must be handed back so
+        // the builder sends it rather than the unrounded request.
+        let mut resized = size != requested;
         if let Some(cap) = self.limits.max_order_notional
             && size * reference > cap
         {
-            size = cap / reference;
+            size = round_size_lot(cap / reference, ctx.meta.sz_decimals);
             resized = true;
         }
 
-        // 7. per-coin projected exposure = confirmed + worst-case in-flight.
+        // 8. per-coin projected exposure = confirmed + worst-case in-flight.
         if let Some(cap) = self.limits.max_position_notional
             && !reduce_only
         {
@@ -597,12 +607,12 @@ impl RiskGate {
                 return Err(RiskReason::PositionExposure);
             }
             if size * reference > room {
-                size = room / reference;
+                size = round_size_lot(room / reference, ctx.meta.sz_decimals);
                 resized = true;
             }
         }
 
-        // 8. account margin utilization.
+        // 9. account margin utilization.
         if let Some(cap) = self.limits.max_margin_utilization_bps {
             let utilization = margin_utilization_bps(ctx.account);
             if utilization > cap {
@@ -631,6 +641,14 @@ impl RiskGate {
             Decision::Approve
         })
     }
+}
+
+/// Round a size toward zero to the market's lot (`sz_decimals`).
+///
+/// Risk evaluates this rounded size so it matches what the wire builder sends
+/// (PERF-003).
+fn round_size_lot(size: Sz, sz_decimals: u32) -> Sz {
+    size.round_dp_with_strategy(sz_decimals, RoundingStrategy::ToZero)
 }
 
 /// Margin utilization in bps of account value; zero when value is unknown
@@ -958,11 +976,105 @@ mod tests {
         );
         let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
         // Order cap first resizes 10 -> 2.5; then position room (10 - 4 = 6) is
-        // larger, so the order cap wins.
+        // larger, so the order cap wins. The size is rounded toward zero to the
+        // market lot (szDecimals = 0), so 2.5 becomes 2.
         assert_eq!(
             gate.evaluate(&buy(Some(ds("100")), ds("10")), &ctx),
-            Ok(Decision::Resize(ds("2.5")))
+            Ok(Decision::Resize(ds("2")))
         );
+    }
+
+    fn meta_with(sz_decimals: u32) -> AssetMeta {
+        AssetMeta {
+            sz_decimals,
+            ..asset_meta()
+        }
+    }
+
+    #[test]
+    fn risk_evaluates_the_rounded_size() {
+        let orders = OrderManager::new(1);
+        let acct = account("0", "1000", "0");
+        let slot = slot();
+        let meta = meta_with(1); // szDecimals = 1
+        let budget = huge_budget();
+        let mut gate = RiskGate::new(
+            RiskLimits {
+                min_notional: ds("1"),
+                ..Default::default()
+            },
+            KillSwitch::new(),
+            Breakers::new(),
+        );
+        let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+        // 1.49 rounds toward zero to 1.4; risk hands the rounded size back.
+        assert_eq!(
+            gate.evaluate(&buy(Some(ds("100")), ds("1.49")), &ctx),
+            Ok(Decision::Resize(ds("1.4")))
+        );
+    }
+
+    #[test]
+    fn risk_cap_accepts_a_request_that_rounds_below_it() {
+        let orders = OrderManager::new(1);
+        let acct = account("0", "1000", "0");
+        let slot = slot();
+        let meta = asset_meta(); // szDecimals = 0
+        let budget = huge_budget();
+        let mut gate = RiskGate::new(
+            RiskLimits {
+                max_order_notional: Some(ds("1.5")),
+                min_notional: ds("0.1"),
+                ..Default::default()
+            },
+            KillSwitch::new(),
+            Breakers::new(),
+        );
+        let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+        // Requested 1.4 at a $1 reference rounds to 1, below the $1.5 cap.
+        assert_eq!(
+            gate.evaluate(&buy(Some(ds("1")), ds("1.4")), &ctx),
+            Ok(Decision::Resize(ds("1")))
+        );
+    }
+
+    /// The approved size never exceeds the requested size, for every lot size.
+    #[test]
+    fn approved_size_never_exceeds_requested_for_any_lot() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+        for sz_decimals in 0..=5u32 {
+            let meta = meta_with(sz_decimals);
+            let orders = OrderManager::new(1);
+            let acct = account("0", "1000", "0");
+            let slot = slot();
+            let budget = huge_budget();
+            let mut gate = RiskGate::new(
+                RiskLimits {
+                    max_order_notional: Some(ds("1000000")),
+                    max_position_notional: Some(ds("1000000")),
+                    max_margin_utilization_bps: Some(ds("9000")),
+                    min_notional: ds("0.0001"),
+                    ..Default::default()
+                },
+                KillSwitch::new(),
+                Breakers::new(),
+            );
+            for _ in 0..2_000 {
+                let requested = Decimal::from(rng.below(500) + 1) / Decimal::from(100);
+                let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+                if let Ok(decision) = gate.evaluate(&buy(Some(ds("100")), requested), &ctx) {
+                    let approved = match decision {
+                        Decision::Approve => requested,
+                        Decision::Resize(size) => size,
+                        Decision::Reject(_) => continue,
+                    };
+                    assert!(
+                        approved <= requested,
+                        "sz_decimals={sz_decimals}: approved {approved} > requested {requested}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
