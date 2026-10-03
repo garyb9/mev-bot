@@ -1135,6 +1135,7 @@ fn empty_report() -> reader::VerifyReport {
         unfinalized: Vec::new(),
         corrupt_orphans: Vec::new(),
         partials: Vec::new(),
+        unknown_kinds: 0,
         coverage: Vec::new(),
     }
 }
