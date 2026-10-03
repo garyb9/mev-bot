@@ -172,7 +172,7 @@ Milestones later in the list may split into smaller commits (e.g. client vs benc
 
 ## 17. Open questions
 
-1. Repo/binary naming — keep `mev-bot`, or rename the binary (e.g. `hl-bot`) while keeping the repo?
+1. ~~Repo/binary naming~~ **Resolved (2026-10-03):** the repo is renamed `hl-arb-bot`; the binary stays `hl` and the Cargo packages keep their `mev-*` names (a prefix rename would touch every import; revisit only if wanted).
 2. Delete old code outright, or keep under `legacy/` (ABIs + math + docs only)?
 3. Deployment target preference (VPS region, container vs bare metal)?
 4. Do you want the SPEC-0001 client benchmark to also include a community Alloy-native SDK, or custom-vs-official only?
