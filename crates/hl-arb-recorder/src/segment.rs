@@ -8,16 +8,14 @@
 //! One writer owns one `(src, conn)` stream. Segments rotate at the top of a
 //! UTC hour or when the uncompressed size passes [`SegmentConfig::max_raw_bytes`].
 
-use std::collections::HashMap;
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel,
 };
-use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,6 +25,18 @@ use tracing::{debug, error, warn};
 
 use crate::envelope::{Envelope, EnvelopeClock, SegmentOpenMeta, SystemEnvelopeClock};
 use crate::mount_guard::{MOUNT_RECHECK_INTERVAL, MountError, MountGuard};
+
+mod manifest;
+mod os;
+mod paths;
+
+use self::manifest::append_manifest_line;
+use self::os::is_lost_mount;
+use self::paths::{
+    create_dir_below, hour_key, manifest_path_for_t_ns, recover_crashed, rel_path, utc_parts,
+};
+
+pub use self::os::{DiskSpace, SystemDiskSpace};
 
 /// At most one "queue full" warning per this interval.
 const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
@@ -62,68 +72,6 @@ pub enum SegmentError {
         /// The bounded join timeout that elapsed.
         timeout: Duration,
     },
-}
-
-/// Whether an I/O error means the segment's device or file vanished, which must
-/// stop the stream rather than be retried (R-14 fix1 §5).
-///
-/// Errnos that a lost mount returns directly stop immediately. Any other write
-/// error also stops when the mount probe itself fails: the probe is the
-/// authority, so a fresh EACCES/ENOSPC on a vanished mount is caught too. The
-/// probe runs only on an actual write error, never per envelope.
-#[cfg(unix)]
-fn is_lost_mount(err: &SegmentError, guard: &MountGuard) -> bool {
-    let SegmentError::Io(io) = err else {
-        return false;
-    };
-    if matches!(
-        io.raw_os_error(),
-        Some(libc::EIO)
-            | Some(libc::ENOENT)
-            | Some(libc::ENODEV)
-            | Some(libc::ENOTCONN)
-            | Some(libc::ESTALE)
-            | Some(libc::EACCES)
-    ) {
-        return true;
-    }
-    guard.check().is_err()
-}
-
-#[cfg(not(unix))]
-fn is_lost_mount(_err: &SegmentError, guard: &MountGuard) -> bool {
-    guard.check().is_err()
-}
-
-/// A source of free-disk-space measurements, injectable for tests.
-pub trait DiskSpace: Send + Sync + 'static {
-    /// Free bytes available to the process at `path`.
-    fn free_bytes(&self, path: &Path) -> io::Result<u64>;
-}
-
-/// Disk-space measurement backed by `statvfs(3)`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemDiskSpace;
-
-impl DiskSpace for SystemDiskSpace {
-    #[cfg(unix)]
-    fn free_bytes(&self, path: &Path) -> io::Result<u64> {
-        use std::os::unix::ffi::OsStrExt;
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-        // SAFETY: `c_path` is a valid NUL-terminated path and `stat` is a valid
-        // out-parameter for the duration of the call.
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
-    }
-
-    #[cfg(not(unix))]
-    fn free_bytes(&self, _path: &Path) -> io::Result<u64> {
-        Ok(u64::MAX)
-    }
 }
 
 /// Configuration for one `(src, conn)` segment writer.
@@ -868,207 +816,6 @@ pub struct ManifestEntry {
     pub bytes_zst: u64,
     /// Whether the segment was recovered from a crash.
     pub crashed: bool,
-}
-
-fn recover_crashed(config: &SegmentConfig) -> Result<(), SegmentError> {
-    let root = config.out_dir.join(&config.network).join(&config.src);
-    if !root.is_dir() {
-        return Ok(());
-    }
-    // Recovery renames `.partial` files and appends manifest lines: guard it.
-    config.mount_guard.check_or_trip()?;
-    let mut partials = Vec::new();
-    collect_partials(&root, &mut partials)?;
-    // Match the connection exactly by parsing the name: a prefix test would let
-    // conn `hl-ws` claim `hl-ws-02`'s files.
-    partials.retain(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .and_then(parse_partial_name)
-            .is_some_and(|(conn, _)| conn == config.conn)
-    });
-    partials.sort();
-    for partial in partials {
-        let name = partial
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-        let (conn, start_t_ns) =
-            parse_partial_name(&name).unwrap_or_else(|| (config.conn.clone(), 0));
-        let crashed = partial.with_extension("crashed");
-        fs::rename(&partial, &crashed)?;
-        let bytes_zst = fs::metadata(&crashed).map(|meta| meta.len()).unwrap_or(0);
-        let entry = ManifestEntry {
-            file: rel_path(&config.out_dir, &crashed),
-            src: config.src.clone(),
-            conn,
-            first_t_ns: start_t_ns,
-            last_t_ns: 0,
-            records: 0,
-            bytes_raw: 0,
-            bytes_zst,
-            crashed: true,
-        };
-        let manifest = crashed
-            .parent()
-            .and_then(Path::parent)
-            .map(|day| day.join("manifest.jsonl"))
-            .unwrap_or_else(|| manifest_path_for_t_ns(config, start_t_ns));
-        append_manifest_line(&manifest, &entry, config)?;
-    }
-    Ok(())
-}
-
-fn collect_partials(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), SegmentError> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            collect_partials(&path, out)?;
-        } else if file_type.is_file()
-            && let Some(name) = path.file_name().and_then(|name| name.to_str())
-            && name.ends_with(".partial")
-        {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn parse_partial_name(name: &str) -> Option<(String, i64)> {
-    let stem = name.strip_suffix(".partial")?;
-    let stem = stem.strip_suffix(".jsonl.zst")?;
-    let (conn, timestamp) = stem.rsplit_once('-')?;
-    let t_ns = timestamp.parse::<i64>().ok()?;
-    Some((conn.to_string(), t_ns))
-}
-
-/// Serializes manifest appends for one manifest path across every writer in the
-/// process (R-2b).
-///
-/// Every `SegmentWriter` for a `(src, day)` appends to the same
-/// `manifest.jsonl`, each with its own freshly-opened `O_APPEND` handle. On the
-/// recorder's real output filesystem — a WSL 9p `drvfs` mount of the external
-/// SSD — `O_APPEND` across independently-opened handles is **not** atomic: the
-/// 9p client caches the file size, so two writers that open at the same instant
-/// append at the same offset and one line is silently lost with no error.
-/// Serializing the whole open→write→fsync→close per path means at most one
-/// handle is appending at a time, which removes the race.
-fn manifest_append_lock(path: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    let registry = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = registry.lock().unwrap_or_else(|poison| poison.into_inner());
-    locks.entry(path.to_path_buf()).or_default().clone()
-}
-
-fn append_manifest_line(
-    path: &Path,
-    entry: &ManifestEntry,
-    config: &SegmentConfig,
-) -> Result<(), SegmentError> {
-    // Hold one append at a time per manifest so concurrent writers cannot race
-    // the 9p/drvfs append (R-2b). The lock is held across the guard check and
-    // every create/open/write below, so the guard behaviour itself is unchanged.
-    let lock = manifest_append_lock(path);
-    let _append_guard = lock.lock().unwrap_or_else(|poison| poison.into_inner());
-    #[cfg(test)]
-    let _probe = append_probe::enter(path);
-    // Re-check immediately before creating/opening (R-14 §2).
-    config.mount_guard.check_or_trip()?;
-    if let Some(parent) = path.parent() {
-        create_dir_below(&config.out_dir, parent, &config.mount_guard)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let mut line = serde_json::to_vec(entry)?;
-    line.push(b'\n');
-    file.write_all(&line)?;
-    file.sync_data()?;
-    Ok(())
-}
-
-/// Create `dir` below `out_dir`, never creating `out_dir` itself (R-14 fix2 §3).
-///
-/// Unguarded this is `create_dir_all` (unchanged). Under a guard: re-check the
-/// mount, fail closed (trip, create nothing) if `out_dir` itself is missing,
-/// then create each level below it one at a time with `create_dir`.
-fn create_dir_below(out_dir: &Path, dir: &Path, guard: &MountGuard) -> Result<(), SegmentError> {
-    if !guard.is_guarded() {
-        fs::create_dir_all(dir)?;
-        return Ok(());
-    }
-    guard.check_or_trip()?;
-    if !out_dir.is_dir() {
-        // `out_dir` vanished (or was never created): never recreate it.
-        guard.trip();
-        return Err(SegmentError::Mount(MountError::Missing {
-            mount: out_dir.to_path_buf(),
-        }));
-    }
-    let relative = dir.strip_prefix(out_dir).map_err(|_| {
-        SegmentError::Mount(MountError::OutDirOutside {
-            out_dir: dir.to_path_buf(),
-            mount: out_dir.to_path_buf(),
-        })
-    })?;
-    let mut level = out_dir.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            continue;
-        };
-        level.push(part);
-        match fs::create_dir(&level) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(SegmentError::Io(err)),
-        }
-    }
-    Ok(())
-}
-
-fn manifest_path_for_t_ns(config: &SegmentConfig, t_ns: i64) -> PathBuf {
-    let (year, month, day, _) = utc_parts(t_ns);
-    config
-        .out_dir
-        .join(&config.network)
-        .join(&config.src)
-        .join(format!("{year:04}-{month:02}-{day:02}"))
-        .join("manifest.jsonl")
-}
-
-fn rel_path(out_dir: &Path, path: &Path) -> String {
-    path.strip_prefix(out_dir)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-fn hour_key(t_ns: i64) -> i64 {
-    t_ns.div_euclid(3_600_000_000_000)
-}
-
-fn utc_parts(t_ns: i64) -> (i32, u32, u32, u32) {
-    let secs = t_ns.div_euclid(1_000_000_000);
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = secs.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    (year, month, day, (secs_of_day / 3600) as u32)
-}
-
-// Howard Hinnant's `civil_from_days`: days since 1970-01-01 to (year, month, day).
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    (year as i32, month as u32, day as u32)
 }
 
 /// Test-only instrumentation that records how many `append_manifest_line` calls

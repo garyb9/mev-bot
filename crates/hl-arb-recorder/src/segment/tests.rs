@@ -2,8 +2,10 @@
 
 use super::*;
 use crate::envelope::{FixedEnvelopeClock, Kind};
+use crate::mount_guard::MountError;
 use crate::mount_guard::test_support::FakeMountProbe;
 use std::io::Read;
+use std::path::Path;
 
 fn decode_records(path: &Path) -> Vec<Envelope> {
     let file = File::open(path).unwrap();

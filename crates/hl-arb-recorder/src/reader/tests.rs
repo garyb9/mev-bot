@@ -1,5 +1,6 @@
 //! Tests for the segment reader and the inspect/verify/repair analysis.
 
+use std::fs;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
