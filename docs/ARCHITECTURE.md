@@ -222,12 +222,16 @@ stateDiagram-v2
   (`HL_KILL_FILE`, polled every 250 ms), or `hl panic`; it cancels every working
   order and halts new places. Clearing is two-key: `hl resume` **and**
   `SIGUSR2`, and `SIGUSR2` is ignored while the flag file exists.
-- **Risk is fail-closed**: `live` refuses to start unless
+- **Risk is fail-closed at startup**: `live` refuses to start unless
   `max_order_notional_usd`, `max_position_notional_usd`, `max_open_orders`,
   `max_margin_utilization_bps`, `max_daily_loss_usd`, and `max_unhedged_usd`
-  are all explicitly finite (`crates/hl-arb-core/src/config.rs` `validate`). The
+  are all explicitly finite (`crates/hl-arb-core/src/config.rs` `validate`).
+  **Not all of these are enforced yet:** the engine risk gate enforces order
+  notional, projected per-coin exposure, the open-order count, and margin
+  utilization. `max_daily_loss_usd` and `max_unhedged_usd` are required but not
+  yet acted on (SPEC-0004 K-4); a `live` startup logs a WARN naming them. The
   check order is kill → breaker → stale coin → unknown-on-coin → rate budget →
-  notional → projected exposure → margin → tick/min-notional
+  open-order cap → notional → projected exposure → margin → tick/min-notional
   (`crates/hl-arb-engine/src/risk.rs`).
 
 ## 6. Persistence

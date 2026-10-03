@@ -15,10 +15,12 @@
 //! 3. stale coin (feed gap / staleness)
 //! 4. unknown orders on the coin
 //! 5. rate budget (K-5)
-//! 6. per-order notional
-//! 7. per-coin projected exposure (`confirmed + in-flight`)
-//! 8. account margin utilization
-//! 9. min-notional / rounding validity
+//! 6. open-order count for the coin (SPEC-0004 K-1)
+//! 7. per-order notional, evaluated on the size rounded toward zero to the
+//!    market's lot (so risk sees the size that will actually be sent, PERF-003)
+//! 8. per-coin projected exposure (`confirmed + in-flight`)
+//! 9. account margin utilization
+//! 10. min-notional / rounding validity
 //!
 //! **Cancels are never blocked by risk**, except by the rate budget's hard
 //! floor (they reduce exposure). The concrete cancel-all collector lives here
@@ -60,6 +62,8 @@ pub enum RiskReason {
     RateBudget,
     /// No reference price is available to value an aggressive order.
     NoReferencePrice,
+    /// The coin already has `max_open_orders` working orders (SPEC-0004 K-1).
+    OpenOrdersCap,
     /// The order size is zero or negative.
     NonPositiveSize,
     /// The projected per-coin exposure is already at or over its cap.
@@ -88,6 +92,7 @@ impl std::fmt::Display for RiskReason {
             RiskReason::UnknownOrders => f.write_str("unknown orders on coin"),
             RiskReason::RateBudget => f.write_str("rate budget exhausted"),
             RiskReason::NoReferencePrice => f.write_str("no reference price"),
+            RiskReason::OpenOrdersCap => f.write_str("open-order cap reached"),
             RiskReason::NonPositiveSize => f.write_str("non-positive size"),
             RiskReason::PositionExposure => f.write_str("position exposure cap reached"),
             RiskReason::MarginUtilization => f.write_str("margin utilization cap exceeded"),
@@ -362,6 +367,8 @@ pub struct RiskLimits {
     pub max_position_notional: Option<Decimal>,
     /// Maximum margin utilization (bps) before new risk is refused.
     pub max_margin_utilization_bps: Option<Decimal>,
+    /// Maximum working (resting) orders allowed on one coin.
+    pub max_open_orders: Option<usize>,
     /// Minimum order notional (venue floor by default).
     pub min_notional: Decimal,
 }
@@ -372,6 +379,7 @@ impl Default for RiskLimits {
             max_order_notional: None,
             max_position_notional: None,
             max_margin_utilization_bps: None,
+            max_open_orders: None,
             min_notional: MIN_ORDER_NOTIONAL,
         }
     }
@@ -384,6 +392,7 @@ impl RiskLimits {
             max_order_notional: settings.max_order_notional_usd,
             max_position_notional: settings.max_position_notional_usd,
             max_margin_utilization_bps: settings.max_margin_utilization_bps,
+            max_open_orders: settings.max_open_orders,
             min_notional: MIN_ORDER_NOTIONAL,
         }
     }
@@ -573,7 +582,16 @@ impl RiskGate {
         }
         ctx.rate.consume_place();
 
-        // 6. reference price and per-order notional.
+        // 6. open-order cap: an exposure-increasing order is refused once the
+        // coin is at the cap. Reduce-only and cancels are never blocked.
+        if !reduce_only
+            && let Some(cap) = self.limits.max_open_orders
+            && open_orders_on_coin(ctx.orders, coin) >= cap
+        {
+            return Err(RiskReason::OpenOrdersCap);
+        }
+
+        // 7. reference price and per-order notional, on the rounded size.
         let reference = match limit_px {
             Some(px) => px,
             None => ctx.reference().ok_or(RiskReason::NoReferencePrice)?,
@@ -620,7 +638,7 @@ impl RiskGate {
             }
         }
 
-        // 9. min-notional / rounding validity.
+        // 10. min-notional / rounding validity, re-checked on the final size.
         if size <= Decimal::ZERO {
             return Err(RiskReason::NonPositiveSize);
         }
@@ -634,7 +652,7 @@ impl RiskGate {
             return Err(RiskReason::TickInvalid);
         }
 
-        let final_size = if resized { size.normalize() } else { size };
+        let final_size = size.normalize();
         Ok(if resized {
             Decision::Resize(final_size)
         } else {
@@ -658,6 +676,11 @@ fn margin_utilization_bps(account: &AccountState) -> Decimal {
         return Decimal::ZERO;
     }
     account.margin_used / account.account_value * Decimal::from(10_000)
+}
+
+/// Number of working (possibly resting) orders the manager tracks on `coin`.
+fn open_orders_on_coin(orders: &OrderManager, coin: CoinId) -> usize {
+    orders.working().filter(|order| order.coin == coin).count()
 }
 
 /// Every cloid a kill response must cancel: all working orders (SPEC-0004 K-3).
@@ -799,6 +822,7 @@ mod tests {
                 max_order_notional: Some(ds("5000")),
                 max_position_notional: Some(ds("100000")),
                 max_margin_utilization_bps: Some(ds("9000")),
+                max_open_orders: None,
                 min_notional: ds("10"),
             },
             KillSwitch::new(),
@@ -969,6 +993,7 @@ mod tests {
                 max_order_notional: Some(ds("250")),     // 2.5 units
                 max_position_notional: Some(ds("1000")), // 10 units total
                 max_margin_utilization_bps: Some(ds("9000")),
+                max_open_orders: None,
                 min_notional: ds("10"),
             },
             KillSwitch::new(),
@@ -1097,6 +1122,7 @@ mod tests {
                 max_order_notional: None,
                 max_position_notional: Some(ds("1000")), // 10 units total
                 max_margin_utilization_bps: None,
+                max_open_orders: None,
                 min_notional: ds("10"),
             },
             KillSwitch::new(),
@@ -1409,10 +1435,12 @@ mod tests {
             max_order_notional_usd: Some(ds("250")),
             max_position_notional_usd: Some(ds("1000")),
             max_margin_utilization_bps: Some(ds("5000")),
+            max_open_orders: Some(7),
             ..Default::default()
         };
         let limits = RiskLimits::from_settings(&settings);
         assert_eq!(limits.max_order_notional, Some(ds("250")));
+        assert_eq!(limits.max_open_orders, Some(7));
         assert_eq!(limits.min_notional, MIN_ORDER_NOTIONAL);
 
         let budget = RateBudgetConfig::from_settings(&RateBudgetSettings {
@@ -1469,6 +1497,7 @@ mod tests {
             max_order_notional: Some(ds("300")),
             max_position_notional: Some(cap),
             max_margin_utilization_bps: Some(ds("10_000")),
+            max_open_orders: None,
             min_notional: ds("10"),
         };
         let mut gate = RiskGate::new(limits, KillSwitch::new(), Breakers::new());
@@ -1553,5 +1582,92 @@ mod tests {
                 assert!(exposure_ok(&account, &orders, cap, ref_px));
             }
         }
+    }
+
+    fn resting(cloid: Cloid, coin: u16) -> LiveOrder {
+        live(cloid, coin, ds("100"), ds("1"), OrderState::Resting, false)
+    }
+
+    fn permissive_limits(max_open_orders: Option<usize>) -> RiskLimits {
+        RiskLimits {
+            max_order_notional: Some(ds("5000")),
+            max_position_notional: Some(ds("100000")),
+            max_margin_utilization_bps: Some(ds("9000")),
+            max_open_orders,
+            min_notional: ds("10"),
+        }
+    }
+
+    #[test]
+    fn open_order_cap_blocks_at_and_above_the_cap() {
+        let meta = asset_meta();
+        let budget = huge_budget();
+        let slot = slot();
+        let acct = account("0", "1000", "0");
+        for (open, cap, expected) in [
+            (2usize, 3usize, Ok(Decision::Approve)), // cap - 1
+            (3, 3, Err(RiskReason::OpenOrdersCap)),  // at cap
+            (4, 3, Err(RiskReason::OpenOrdersCap)),  // above cap
+        ] {
+            let mut orders = OrderManager::new(1);
+            for i in 0..open {
+                orders.insert(resting(nth_cloid(i as u32 + 1), 0));
+            }
+            let mut gate = RiskGate::new(
+                permissive_limits(Some(cap)),
+                KillSwitch::new(),
+                Breakers::new(),
+            );
+            let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+            assert_eq!(
+                gate.evaluate(&buy(Some(ds("100")), ds("1")), &ctx),
+                expected,
+                "open={open} cap={cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_order_cap_is_per_coin_and_exempts_reduce_only_and_cancels() {
+        let meta = asset_meta();
+        let budget = huge_budget();
+        let slot = slot();
+        let acct = account("0", "1000", "0");
+        let mut orders = OrderManager::new(2);
+        for i in 0..5u32 {
+            orders.insert(resting(nth_cloid(i + 1), 1)); // all on the other coin
+        }
+        let mut gate = RiskGate::new(
+            permissive_limits(Some(1)),
+            KillSwitch::new(),
+            Breakers::new(),
+        );
+        let ctx_other = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+        // Orders on coin 1 do not count against coin 0's cap.
+        assert_eq!(
+            gate.evaluate(&buy(Some(ds("100")), ds("1")), &ctx_other),
+            Ok(Decision::Approve)
+        );
+
+        // Put coin 0 at its cap: a normal place is refused, but a reduce-only
+        // place and a cancel still pass.
+        let at_cap = nth_cloid(9);
+        orders.insert(resting(at_cap, 0));
+        let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+        assert_eq!(
+            gate.evaluate(&buy(Some(ds("100")), ds("1")), &ctx),
+            Err(RiskReason::OpenOrdersCap)
+        );
+        assert_eq!(
+            gate.evaluate(
+                &intent(StrategySide::Sell, Some(ds("100")), ds("1"), true),
+                &ctx
+            ),
+            Ok(Decision::Approve)
+        );
+        assert_eq!(
+            gate.evaluate(&Action::Cancel { cloid: at_cap }, &ctx),
+            Ok(Decision::Approve)
+        );
     }
 }

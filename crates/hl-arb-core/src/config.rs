@@ -466,7 +466,26 @@ impl Config {
                 "live mode requires a finite risk max_open_orders".into(),
             ));
         }
+        // Be loud about the limits that are required at startup but not yet
+        // enforced by the engine risk gate, so a configured value is not
+        // mistaken for protection (SEC-002 / SPEC-0004 K-4).
+        tracing::warn!(
+            unenforced = ?Self::unenforced_live_limits(),
+            "live mode: these configured risk limits are validated but NOT enforced by the engine; \
+             do not rely on them as a loss cutoff (SPEC-0004 K-4)"
+        );
         Ok(())
+    }
+
+    /// The `live`-required risk limits the engine risk gate does **not** yet
+    /// enforce (SPEC-0004 K-4).
+    ///
+    /// `live` validation requires these to be finite so an operator cannot
+    /// leave them unlimited, but the engine does not act on them yet. Startup
+    /// warns with this list so a configured value is not mistaken for
+    /// protection.
+    pub fn unenforced_live_limits() -> &'static [&'static str] {
+        &["max_daily_loss_usd", "max_unhedged_usd"]
     }
 
     /// The configured agent private key, if any. Handle with care: never log
@@ -587,6 +606,21 @@ mod tests {
         with_limits.risk.max_unhedged_usd = Some(Decimal::from(5_000));
         assert!(with_limits.validate().is_ok());
         unsafe { std::env::remove_var("HL_LIVE_CONFIRM") };
+    }
+
+    #[test]
+    fn unenforced_live_limits_names_only_the_unimplemented_caps() {
+        let unenforced = Config::unenforced_live_limits();
+        assert!(unenforced.contains(&"max_daily_loss_usd"));
+        assert!(unenforced.contains(&"max_unhedged_usd"));
+        for enforced in [
+            "max_order_notional_usd",
+            "max_position_notional_usd",
+            "max_open_orders",
+            "max_margin_utilization_bps",
+        ] {
+            assert!(!unenforced.contains(&enforced), "{enforced} is enforced");
+        }
     }
 
     #[test]
