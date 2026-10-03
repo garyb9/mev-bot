@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::envelope::{Envelope, FixedEnvelopeClock};
+use crate::envelope::{Envelope, FixedEnvelopeClock, Kind, SCHEMA_VERSION};
 use crate::segment::{ManifestEntry, SegmentConfig, SegmentWriter};
 
 use super::*;
@@ -1375,4 +1375,242 @@ fn verify_mixed_manifest_and_orphan_across_two_hours_with_gap() {
         "the orphan's records were not counted: {:?}",
         report.coverage
     );
+}
+
+// ---- Reader hardening: line cap, manifest paths, versioning, unknown kinds ----
+
+fn write_zst(path: &Path, lines: &[String]) {
+    fs::write(path, zstd_frame(lines)).unwrap();
+}
+
+fn raw_envelope(v: u8, kind: &str) -> String {
+    format!(
+        r#"{{"v":{v},"src":"hl-ws","conn":"hl-ws-01","seq":0,"t_ns":1000,"mono_ns":0,"kind":"{kind}","raw":"x"}}"#
+    )
+}
+
+fn manifest_json(file: &str, v: Option<u64>) -> String {
+    let mut value = serde_json::json!({
+        "file": file,
+        "src": "hl-ws",
+        "conn": "hl-ws-01",
+        "first_t_ns": 1000,
+        "last_t_ns": 2000,
+        "records": 3,
+        "bytes_raw": 10,
+        "bytes_zst": 5,
+        "crashed": false,
+    });
+    if let Some(v) = v {
+        value["v"] = serde_json::json!(v);
+    }
+    value.to_string()
+}
+
+#[test]
+fn reader_rejects_a_line_over_the_cap() {
+    let tmp = temp_dir("line-cap");
+    let dir = tmp.path();
+
+    // A normal file keeps reading exactly as before.
+    let normal = dir.join("normal.jsonl.zst");
+    write_zst(
+        &normal,
+        &[
+            raw_envelope(SCHEMA_VERSION, "frame"),
+            raw_envelope(SCHEMA_VERSION, "frame"),
+        ],
+    );
+    let read: Vec<Envelope> = SegmentReader::open(&normal)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(read.len(), 2);
+
+    // One line larger than the cap is a typed error, not an abort or an
+    // unbounded allocation.
+    let huge = "a".repeat(MAX_LINE_BYTES + 1024);
+    let path = dir.join("huge.jsonl.zst");
+    write_zst(&path, &[huge]);
+    let result: Result<Vec<Envelope>, ReaderError> = SegmentReader::open(&path).unwrap().collect();
+    match result {
+        Err(ReaderError::LineTooLong { limit, .. }) => assert_eq!(limit, MAX_LINE_BYTES),
+        other => panic!("expected LineTooLong, got {other:?}"),
+    }
+}
+
+#[test]
+fn manifest_file_path_is_validated() {
+    use super::manifest::validate_manifest_file;
+
+    for bad in [
+        "",
+        "/etc/passwd",
+        "../evil.jsonl.zst",
+        "a/../../evil.jsonl.zst",
+        "..",
+        r"..\..\evil.jsonl.zst",
+    ] {
+        match validate_manifest_file(bad) {
+            Err(ReaderError::InvalidManifestPath { path }) => assert_eq!(path, bad),
+            other => panic!("expected InvalidManifestPath for {bad:?}, got {other:?}"),
+        }
+    }
+
+    for good in [
+        "x.jsonl.zst",
+        "00/x.jsonl.zst",
+        "testnet/hl-ws/2026-01-01/00/hl-ws-01-0.jsonl.zst",
+    ] {
+        assert!(
+            validate_manifest_file(good).is_ok(),
+            "rejected a safe path {good:?}"
+        );
+    }
+}
+
+#[test]
+fn read_manifest_rejects_an_unsafe_file_before_opening_it() {
+    let tmp = temp_dir("manifest-path");
+    let dir = tmp.path();
+    let manifest = dir.join("manifest.jsonl");
+    fs::write(
+        &manifest,
+        format!("{}\n", manifest_json("/etc/passwd", None)),
+    )
+    .unwrap();
+
+    match super::manifest::read_manifest(&manifest) {
+        Err(ReaderError::InvalidManifestPath { path }) => assert_eq!(path, "/etc/passwd"),
+        other => panic!("expected InvalidManifestPath, got {other:?}"),
+    }
+}
+
+#[test]
+fn reader_rejects_a_newer_envelope_version() {
+    let tmp = temp_dir("envelope-version");
+    let dir = tmp.path();
+    let path = dir.join("s.jsonl.zst");
+    write_zst(&path, &[raw_envelope(SCHEMA_VERSION + 1, "frame")]);
+    let result: Result<Vec<Envelope>, ReaderError> = SegmentReader::open(&path).unwrap().collect();
+    match result {
+        Err(ReaderError::UnsupportedVersion { found, supported }) => {
+            assert_eq!(found, SCHEMA_VERSION + 1);
+            assert_eq!(supported, SCHEMA_VERSION);
+        }
+        other => panic!("expected UnsupportedVersion, got {other:?}"),
+    }
+
+    // An equal or older version still reads.
+    for v in [0, SCHEMA_VERSION] {
+        let ok = dir.join(format!("v{v}.jsonl.zst"));
+        write_zst(&ok, &[raw_envelope(v, "frame")]);
+        let read: Vec<Envelope> = SegmentReader::open(&ok)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(read.len(), 1);
+    }
+}
+
+#[test]
+fn unknown_kind_is_skipped_and_tallied() {
+    let tmp = temp_dir("unknown-kind");
+    let dir = tmp.path();
+    let path = dir.join("s.jsonl.zst");
+    write_zst(
+        &path,
+        &[
+            raw_envelope(SCHEMA_VERSION, "frame"),
+            raw_envelope(SCHEMA_VERSION, "future_kind"),
+            raw_envelope(SCHEMA_VERSION, "frame"),
+        ],
+    );
+
+    // The bare enum maps an unrecognized kind to Unknown...
+    let kind: Kind = serde_json::from_str("\"future_kind\"").unwrap();
+    assert_eq!(kind, Kind::Unknown);
+
+    // ...the iterator skips those lines and counts them...
+    let mut reader = SegmentReader::open(&path).unwrap();
+    let mut kinds = Vec::new();
+    for env in reader.by_ref() {
+        kinds.push(env.unwrap().kind);
+    }
+    assert_eq!(kinds, vec![Kind::Frame, Kind::Frame]);
+    assert_eq!(reader.unknown_count(), 1);
+
+    // ...and `inspect` reports the tally without failing.
+    let report = inspect(&[path]).unwrap();
+    assert_eq!(report.records, 2);
+    assert_eq!(report.unknown_kinds, 1);
+    assert_eq!(report.by_kind.get("future_kind"), None);
+}
+
+#[test]
+fn manifest_version_is_optional_and_checked() {
+    let tmp = temp_dir("manifest-version");
+    let dir = tmp.path();
+
+    for (tag, v) in [("absent", None), ("v1", Some(1u64))] {
+        let path = dir.join(format!("{tag}.jsonl"));
+        fs::write(&path, format!("{}\n", manifest_json("x.jsonl.zst", v))).unwrap();
+        let entries = super::manifest::read_manifest(&path).unwrap();
+        assert_eq!(entries.len(), 1, "{tag}");
+        assert_eq!(entries[0].file, "x.jsonl.zst", "{tag}");
+    }
+
+    let path = dir.join("newer.jsonl");
+    fs::write(
+        &path,
+        format!("{}\n", manifest_json("x.jsonl.zst", Some(2))),
+    )
+    .unwrap();
+    match super::manifest::read_manifest(&path) {
+        Err(ReaderError::UnsupportedManifestVersion {
+            found, supported, ..
+        }) => {
+            assert_eq!(found, 2);
+            assert_eq!(supported, super::manifest::MANIFEST_VERSION);
+        }
+        other => panic!("expected UnsupportedManifestVersion, got {other:?}"),
+    }
+}
+
+#[test]
+fn verify_tallies_skipped_unknown_kinds() {
+    let tmp = temp_dir("verify-unknown");
+    let dir = tmp.path();
+    let date = "2026-01-01";
+    let base = 1_767_227_400_000_000_000i64;
+    let clock = FixedEnvelopeClock::new(base, 0);
+    let lines: Vec<String> = vec![
+        serde_json::to_string(&Envelope::segment_open(
+            &clock,
+            "hl-ws",
+            "hl-ws-01",
+            0,
+            &Default::default(),
+        ))
+        .unwrap(),
+        serde_json::to_string(&Envelope::frame(&clock, "hl-ws", "hl-ws-01", 1, "x")).unwrap(),
+        raw_envelope(SCHEMA_VERSION, "future_kind"),
+        serde_json::to_string(&Envelope::segment_close(
+            &clock, "hl-ws", "hl-ws-01", 3, 4, 100,
+        ))
+        .unwrap(),
+    ];
+    let hour = dir.join("testnet/hl-ws").join(date).join("00");
+    fs::create_dir_all(&hour).unwrap();
+    let path = hour.join(format!("hl-ws-01-{base}.jsonl.zst"));
+    write_zst(&path, &lines);
+
+    let report = verify(&VerifyConfig {
+        out_dir: dir.to_path_buf(),
+        network: "testnet".into(),
+        date: date.into(),
+    })
+    .unwrap();
+    assert_eq!(report.unknown_kinds, 1, "{report:?}");
+    assert_eq!(report.orphans.len(), 1, "{report:?}");
 }

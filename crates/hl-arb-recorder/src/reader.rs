@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::envelope::{Envelope, Kind};
+use crate::envelope::{Envelope, Kind, SCHEMA_VERSION};
 
 mod inspect;
 mod manifest;
@@ -25,6 +25,16 @@ mod repair;
 mod verify;
 
 use self::read::is_crashed;
+
+/// Hard cap on one decompressed segment line, in bytes (excluding the
+/// terminating newline).
+///
+/// A segment line is normally well under a megabyte; the largest recorded
+/// payloads (an `l2Book` snapshot) are a few megabytes. The cap bounds what a
+/// damaged or hostile segment can make the reader allocate: a line longer than
+/// this is rejected with [`ReaderError::LineTooLong`] instead of growing an
+/// unbounded buffer.
+pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A reader failure. Truncated segments are not an error.
 #[derive(Debug, Error)]
@@ -41,6 +51,22 @@ pub enum ReaderError {
         line: usize,
         /// The serde error.
         source: serde_json::Error,
+    },
+    /// A decompressed segment line exceeded [`MAX_LINE_BYTES`].
+    #[error("segment line in {path} exceeds the {limit}-byte reader cap")]
+    LineTooLong {
+        /// File being read.
+        path: String,
+        /// The cap in bytes ([`MAX_LINE_BYTES`]).
+        limit: usize,
+    },
+    /// An envelope declares a schema version this build cannot read.
+    #[error("unsupported envelope schema version {found} (supported: {supported})")]
+    UnsupportedVersion {
+        /// The `v` found in the envelope.
+        found: u8,
+        /// The highest `v` this build supports ([`SCHEMA_VERSION`]).
+        supported: u8,
     },
     /// A manifest line could not be decoded.
     #[error("manifest parse error in {path}: {source}")]
@@ -63,6 +89,26 @@ pub enum ReaderError {
     InvalidSegment {
         /// The offending path.
         path: String,
+    },
+    /// A manifest entry's `file` is not a safe path inside the recording tree.
+    ///
+    /// Rejected before anything opens it: an absolute path, a component that
+    /// climbs out with `..`, or a Windows separator that would escape on
+    /// another platform (SPEC-0008 §6).
+    #[error("manifest entry path `{path}` is not a safe relative path")]
+    InvalidManifestPath {
+        /// The offending `file` value.
+        path: String,
+    },
+    /// A manifest declares a version this build cannot read.
+    #[error("manifest {path} has unsupported version {found} (supported: {supported})")]
+    UnsupportedManifestVersion {
+        /// Manifest file path.
+        path: String,
+        /// The `v` found in the manifest line.
+        found: u64,
+        /// The highest manifest version this build supports.
+        supported: u8,
     },
     /// The recorder root directory does not exist.
     #[error("recorder root `{0}` does not exist; nothing to do (check the profile out_dir)")]
@@ -89,13 +135,20 @@ pub enum ReaderError {
 /// segment never has to be held in memory. A truncated zstd tail is tolerated
 /// only for `.crashed` segments (it ends iteration at the last complete line);
 /// for a finished segment a decode failure is an error.
+///
+/// A single line may not exceed [`MAX_LINE_BYTES`] (over that is
+/// [`ReaderError::LineTooLong`]), an envelope whose [`Envelope::v`] is newer
+/// than [`SCHEMA_VERSION`] is [`ReaderError::UnsupportedVersion`], and
+/// envelopes of an unknown [`Kind`] are skipped (counted by
+/// [`SegmentReader::unknown_count`]) rather than failing the whole file.
 pub struct SegmentReader {
     inner: BufReader<zstd::stream::read::Decoder<'static, BufReader<Box<dyn Read>>>>,
     path: PathBuf,
     crashed: bool,
-    line: String,
+    line: Vec<u8>,
     line_no: usize,
     done: bool,
+    unknown: u64,
 }
 
 impl SegmentReader {
@@ -115,19 +168,86 @@ impl SegmentReader {
             inner: BufReader::new(decoder),
             path: path.to_path_buf(),
             crashed,
-            line: String::new(),
+            line: Vec::new(),
             line_no: 0,
             done: false,
+            unknown: 0,
         })
     }
 
-    fn decode(&self, line: &str) -> Result<Envelope, ReaderError> {
-        serde_json::from_str(line).map_err(|source| ReaderError::Decode {
+    /// Number of unknown-kind envelopes skipped so far.
+    ///
+    /// Unknown kinds (from a newer recorder) never fail a read; they are
+    /// dropped and tallied here so a caller can report them.
+    pub fn unknown_count(&self) -> u64 {
+        self.unknown
+    }
+
+    /// Read one newline-terminated line into `self.line`, bounded by
+    /// [`MAX_LINE_BYTES`], returning its length. A final line without a
+    /// newline is returned as-is (a caller decides whether that is a crash).
+    fn read_line_bounded(&mut self) -> Result<usize, ReaderError> {
+        self.line.clear();
+        loop {
+            let available = self.inner.fill_buf()?;
+            if available.is_empty() {
+                validate_utf8(&self.line, &self.path)?;
+                return Ok(self.line.len());
+            }
+            let newline = available.iter().position(|&b| b == b'\n');
+            let take = newline.map_or(available.len(), |pos| pos + 1);
+            if self.line.len() + take > MAX_LINE_BYTES + 1 {
+                // Never append past cap + one byte; error as soon as the line
+                // cannot fit, so a hostile segment cannot grow the buffer.
+                let room = (MAX_LINE_BYTES + 1).saturating_sub(self.line.len());
+                self.line.extend_from_slice(&available[..room.min(take)]);
+                return Err(ReaderError::LineTooLong {
+                    path: self.path.display().to_string(),
+                    limit: MAX_LINE_BYTES,
+                });
+            }
+            self.line.extend_from_slice(&available[..take]);
+            self.inner.consume(take);
+            if newline.is_some() {
+                validate_utf8(&self.line, &self.path)?;
+                return Ok(self.line.len());
+            }
+            if self.line.len() > MAX_LINE_BYTES {
+                return Err(ReaderError::LineTooLong {
+                    path: self.path.display().to_string(),
+                    limit: MAX_LINE_BYTES,
+                });
+            }
+        }
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Result<Envelope, ReaderError> {
+        let line = std::str::from_utf8(bytes).map_err(|source| {
+            ReaderError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, source))
+        })?;
+        let env: Envelope = serde_json::from_str(line).map_err(|source| ReaderError::Decode {
             path: self.path.display().to_string(),
             line: self.line_no,
             source,
-        })
+        })?;
+        if env.v > SCHEMA_VERSION {
+            return Err(ReaderError::UnsupportedVersion {
+                found: env.v,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        Ok(env)
     }
+}
+
+/// Reject a line that is not valid UTF-8, as `BufRead::read_line` would.
+fn validate_utf8(bytes: &[u8], path: &Path) -> Result<(), ReaderError> {
+    std::str::from_utf8(bytes).map(|_| ()).map_err(|_| {
+        ReaderError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("segment line in {} is not valid UTF-8", path.display()),
+        ))
+    })
 }
 
 impl Iterator for SegmentReader {
@@ -138,15 +258,22 @@ impl Iterator for SegmentReader {
             if self.done {
                 return None;
             }
-            self.line.clear();
-            match self.inner.read_line(&mut self.line) {
+            match self.read_line_bounded() {
                 Ok(0) => {
                     self.done = true;
                     return None;
                 }
                 Ok(_) => {
                     self.line_no += 1;
-                    if !self.line.ends_with('\n') {
+                    let bytes: &[u8] = &self.line;
+                    let has_newline = bytes.ends_with(b"\n");
+                    let trimmed: &[u8] = if has_newline {
+                        let mut end = bytes.len();
+                        while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
+                            end -= 1;
+                        }
+                        &bytes[..end]
+                    } else {
                         // The tail was cut mid-line. A crashed segment stops at
                         // its last full line; a finished one still parses it if
                         // it happens to be complete.
@@ -154,25 +281,30 @@ impl Iterator for SegmentReader {
                         if self.crashed {
                             return None;
                         }
-                        let trimmed = self.line.trim_end();
-                        if trimmed.is_empty() {
-                            return None;
-                        }
-                        return Some(self.decode(trimmed));
-                    }
-                    let trimmed = self.line.trim_end_matches(['\n', '\r']);
+                        bytes.trim_ascii_end()
+                    };
                     if trimmed.is_empty() {
-                        continue;
+                        if has_newline {
+                            continue;
+                        }
+                        return None;
                     }
-                    return Some(self.decode(trimmed));
+                    match self.decode(trimmed) {
+                        Ok(env) if env.kind == Kind::Unknown => {
+                            self.unknown += 1;
+                            continue;
+                        }
+                        other => return Some(other),
+                    }
                 }
                 Err(err) => {
                     self.done = true;
-                    if self.crashed {
-                        // A truncated zstd tail is expected for a crash.
+                    if self.crashed && matches!(err, ReaderError::Io(_)) {
+                        // A truncated zstd tail or partial line is expected for
+                        // a crash; a cap/version error is not.
                         return None;
                     }
-                    return Some(Err(ReaderError::Io(err)));
+                    return Some(Err(err));
                 }
             }
         }

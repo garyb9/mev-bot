@@ -98,6 +98,8 @@ pub struct InspectReport {
     pub seq_holes: Vec<SeqHoles>,
     /// Number of `.crashed` files read.
     pub crashed_files: usize,
+    /// Unknown-kind envelopes skipped (from a newer recorder).
+    pub unknown_kinds: u64,
 }
 
 /// Per-connection `seq` tracker that finds holes across process restarts.
@@ -147,7 +149,8 @@ pub fn inspect(paths: &[PathBuf]) -> Result<InspectReport, ReaderError> {
         if is_crashed(path) {
             report.crashed_files += 1;
         }
-        for env in SegmentReader::open(path)? {
+        let mut reader = SegmentReader::open(path)?;
+        for env in reader.by_ref() {
             let env = env?;
             report.records += 1;
             *report.by_src.entry(env.src.clone()).or_insert(0) += 1;
@@ -179,6 +182,7 @@ pub fn inspect(paths: &[PathBuf]) -> Result<InspectReport, ReaderError> {
                 _ => {}
             }
         }
+        report.unknown_kinds += reader.unknown_count();
     }
 
     for ((src, conn), tracker) in seq {

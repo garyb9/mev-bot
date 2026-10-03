@@ -11,7 +11,18 @@ use super::{ReaderError, SegmentReader};
 
 /// Decode every envelope in a segment, tolerating a truncated `.crashed` tail.
 pub fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, ReaderError> {
-    SegmentReader::open(path)?.collect()
+    Ok(read_envelopes_counting(path)?.0)
+}
+
+/// Like [`read_envelopes`], also returning how many unknown-kind envelopes
+/// were skipped (SPEC-0008 §5.3).
+pub(super) fn read_envelopes_counting(path: &Path) -> Result<(Vec<Envelope>, u64), ReaderError> {
+    let mut reader = SegmentReader::open(path)?;
+    let mut envelopes = Vec::new();
+    for item in &mut reader {
+        envelopes.push(item?);
+    }
+    Ok((envelopes, reader.unknown_count()))
 }
 
 /// Enumerate every segment file under `out_dir/{network}` for the inclusive

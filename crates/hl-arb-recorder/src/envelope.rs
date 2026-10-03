@@ -38,6 +38,13 @@ pub enum Kind {
     SegmentOpen,
     /// Last line of every cleanly closed segment.
     SegmentClose,
+    /// A kind this build does not know (forward compatibility).
+    ///
+    /// Deserialization maps any unrecognized `kind` string here instead of
+    /// failing, so a segment written by a newer recorder can still be read.
+    /// The reader skips these envelopes and counts them (SPEC-0008 §5.3).
+    #[serde(other)]
+    Unknown,
 }
 
 impl Kind {
@@ -54,6 +61,7 @@ impl Kind {
             Kind::Clock => "clock",
             Kind::SegmentOpen => "segment_open",
             Kind::SegmentClose => "segment_close",
+            Kind::Unknown => "unknown",
         }
     }
 }

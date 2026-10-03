@@ -2,13 +2,24 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use serde::de::Error as _;
+use serde_json::Value;
 
 use crate::envelope::{Envelope, Kind};
 use crate::segment::ManifestEntry;
 
 use super::ReaderError;
 use super::read::is_crashed;
+
+/// Manifest schema version this build reads (SPEC-0008 §6).
+///
+/// A manifest line may carry an optional `v`; when it is absent the line is
+/// assumed to be this version (old manifests predate the field). A line with a
+/// newer `v` is rejected with [`ReaderError::UnsupportedManifestVersion`]
+/// rather than misread. The writer does not emit `v` yet.
+pub(super) const MANIFEST_VERSION: u8 = 1;
 
 /// `(src, conn, first_t_ns)` for a segment path, from its directory and name.
 ///
@@ -120,14 +131,70 @@ pub(super) fn rel_path(out_dir: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Reject a manifest `file` value that could make the reader open something
+/// outside the recording tree (SPEC-0008 §6).
+///
+/// An absolute path, a component that climbs out with `..`, a Windows
+/// separator (which would escape when run on another platform), or an empty
+/// value is rejected. A plain relative name or a normal relative subpath is
+/// accepted. This runs while parsing the manifest, before any segment is
+/// opened.
+pub(super) fn validate_manifest_file(file: &str) -> Result<(), ReaderError> {
+    let invalid = || ReaderError::InvalidManifestPath {
+        path: file.to_string(),
+    };
+    if file.is_empty() || file.contains('\0') || file.contains('\\') {
+        return Err(invalid());
+    }
+    let path = Path::new(file);
+    if path.is_absolute() {
+        return Err(invalid());
+    }
+    let mut depth: i64 = 0;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(invalid());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return Err(invalid()),
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn read_manifest(path: &Path) -> Result<Vec<ManifestEntry>, ReaderError> {
     let text = fs::read_to_string(path)?;
     let mut entries = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let entry = serde_json::from_str(line).map_err(|source| ReaderError::Manifest {
+        let value: Value = serde_json::from_str(line).map_err(|source| ReaderError::Manifest {
             path: path.display().to_string(),
             source,
         })?;
+        let found = match value.get("v") {
+            None => MANIFEST_VERSION as u64,
+            Some(v) => v.as_u64().ok_or_else(|| ReaderError::Manifest {
+                path: path.display().to_string(),
+                source: serde_json::Error::custom("manifest `v` must be a non-negative integer"),
+            })?,
+        };
+        if found > MANIFEST_VERSION as u64 {
+            return Err(ReaderError::UnsupportedManifestVersion {
+                path: path.display().to_string(),
+                found,
+                supported: MANIFEST_VERSION,
+            });
+        }
+        let entry: ManifestEntry =
+            serde_json::from_value(value).map_err(|source| ReaderError::Manifest {
+                path: path.display().to_string(),
+                source,
+            })?;
+        validate_manifest_file(&entry.file)?;
         entries.push(entry);
     }
     Ok(entries)

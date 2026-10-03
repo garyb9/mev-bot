@@ -10,7 +10,9 @@ use crate::segment::ManifestEntry;
 use super::manifest::{
     manifests_for, read_manifest, rel_path, segment_identity, segment_manifest_entry,
 };
-use super::read::{ensure_root_exists, is_crashed, partials_for_day, read_envelopes, segments_for};
+use super::read::{
+    ensure_root_exists, is_crashed, partials_for_day, read_envelopes_counting, segments_for,
+};
 use super::{CoverageAcc, ReaderError, day_bounds};
 
 /// One file's manifest-vs-disk check (SPEC-0008 §12.1).
@@ -111,6 +113,8 @@ pub struct VerifyReport {
     /// means a recorder may be running, so orphan findings are "possibly in
     /// flight".
     pub partials: Vec<String>,
+    /// Unknown-kind envelopes skipped across every file (from a newer recorder).
+    pub unknown_kinds: u64,
     /// Per-stream coverage.
     pub coverage: Vec<StreamCoverage>,
 }
@@ -165,6 +169,7 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
         unfinalized: Vec::new(),
         corrupt_orphans: Vec::new(),
         partials: Vec::new(),
+        unknown_kinds: 0,
         coverage: Vec::new(),
     };
 
@@ -216,8 +221,8 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
             // An orphan: read it, feed coverage from its envelopes, and classify
             // it. A corrupt one is listed and skipped; it must not abort the
             // whole report (SPEC-0008 §17 #36).
-            let envelopes = match read_envelopes(&path) {
-                Ok(envelopes) => envelopes,
+            let (envelopes, unknown) = match read_envelopes_counting(&path) {
+                Ok(read) => read,
                 Err(err) => {
                     report.corrupt_orphans.push(CorruptOrphan {
                         file: task.file.clone(),
@@ -226,6 +231,7 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
                     continue;
                 }
             };
+            report.unknown_kinds += unknown;
             let acc = coverage
                 .entry((task.src.clone(), task.conn.clone()))
                 .or_default();
@@ -266,7 +272,8 @@ pub fn verify(config: &VerifyConfig) -> Result<VerifyReport, ReaderError> {
             None
         };
         let records_on_disk = if exists {
-            let envelopes = read_envelopes(&path)?;
+            let (envelopes, unknown) = read_envelopes_counting(&path)?;
+            report.unknown_kinds += unknown;
             let acc = coverage
                 .entry((entry.src.clone(), entry.conn.clone()))
                 .or_default();
