@@ -1,11 +1,23 @@
 //! Unit tests for the exchange client (SPEC-0002).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use super::write_core::refusal_log_due;
 use super::*;
+use crate::nonce::{
+    DEFAULT_NONCE_LEASE_MS, NONCE_WARN_INTERVAL_MS, NonceLease, VENUE_MAX_FUTURE_MS,
+};
 use crate::order::{Action, Grouping, Tif, limit_order};
+use crate::signing::AgentSigner;
 use crate::test_metrics::{counter_value, histogram_samples};
 use hl_arb_core::clock::FixedClock;
+use hl_arb_core::config::Mode;
+use hl_arb_core::db::Db;
+use hl_arb_core::error::Error;
 use hl_arb_metrics::names;
 use metrics_util::debugging::DebuggingRecorder;
+use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
